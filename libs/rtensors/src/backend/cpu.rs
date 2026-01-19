@@ -686,65 +686,60 @@ macro_rules! blas_impl {
                 rhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
                 dst: &mut Self::Buf<$t>,
                 b: usize,
-                m: usize,
+                mut m: usize,
                 k: usize,
-                n: usize
+                mut n: usize
             ) -> Result<(), TensorError> {
 
-                let (lhs_buf, lhs_meta, lhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes) = lhs;
-                let (rhs_buf, rhs_meta, rhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes) = rhs;
+                let (lhs_buf, lhs_meta, lhs_contiguity) = lhs;
+                let (rhs_buf, rhs_meta, rhs_contiguity) = rhs;
 
-                let lda = match &lhs_contiguity {
+                let mut lda = match &lhs_contiguity {
                     ContiguityTypes::ColumnMajor => lhs_meta.strides()[lhs_meta.rank() - 1] as blasint,
                     ContiguityTypes::RowMajor => lhs_meta.strides()[lhs_meta.rank() - 2] as blasint,
                     _ => panic!("Invalid contiguity for BLAS matmul")
                 };
 
-                let ldb = match &rhs_contiguity {
+                let mut ldb = match &rhs_contiguity {
                     ContiguityTypes::ColumnMajor => rhs_meta.strides()[rhs_meta.rank() - 1] as blasint,
                     ContiguityTypes::RowMajor => rhs_meta.strides()[rhs_meta.rank() - 2] as blasint,
                     _ => panic!("Invalid contiguity for BLAS matmul")
                 };
                 let ldc = n as blasint; // row major
 
-                let bstride_lhs = if lhs_meta.rank() > 2 {
+                let mut bstride_lhs = if lhs_meta.rank() > 2 {
                     lhs_meta.strides()[lhs_meta.rank() - 3] as usize
                 } else {
                     m * k
                 };
                 
-                let bstride_rhs = if rhs_meta.rank() > 2 {
+                let mut bstride_rhs = if rhs_meta.rank() > 2 {
                     rhs_meta.strides()[rhs_meta.rank() - 3] as usize
                 } else {
                     k * n
                 };
-                
-                let (order, trans, m, n, lda, ldb, lhs, rhs) = match lhs_contiguity {
-                    ContiguityTypes::RowMajor => (
-                        CBLAS_ORDER::CblasRowMajor,
-                        CBLAS_TRANSPOSE::CblasNoTrans,
-                        m,
-                        n,
-                        lda,
-                        ldb,
-                        lhs_buf.as_ptr(),
-                        rhs_buf.as_ptr(),
-                    ),
-                    ContiguityTypes::ColumnMajor => (
-                        CBLAS_ORDER::CblasColMajor,
-                        CBLAS_TRANSPOSE::CblasTrans,
-                        m,
-                        n,
-                        ldb,
-                        lda,
-                        rhs_buf.as_ptr(),
-                        lhs_buf.as_ptr(),
-                    ),
-                    _ => {
-                        panic!("Invalid contiguity for BLAS matmul")
-                    }
+
+                let transpose_lhs = match lhs_contiguity {
+                    ContiguityTypes::RowMajor => CBLAS_TRANSPOSE::CblasTrans,
+                    ContiguityTypes::ColumnMajor => CBLAS_TRANSPOSE::CblasNoTrans,
+                    _ => panic!("Invalid contiguity for BLAS matmul")
                 };
 
+                let transpose_rhs = match rhs_contiguity {
+                    ContiguityTypes::RowMajor => CBLAS_TRANSPOSE::CblasTrans,
+                    ContiguityTypes::ColumnMajor => CBLAS_TRANSPOSE::CblasNoTrans,
+                    _ => panic!("Invalid contiguity for BLAS matmul")
+                };
+
+                let mut lhs = lhs_buf.as_ptr();
+                let mut rhs = rhs_buf.as_ptr();
+                if lhs_contiguity == rhs_contiguity && lhs_contiguity == ContiguityTypes::RowMajor {
+                    // swaps
+                    (m, n) = (n, m);
+                    (lda, ldb) = (ldb, lda);
+                    (bstride_lhs, bstride_rhs) = (bstride_rhs, bstride_lhs);
+                    (lhs, rhs) = (rhs, lhs);
+                }
                 for batch in 0..b {
                     // base pointers
                     let lhs_batch = lhs_meta.offset + batch * bstride_lhs;
@@ -754,9 +749,9 @@ macro_rules! blas_impl {
 
                     unsafe {
                         $gemm_fn(
-                            order,
-                            trans,
-                            trans,
+                            CBLAS_ORDER::CblasRowMajor,
+                            transpose_lhs,
+                            transpose_rhs,
                             m as blasint,
                             n as blasint,
                             k as blasint,
