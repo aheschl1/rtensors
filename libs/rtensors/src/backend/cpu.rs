@@ -682,26 +682,25 @@ macro_rules! blas_impl {
         impl BackendMatMul<$t> for Cpu {
             fn matmul(
                 &self,
-                lhs: (&Self::Buf<$t>, &MetaTensor),
-                rhs: (&Self::Buf<$t>, &MetaTensor),
+                lhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
+                rhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
                 dst: &mut Self::Buf<$t>,
                 b: usize,
                 m: usize,
                 k: usize,
-                n: usize,
-                contiguity: ContiguityTypes
+                n: usize
             ) -> Result<(), TensorError> {
 
-                let (lhs_buf, lhs_meta): (&Self::Buf<$t>, &MetaTensor) = lhs;
-                let (rhs_buf, rhs_meta): (&Self::Buf<$t>, &MetaTensor) = rhs;
+                let (lhs_buf, lhs_meta, lhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes) = lhs;
+                let (rhs_buf, rhs_meta, rhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes) = rhs;
 
-                let lda = match &contiguity {
+                let lda = match &lhs_contiguity {
                     ContiguityTypes::ColumnMajor => lhs_meta.strides()[lhs_meta.rank() - 1] as blasint,
                     ContiguityTypes::RowMajor => lhs_meta.strides()[lhs_meta.rank() - 2] as blasint,
                     _ => panic!("Invalid contiguity for BLAS matmul")
                 };
 
-                let ldb = match &contiguity {
+                let ldb = match &rhs_contiguity {
                     ContiguityTypes::ColumnMajor => rhs_meta.strides()[rhs_meta.rank() - 1] as blasint,
                     ContiguityTypes::RowMajor => rhs_meta.strides()[rhs_meta.rank() - 2] as blasint,
                     _ => panic!("Invalid contiguity for BLAS matmul")
@@ -720,7 +719,7 @@ macro_rules! blas_impl {
                     k * n
                 };
                 
-                let (order, trans, m, n, lda, ldb, lhs, rhs) = match contiguity {
+                let (order, trans, m, n, lda, ldb, lhs, rhs) = match lhs_contiguity {
                     ContiguityTypes::RowMajor => (
                         CBLAS_ORDER::CblasRowMajor,
                         CBLAS_TRANSPOSE::CblasNoTrans,
@@ -784,24 +783,23 @@ macro_rules! generic_backend_matmul {
         impl BackendMatMul<$t> for Cpu {
             fn matmul(
                 &self,
-                lhs: (&Self::Buf<$t>, &MetaTensor),
-                rhs: (&Self::Buf<$t>, &MetaTensor),
+                lhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
+                rhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
                 dst: &mut Self::Buf<$t>,
                 b: usize,
                 m: usize,
                 k: usize,
                 n: usize,
-                contiguity: ContiguityTypes
             ) -> Result<(), TensorError> {
                 // let mut out_buf = self.alloc(b * m * n)?;
-                let (lhs_buf, lhs_meta): (&Self::Buf<$t>, &MetaTensor) = lhs;
-                let (rhs_buf, rhs_meta): (&Self::Buf<$t>, &MetaTensor) = rhs;
-                let lda = match contiguity {
+                let (lhs_buf, lhs_meta, lhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes) = lhs;
+                let (rhs_buf, rhs_meta, rhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes) = rhs;
+                let lda = match lhs_contiguity {
                     ContiguityTypes::ColumnMajor => lhs_meta.strides[lhs_meta.rank() - 1] as usize,
                     ContiguityTypes::RowMajor => lhs_meta.strides[lhs_meta.rank() - 2] as usize,
                     _ => panic!("Invalid contiguity for generic matmul")
                 };
-                let ldb = match contiguity {
+                let ldb = match rhs_contiguity {
                     ContiguityTypes::ColumnMajor => rhs_meta.strides[rhs_meta.rank() - 1] as usize,
                     ContiguityTypes::RowMajor => rhs_meta.strides[rhs_meta.rank() - 2] as usize,
                     _ => panic!("Invalid contiguity for generic matmul")
@@ -825,7 +823,7 @@ macro_rules! generic_backend_matmul {
                     let out_batch = batch * m * n;
                     // this is repeated code, yes, but we want to reduce indirection in the inner loop
                     // as this is a hot path. furthermore, branching in the inner loop will reduce chances of vectorization
-                    if contiguity == ContiguityTypes::RowMajor {
+                    if lhs_contiguity == ContiguityTypes::RowMajor {
                         for row in 0..m {
                             for col in 0..n {
                                 let mut sum: $t = <$t>::ZERO;

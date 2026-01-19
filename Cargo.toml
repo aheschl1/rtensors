@@ -4,5 +4,6 @@ resolver = "3"
 members = [
     "libs/rtensors",
     "libs/proc", 
-    "libs/benchmark"
+    "libs/benchmark",
+    "examples/mnist"
 ]

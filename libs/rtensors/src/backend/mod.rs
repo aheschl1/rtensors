@@ -410,13 +410,12 @@ pub trait Backend: Send + Sync + 'static + Clone + Debug {
 pub trait BackendMatMul<T: TensorValue>: Backend {
     fn matmul(
         &self,
-        lhs: (&Self::Buf<T>, &MetaTensor),
-        rhs: (&Self::Buf<T>, &MetaTensor),
+        lhs: (&Self::Buf<T>, &MetaTensor, ContiguityTypes),
+        rhs: (&Self::Buf<T>, &MetaTensor, ContiguityTypes),
         dst: &mut Self::Buf<T>,
         b: usize,
         m: usize,
         k: usize,
-        n: usize,
-        contiguity: ContiguityTypes,
+        n: usize
     ) -> Result<(), TensorError>;
 }

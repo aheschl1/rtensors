@@ -35,54 +35,43 @@ where
             ));
         }
 
-        let contiguity_type_lhs = contiguity_type(&lhs_view0.meta);
-        let contiguity_type_rhs =  contiguity_type(&rhs_view0.meta);
+        let mut contiguity_type_lhs = contiguity_type(&lhs_view0.meta);
+        let mut contiguity_type_rhs =  contiguity_type(&rhs_view0.meta);
 
         // the 0 copy scenario is both are already row major or both are column major
         // the 1 copy case is one is row major, the other is not
         // so, unless both are column major, we will target row major output
         // furthermore, no routine exists for producing fortran contiguous arrays from any other status
-        let target_contiguity = match (&contiguity_type_lhs, &contiguity_type_rhs) {
-            (ContiguityTypes::ColumnMajor, ContiguityTypes::ColumnMajor) => ContiguityTypes::ColumnMajor,
-            _ => ContiguityTypes::RowMajor,
-        };
+        // let target_contiguity = match (&contiguity_type_lhs, &contiguity_type_rhs) {
+        //     (ContiguityTypes::ColumnMajor, ContiguityTypes::ColumnMajor) => ContiguityTypes::ColumnMajor,
+        //     _ => ContiguityTypes::RowMajor,
+        // };
 
-        // println!("LHS contiguity: {:?}, RHS contiguity: {:?}, target contiguity: {:?}", contiguity_type_lhs, contiguity_type_rhs, target_contiguity);
+        println!("LHS contiguity: {:?}, RHS contiguity: {:?}", contiguity_type_lhs, contiguity_type_rhs);
 
-        debug_assert!(
-            target_contiguity == ContiguityTypes::RowMajor || target_contiguity == ContiguityTypes::ColumnMajor,
-            "target contiguity must be either row major or column major"
-        );
+        // debug_assert!(
+        //     target_contiguity == ContiguityTypes::RowMajor || target_contiguity == ContiguityTypes::ColumnMajor,
+        //     "target contiguity must be either row major or column major"
+        // );
 
 
         // materialize lhs to target contiguity if needed
-        let lhs_view = match (&contiguity_type_lhs, &target_contiguity) {
-            (ContiguityTypes::None, _) | (ContiguityTypes::ColumnMajor, ContiguityTypes::RowMajor) => {
-                debug_assert!(target_contiguity == ContiguityTypes::RowMajor);
-                let c = lhs_view0.contiguous();
-                _lhs_storage = Some(c);
-                unsafe{_lhs_storage.as_ref().unwrap_unchecked().view()}
-            },
-            (ContiguityTypes::RowMajor, _) | (ContiguityTypes::ColumnMajor, ContiguityTypes::ColumnMajor) => {
-                lhs_view0
-                // let c = lhs_view0.contiguous();
-                // _lhs_storage = Some(c);
-                // unsafe{_lhs_storage.as_ref().unwrap_unchecked().view()}
-            },
-            _ => unreachable!("this is bug :("),
+        let lhs_view = if contiguity_type_lhs == ContiguityTypes::None {
+            let c = lhs_view0.contiguous();
+            _lhs_storage = Some(c);
+            contiguity_type_lhs = ContiguityTypes::RowMajor; // now it is row major
+            unsafe{_lhs_storage.as_ref().unwrap_unchecked().view()}
+        } else {
+            lhs_view0
         };
         // materialize rhs to target contiguity if needed
-        let rhs_view = match (&contiguity_type_rhs, &target_contiguity) {
-            (ContiguityTypes::None, _) | (ContiguityTypes::ColumnMajor, ContiguityTypes::RowMajor) => {
-                debug_assert!(target_contiguity == ContiguityTypes::RowMajor);
-                let c = rhs_view0.contiguous();
-                _rhs_storage = Some(c);
-                unsafe{_rhs_storage.as_ref().unwrap_unchecked().view()}
-            },
-            (ContiguityTypes::RowMajor, _) | (ContiguityTypes::ColumnMajor, ContiguityTypes::ColumnMajor) => {
-                rhs_view0
-            },
-            _ => unreachable!("this is bug :("),
+        let rhs_view = if contiguity_type_rhs == ContiguityTypes::None {
+            let c = rhs_view0.contiguous();
+            _rhs_storage = Some(c);
+            contiguity_type_rhs = ContiguityTypes::RowMajor; // now it is row major
+            unsafe{_rhs_storage.as_ref().unwrap_unchecked().view()}
+        } else {
+            rhs_view0
         };
 
         let lhs_meta = &lhs_view.meta;
@@ -141,14 +130,13 @@ where
         let mut buf = lhs_view.backend.alloc(b*n*m)?;
 
         lhs_view.backend.matmul(
-            (lhs_view.buf, lhs_meta),
-            (rhs_view.buf, rhs_meta),
+            (lhs_view.buf, lhs_meta, contiguity_type_lhs),
+            (rhs_view.buf, rhs_meta, contiguity_type_rhs),
             &mut buf,
             b,
             m,
             k_l,
-            n,
-            target_contiguity
+            n
         )?;
 
         Ok(TensorBase::from_parts(
