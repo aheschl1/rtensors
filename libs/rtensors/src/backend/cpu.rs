@@ -682,74 +682,109 @@ macro_rules! blas_impl {
         impl BackendMatMul<$t> for Cpu {
             fn matmul(
                 &self,
-                lhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
-                rhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
+                (lhs_buf, lhs_meta, lhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
+                (rhs_buf, rhs_meta, rhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
                 dst: &mut Self::Buf<$t>,
                 b: usize,
-                mut m: usize,
+                m: usize,
                 k: usize,
-                mut n: usize
+                n: usize
             ) -> Result<(), TensorError> {
 
-                let (lhs_buf, lhs_meta, lhs_contiguity) = lhs;
-                let (rhs_buf, rhs_meta, rhs_contiguity) = rhs;
-
-                let mut lda = match &lhs_contiguity {
-                    ContiguityTypes::ColumnMajor => lhs_meta.strides()[lhs_meta.rank() - 1] as blasint,
-                    ContiguityTypes::RowMajor => lhs_meta.strides()[lhs_meta.rank() - 2] as blasint,
-                    _ => panic!("Invalid contiguity for BLAS matmul")
-                };
-
-                let mut ldb = match &rhs_contiguity {
-                    ContiguityTypes::ColumnMajor => rhs_meta.strides()[rhs_meta.rank() - 1] as blasint,
-                    ContiguityTypes::RowMajor => rhs_meta.strides()[rhs_meta.rank() - 2] as blasint,
-                    _ => panic!("Invalid contiguity for BLAS matmul")
-                };
-                let ldc = n as blasint; // row major
-
-                let mut bstride_lhs = if lhs_meta.rank() > 2 {
+                let bstride_lhs = if lhs_meta.rank() > 2 {
                     lhs_meta.strides()[lhs_meta.rank() - 3] as usize
                 } else {
+                    assert!(b == 1);
                     m * k
                 };
                 
-                let mut bstride_rhs = if rhs_meta.rank() > 2 {
+                let bstride_rhs = if rhs_meta.rank() > 2 {
                     rhs_meta.strides()[rhs_meta.rank() - 3] as usize
                 } else {
+                    assert!(b == 1);
                     k * n
                 };
 
-                let transpose_lhs = match lhs_contiguity {
-                    ContiguityTypes::RowMajor => CBLAS_TRANSPOSE::CblasTrans,
-                    ContiguityTypes::ColumnMajor => CBLAS_TRANSPOSE::CblasNoTrans,
-                    _ => panic!("Invalid contiguity for BLAS matmul")
+                let (
+                    transpose_lhs, 
+                    transpose_rhs, 
+                    m, 
+                    n, 
+                    lhs, 
+                    rhs, 
+                    bstride_lhs, 
+                    bstride_rhs,
+                    offset_lhs,
+                    offset_rhs,
+                    lda,
+                    ldb
+                ) = match (lhs_contiguity, rhs_contiguity) {
+                    (ContiguityTypes::ColumnMajor, ContiguityTypes::ColumnMajor) => (
+                        CBLAS_TRANSPOSE::CblasTrans, 
+                        CBLAS_TRANSPOSE::CblasTrans,
+                        n, m,
+                        rhs_buf.as_ptr(),
+                        lhs_buf.as_ptr(),
+                        bstride_rhs,
+                        bstride_lhs,
+                        rhs_meta.offset,
+                        lhs_meta.offset,
+                        rhs_meta.strides()[lhs_meta.rank() - 1] as blasint,
+                        lhs_meta.strides()[rhs_meta.rank() - 1] as blasint
+                    ), // because the output should be row major, and we are doing col major gemm, thus we transpose both
+                    (ContiguityTypes::RowMajor, ContiguityTypes::ColumnMajor) => (
+                        CBLAS_TRANSPOSE::CblasTrans, // tranpose of row major matrix is og matrix in col major
+                        CBLAS_TRANSPOSE::CblasNoTrans,
+                        m, n,
+                        lhs_buf.as_ptr(),
+                        rhs_buf.as_ptr(),
+                        bstride_lhs,
+                        bstride_rhs,
+                        lhs_meta.offset,
+                        rhs_meta.offset,
+                        lhs_meta.strides()[rhs_meta.rank() - 2] as blasint,
+                        rhs_meta.strides()[lhs_meta.rank() - 1] as blasint,
+                    ),
+                    (ContiguityTypes::ColumnMajor, ContiguityTypes::RowMajor) => (
+                        CBLAS_TRANSPOSE::CblasNoTrans,
+                        CBLAS_TRANSPOSE::CblasTrans,
+                        n, m,
+                        rhs_buf.as_ptr(),
+                        lhs_buf.as_ptr(),
+                        bstride_rhs,
+                        bstride_lhs,
+                        rhs_meta.offset,
+                        lhs_meta.offset,
+                        rhs_meta.strides()[rhs_meta.rank() - 2] as blasint,
+                        lhs_meta.strides()[lhs_meta.rank() - 1] as blasint
+                    ),
+                    (ContiguityTypes::RowMajor, ContiguityTypes::RowMajor) => (
+                        CBLAS_TRANSPOSE::CblasNoTrans,
+                        CBLAS_TRANSPOSE::CblasNoTrans,
+                        n, m,
+                        rhs_buf.as_ptr(),
+                        lhs_buf.as_ptr(),
+                        bstride_rhs,
+                        bstride_lhs,
+                        rhs_meta.offset,
+                        lhs_meta.offset,
+                        rhs_meta.strides()[rhs_meta.rank() - 2] as blasint,
+                        lhs_meta.strides()[lhs_meta.rank() - 2] as blasint
+                    ), // tranpose of row major matrix is og matrix in col major,
+                    _ => panic!("Invalid contiguity for matmul")
                 };
 
-                let transpose_rhs = match rhs_contiguity {
-                    ContiguityTypes::RowMajor => CBLAS_TRANSPOSE::CblasTrans,
-                    ContiguityTypes::ColumnMajor => CBLAS_TRANSPOSE::CblasNoTrans,
-                    _ => panic!("Invalid contiguity for BLAS matmul")
-                };
-
-                let mut lhs = lhs_buf.as_ptr();
-                let mut rhs = rhs_buf.as_ptr();
-                if lhs_contiguity == rhs_contiguity && lhs_contiguity == ContiguityTypes::RowMajor {
-                    // swaps
-                    (m, n) = (n, m);
-                    (lda, ldb) = (ldb, lda);
-                    (bstride_lhs, bstride_rhs) = (bstride_rhs, bstride_lhs);
-                    (lhs, rhs) = (rhs, lhs);
-                }
+                let ldc = m as blasint;
                 for batch in 0..b {
                     // base pointers
-                    let lhs_batch = lhs_meta.offset + batch * bstride_lhs;
-                    let rhs_batch = rhs_meta.offset + batch * bstride_rhs;
+                    let lhs_batch = offset_lhs + batch * bstride_lhs;
+                    let rhs_batch = offset_rhs + batch * bstride_rhs;
 
                     let out_batch = batch * m * n; // contiguous 0 offset
 
                     unsafe {
                         $gemm_fn(
-                            CBLAS_ORDER::CblasRowMajor,
+                            CBLAS_ORDER::CblasColMajor,
                             transpose_lhs,
                             transpose_rhs,
                             m as blasint,

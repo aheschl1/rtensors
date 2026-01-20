@@ -435,6 +435,10 @@ fn build_cuda_kernels() {
         
         println!("cargo:warning=Compiling {} to object file...", kernel_file.display());
 
+        // Determine if this is a release build
+        let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+        let is_release = profile == "release";
+
         // Build compilation command with multiple architectures if specified
         let mut compile_cmd = Command::new(&nvcc);
         compile_cmd
@@ -446,6 +450,23 @@ fn build_cuda_kernels() {
             .arg("cuda/include")
             .arg("--compiler-options")
             .arg("-fPIC");
+        
+        // Add optimization flags for release builds
+        if is_release {
+            compile_cmd
+                .arg("-O3")                             // Maximum optimization
+                .arg("--use_fast_math")                 // Fast math (trade precision for speed)
+                .arg("--extra-device-vectorization")    // Enable extra vectorization
+                .arg("--fmad=true")                     // Fused multiply-add
+                .arg("--prec-div=false")                // Use fast division
+                .arg("--prec-sqrt=false")               // Use fast sqrt
+                .arg("--maxrregcount=128")              // Increase register usage for better perf
+                .arg("-Xptxas=-O3");                    // Maximum PTX optimization
+        } else {
+            compile_cmd
+                .arg("-g")                     // Debug info for debug builds
+                .arg("-G");                    // Generate debug info for device code
+        }
         
         // Add architecture flags
         for arch in &archs {

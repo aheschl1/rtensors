@@ -250,6 +250,10 @@ where
         })
     }
 
+    pub fn to_buf(&self) -> Result<Box<[T]>, TensorError> {
+        self.backend.dump(&self.buf)
+    }
+
     /// Creates a rank-0 (scalar) tensor.
     /// 
     /// # Examples

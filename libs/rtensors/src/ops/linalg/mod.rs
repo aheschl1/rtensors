@@ -1,6 +1,6 @@
 use crate::{backend::Backend, core::{tensor::TensorError, value::{TensorValue, WeightValue}}};
 
-mod matmul;
+pub mod matmul;
 mod conv;
 
 pub use conv::*;
@@ -503,6 +503,8 @@ mod tests {
             vec![2, 2]
         ).unwrap();
         
+        println!("Identity Slice: {:?}", identity_slice.meta);
+
         let result = identity_slice.matmul(&test_matrix).unwrap();
         
         // Should get test_matrix back

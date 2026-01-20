@@ -38,23 +38,6 @@ where
         let mut contiguity_type_lhs = contiguity_type(&lhs_view0.meta);
         let mut contiguity_type_rhs =  contiguity_type(&rhs_view0.meta);
 
-        // the 0 copy scenario is both are already row major or both are column major
-        // the 1 copy case is one is row major, the other is not
-        // so, unless both are column major, we will target row major output
-        // furthermore, no routine exists for producing fortran contiguous arrays from any other status
-        // let target_contiguity = match (&contiguity_type_lhs, &contiguity_type_rhs) {
-        //     (ContiguityTypes::ColumnMajor, ContiguityTypes::ColumnMajor) => ContiguityTypes::ColumnMajor,
-        //     _ => ContiguityTypes::RowMajor,
-        // };
-
-        println!("LHS contiguity: {:?}, RHS contiguity: {:?}", contiguity_type_lhs, contiguity_type_rhs);
-
-        // debug_assert!(
-        //     target_contiguity == ContiguityTypes::RowMajor || target_contiguity == ContiguityTypes::ColumnMajor,
-        //     "target contiguity must be either row major or column major"
-        // );
-
-
         // materialize lhs to target contiguity if needed
         let lhs_view = if contiguity_type_lhs == ContiguityTypes::None {
             let c = lhs_view0.contiguous();
