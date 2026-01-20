@@ -34,6 +34,27 @@ let gpu_tensor = cpu_tensor.cuda().unwrap();
 let back_to_cpu = gpu_tensor.cpu().unwrap();
 ```
 
+## IO
+
+### Image I/O
+
+Load images directly into tensors and convert tensors back to images. Uses the `image` crate for I/O. Gated by the `imagers` feature.
+
+```rust
+use image::open;
+
+// Load an image into a tensor
+// Automatically converts to [height, width, channels] format
+let img = open("path/to/image.png").unwrap();
+let tensor = Tensor::<u8>::from(img);  // Shape: (H, W, C)
+
+// Convert tensor back to image
+// Tensor must have shape [height, width, 3] for RGB
+let tensor = Tensor::<u8>::zeros((64, 64, 3));
+let rgb_image = tensor.into_rgb_image().unwrap();
+rgb_image.save("output.png").unwrap();
+```
+
 ## Indexing
 
 ```rust
