@@ -735,15 +735,15 @@ macro_rules! blas_impl {
                     (ContiguityTypes::RowMajor, ContiguityTypes::ColumnMajor) => (
                         CBLAS_TRANSPOSE::CblasTrans, // tranpose of row major matrix is og matrix in col major
                         CBLAS_TRANSPOSE::CblasNoTrans,
-                        m, n,
-                        lhs_buf.as_ptr(),
+                        n, m,
                         rhs_buf.as_ptr(),
-                        bstride_lhs,
+                        lhs_buf.as_ptr(),
                         bstride_rhs,
-                        lhs_meta.offset,
+                        bstride_lhs,
                         rhs_meta.offset,
-                        lhs_meta.strides()[rhs_meta.rank() - 2] as blasint,
+                        lhs_meta.offset,
                         rhs_meta.strides()[lhs_meta.rank() - 1] as blasint,
+                        lhs_meta.strides()[rhs_meta.rank() - 2] as blasint,
                     ),
                     (ContiguityTypes::ColumnMajor, ContiguityTypes::RowMajor) => (
                         CBLAS_TRANSPOSE::CblasNoTrans,
@@ -824,6 +824,9 @@ macro_rules! generic_backend_matmul {
                 // let mut out_buf = self.alloc(b * m * n)?;
                 let (lhs_buf, lhs_meta, lhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes) = lhs;
                 let (rhs_buf, rhs_meta, rhs_contiguity): (&Self::Buf<$t>, &MetaTensor, ContiguityTypes) = rhs;
+                if lhs_contiguity != rhs_contiguity {
+                    todo!("Kernel needs a refactor to handle different contiguity types between LHS and RHS in generic dtype case.");
+                }
                 let lda = match lhs_contiguity {
                     ContiguityTypes::ColumnMajor => lhs_meta.strides[lhs_meta.rank() - 1] as usize,
                     ContiguityTypes::RowMajor => lhs_meta.strides[lhs_meta.rank() - 2] as usize,

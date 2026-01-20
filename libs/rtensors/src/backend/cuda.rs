@@ -1776,6 +1776,10 @@ macro_rules! generic_matmul_impl {
                 let (lhs_buf, lhs_meta, lhs_contiguity) = lhs;
                 let (rhs_buf, rhs_meta, rhs_contiguity) = rhs;
 
+                if lhs_contiguity != rhs_contiguity {
+                    todo!("Kernel needs a refactor to handle different contiguity types between LHS and RHS in generic dtype case.");
+                }
+
                 let (lhs_ptr, _) = lhs_buf.ptr.device_ptr(&stream);
                 let (rhs_ptr, _) = rhs_buf.ptr.device_ptr(&stream);
                 let (dst_ptr, _) = dst.ptr.device_ptr(&stream);
