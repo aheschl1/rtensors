@@ -525,10 +525,10 @@ mod tests {
         // Slice rows 0-2, cols 1-3 -> [2, 2]
         let sliced_step1 = full.slice(0, 0..2).unwrap();
         let sliced = sliced_step1.slice(1, 1..3).unwrap();
-        
+        // [[2,3],[6,7]]
         // Transpose it -> [2, 2]
         let transposed = sliced.transpose();
-        
+        // [[2,6],[3,7]]
         let b = Tensor::<f64>::from_buf(
             vec![1.0, 0.0, 0.0, 1.0],
             vec![2, 2]
@@ -542,8 +542,11 @@ mod tests {
         // sliced is [[2,3], [6,7]]
         // transposed is [[2,6], [3,7]]
         // result should be transposed unchanged (identity mult)
-        assert_eq!(result.get(vec![0, 0]).unwrap(), 2.0);
-        assert_eq!(result.get(vec![0, 1]).unwrap(), 6.0);
+        let expected = Tensor::<f64>::from_buf(
+            vec![2.0, 6.0, 3.0, 7.0],
+            vec![2, 2]
+        ).unwrap();
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -2237,9 +2240,11 @@ mod cuda_tests {
         // sliced is [[2,3], [6,7]]
         // transposed is [[2,6], [3,7]]
         // result should be transposed unchanged (identity mult)
-        let result_cpu = result.cpu().unwrap();
-        assert_eq!(result_cpu.get(vec![0, 0]).unwrap(), 2.0);
-        assert_eq!(result_cpu.get(vec![0, 1]).unwrap(), 6.0);
+        let expected = Tensor::<f64>::from_buf(
+            vec![2.0, 6.0, 3.0, 7.0],
+            vec![2, 2]
+        ).unwrap();
+        assert_eq!(result.cpu().unwrap(), expected);
     }
 
     // ============================================================================
