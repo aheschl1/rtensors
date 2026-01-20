@@ -318,6 +318,7 @@ impl<T: WeightValue, B: Backend> GradContext<T, B> {
                 _ => {
                     // free memory by removing upstream grads after use
                     accumulations.remove(&node_key);
+                    nodes.remove(node_key);
                 }
             }
         }

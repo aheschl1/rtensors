@@ -4,5 +4,19 @@ resolver = "3"
 members = [
     "libs/rtensors",
     "libs/proc", 
-    "libs/benchmark"
+    "libs/benchmark",
+    "examples/mnist"
 ]
+
+[profile.release]
+opt-level = 3              # Maximum optimization
+lto = "fat"                # Full link-time optimization across all crates
+codegen-units = 1          # Single codegen unit for maximum optimization
+strip = true               # Remove debug symbols
+panic = "abort"            # Smaller binary, no unwinding overhead
+debug = false              # No debug info
+incremental = false        # Disable incremental compilation for better optimization
+
+[profile.release.package."*"]
+opt-level = 3
+codegen-units = 1

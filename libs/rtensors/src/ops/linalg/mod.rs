@@ -1,6 +1,6 @@
 use crate::{backend::Backend, core::{tensor::TensorError, value::{TensorValue, WeightValue}}};
 
-mod matmul;
+pub mod matmul;
 mod conv;
 
 pub use conv::*;
@@ -503,6 +503,8 @@ mod tests {
             vec![2, 2]
         ).unwrap();
         
+        println!("Identity Slice: {:?}", identity_slice.meta);
+
         let result = identity_slice.matmul(&test_matrix).unwrap();
         
         // Should get test_matrix back
@@ -511,7 +513,6 @@ mod tests {
 
     #[test]
     fn test_matmul_f64_slice_then_transpose() {
-        // Test slicing followed by transpose for matmul
         let full = Tensor::<f64>::from_buf(
             vec![
                 1.0, 2.0, 3.0, 4.0,
@@ -523,59 +524,11 @@ mod tests {
         
         // Slice rows 0-2, cols 1-3 -> [2, 2]
         let sliced_step1 = full.slice(0, 0..2).unwrap();
-        // let expecteda = Tensor::<f64>::from_buf(
-        //     vec![
-        //         1.0, 2.0, 3.0, 4.0,
-        //         5.0, 6.0, 7.0, 8.0,
-        //     ],
-        //     vec![2, 4]
-        // ).unwrap();
-        // assert_eq!(sliced_step1.get((0, 0)), expecteda.get((0, 0)));
-        // assert_eq!(sliced_step1.get((0, 1)), expecteda.get((0, 1)));
-        // assert_eq!(sliced_step1.get((1, 0)), expecteda.get((1, 0)));
-        // assert_eq!(sliced_step1.get((1, 1)), expecteda.get((1, 1)));
-        // assert_eq!(sliced_step1.get((1, 2)), expecteda.get((1, 2)));
-        // assert_eq!(sliced_step1.get((1, 3)), expecteda.get((1, 3)));
-        // assert_eq!(sliced_step1.get((0, 2)), expecteda.get((0, 2)));
-        // assert_eq!(sliced_step1.get((0, 3)), expecteda.get((0, 3)));
-
         let sliced = sliced_step1.slice(1, 1..3).unwrap();
-
-        // let expectedb = Tensor::<f64>::from_buf(
-        //     vec![
-        //         2.0, 3.0,
-        //         6.0, 7.0,
-        //     ],
-        //     vec![2, 2]
-        // ).unwrap();
-        // assert_eq!(sliced.get((0, 0)), expectedb.get((0, 0)));
-        // assert_eq!(sliced.get((0, 1)), expectedb.get((0, 1)));
-        // assert_eq!(sliced.get((1, 0)), expectedb.get((1, 0)));
-        // assert_eq!(sliced.get((1, 1)), expectedb.get((1, 1)));
-        
+        // [[2,3],[6,7]]
         // Transpose it -> [2, 2]
         let transposed = sliced.transpose();
-
-        // let expectedc = Tensor::<f64>::from_buf(
-        //     vec![
-        //         2.0, 6.0,
-        //         3.0, 7.0,
-        //     ],
-        //     vec![2, 2]
-        // ).unwrap();
-
-        // assert_eq!(transposed.get((0, 0)), expectedc.get((0, 0)));
-        // assert_eq!(transposed.get((0, 1)), expectedc.get((0, 1)));
-        // assert_eq!(transposed.get((1, 0)), expectedc.get((1, 0)));
-        // assert_eq!(transposed.get((1, 1)), expectedc.get((1, 1)));
-
-        // let contig = transposed.contiguous();
-        // // assert_eq!(contig, transposed);
-        // assert_eq!(transposed.get(vec![0, 0]).unwrap(), contig.buf[0]);
-        // assert_eq!(transposed.get(vec![0, 1]).unwrap(), contig.buf[1]);
-        // assert_eq!(transposed.get(vec![1, 0]).unwrap(), contig.buf[2]);
-        // assert_eq!(transposed.get(vec![1, 1]).unwrap(), contig.buf[3]);
-        
+        // [[2,6],[3,7]]
         let b = Tensor::<f64>::from_buf(
             vec![1.0, 0.0, 0.0, 1.0],
             vec![2, 2]
@@ -583,12 +536,17 @@ mod tests {
         
         let result = transposed.matmul(&b).unwrap();
         assert_eq!(*result.shape(), vec![2, 2]);
-        
+
+        let result2 = b.matmul(&transposed).unwrap();
+        assert_eq!(result2, result);
         // sliced is [[2,3], [6,7]]
         // transposed is [[2,6], [3,7]]
         // result should be transposed unchanged (identity mult)
-        assert_eq!(result.get(vec![0, 0]).unwrap(), 2.0);
-        assert_eq!(result.get(vec![0, 1]).unwrap(), 6.0);
+        let expected = Tensor::<f64>::from_buf(
+            vec![2.0, 6.0, 3.0, 7.0],
+            vec![2, 2]
+        ).unwrap();
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -1803,6 +1761,37 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    #[test]
+    fn test_both_column_major_identity() {
+        let a = Tensor::<f32>::from_buf(
+            vec![
+                1.0, 3.0,
+                2.0, 4.0,
+            ],
+            vec![2, 2]
+        ).unwrap();
+
+        let b = Tensor::<f32>::from_buf(
+            vec![
+                1., 0.,
+                0., 1.,
+            ],
+            vec![2, 2]
+        ).unwrap();
+
+        let result = a.transpose().matmul(&b.transpose()).unwrap();
+
+        let expected = Tensor::<f32>::from_buf(
+            vec![
+                1., 2.,
+                3., 4.,
+            ],
+            vec![2, 2]
+        ).unwrap();
+
+        assert_eq!(result, expected);
+    }
+
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -2245,13 +2234,17 @@ mod cuda_tests {
         
         let result = transposed.matmul(&b).unwrap();
         assert_eq!(*result.shape(), vec![2, 2]);
-        
+
+        let result2 = b.matmul(&transposed).unwrap();
+        assert_eq!(result2.cpu().unwrap(), result.cpu().unwrap());
         // sliced is [[2,3], [6,7]]
         // transposed is [[2,6], [3,7]]
         // result should be transposed unchanged (identity mult)
-        let result_cpu = result.cpu().unwrap();
-        assert_eq!(result_cpu.get(vec![0, 0]).unwrap(), 2.0);
-        assert_eq!(result_cpu.get(vec![0, 1]).unwrap(), 6.0);
+        let expected = Tensor::<f64>::from_buf(
+            vec![2.0, 6.0, 3.0, 7.0],
+            vec![2, 2]
+        ).unwrap();
+        assert_eq!(result.cpu().unwrap(), expected);
     }
 
     // ============================================================================
@@ -3112,6 +3105,7 @@ mod cuda_tests {
         assert_eq!(result.cpu().unwrap(), expected.cpu().unwrap());
     }
 
+
     // ============================================================================
     // DOT PRODUCT TESTS (CUDA)
     // ============================================================================
@@ -3312,6 +3306,37 @@ mod cuda_tests {
         ).unwrap();
         
         assert_eq!(result.cpu().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_both_column_major_identity() {
+        let a = CudaTensor::<f32>::from_buf(
+            vec![
+                1.0, 3.0,
+                2.0, 4.0,
+            ],
+            vec![2, 2]
+        ).unwrap();
+
+        let b = CudaTensor::<f32>::from_buf(
+            vec![
+                1., 0.,
+                0., 1.,
+            ],
+            vec![2, 2]
+        ).unwrap();
+
+        let result = a.transpose().matmul(&b.transpose()).unwrap();
+
+        let expected = CudaTensor::<f32>::from_buf(
+            vec![
+                1., 2.,
+                3., 4.,
+            ],
+            vec![2, 2]
+        ).unwrap();
+
+        assert_eq!(result.cpu().unwrap(), expected.cpu().unwrap());
     }
 
 

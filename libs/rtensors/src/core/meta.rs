@@ -741,7 +741,7 @@ impl AsRef<[isize]> for Strides {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "remote", derive(Serialize, Deserialize))]
 pub enum ContiguityTypes {
     RowMajor,

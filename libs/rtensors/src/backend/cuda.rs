@@ -608,7 +608,14 @@ impl Backend for Cuda {
         // }
         // Ok(())
 
-        todo!()
+        // iterate through elements TODO improve
+        for i in 0..src.len {
+            let value: T = self.read(src, i)?;
+            let converted_value: N = T::convert::<N>(&value);
+            self.write(dst, i, converted_value)?;
+        }
+        Ok(())
+
     }
 
     fn alloc<T: TensorValue>(
@@ -1755,20 +1762,23 @@ macro_rules! generic_matmul_impl {
         impl BackendMatMul<$t> for Cuda {
             fn matmul(
                 &self,
-                lhs: (&Self::Buf<$t>, &MetaTensor),
-                rhs: (&Self::Buf<$t>, &MetaTensor),
+                lhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
+                rhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
                 dst: &mut Self::Buf<$t>,
                 b: usize,
                 m: usize,
                 k: usize,
-                n: usize,
-                contiguity: ContiguityTypes
+                n: usize
             ) -> Result<(), TensorError> {
                 let stream = self.stream();
                 // let res = self.alloc(b * m * n)?;
 
-                let (lhs_buf, lhs_meta) = lhs;
-                let (rhs_buf, rhs_meta) = rhs;
+                let (lhs_buf, lhs_meta, lhs_contiguity) = lhs;
+                let (rhs_buf, rhs_meta, rhs_contiguity) = rhs;
+
+                if lhs_contiguity != rhs_contiguity {
+                    todo!("Kernel needs a refactor to handle different contiguity types between LHS and RHS in generic dtype case.");
+                }
 
                 let (lhs_ptr, _) = lhs_buf.ptr.device_ptr(&stream);
                 let (rhs_ptr, _) = rhs_buf.ptr.device_ptr(&stream);
@@ -1788,12 +1798,12 @@ macro_rules! generic_matmul_impl {
 
                 // let lda = lhs_meta.strides()[lhs_meta.rank() - 2] as usize;
                 // let ldb = rhs_meta.strides()[rhs_meta.rank() - 2] as usize;
-                let lda = match contiguity {
+                let lda = match lhs_contiguity {
                     ContiguityTypes::RowMajor => lhs_meta.strides()[lhs_meta.rank() - 2] as usize,    // row-major
                     ContiguityTypes::ColumnMajor => lhs_meta.strides()[lhs_meta.rank() - 1] as usize, // column-major
                     ContiguityTypes::None => panic!("Matrix multiplication requires contiguous memory layout (either row-major or column-major)"),
                 };
-                let ldb = match contiguity {
+                let ldb = match rhs_contiguity {
                     ContiguityTypes::RowMajor => rhs_meta.strides()[rhs_meta.rank() - 2] as usize,    // row-major
                     ContiguityTypes::ColumnMajor => rhs_meta.strides()[rhs_meta.rank() - 1] as usize, // column-major
                     ContiguityTypes::None => panic!("Matrix multiplication requires contiguous memory layout (either row-major or column-major)"),
@@ -1802,7 +1812,7 @@ macro_rules! generic_matmul_impl {
 
                 // Convert Rust enum to C enum
                 // These values match the ContiguityType enum in common.h
-                let contiguity_c: u8 = match contiguity {
+                let contiguity_c: u8 = match lhs_contiguity {
                     ContiguityTypes::RowMajor => 0,    // ROW_MAJOR
                     ContiguityTypes::ColumnMajor => 1, // COLUMN_MAJOR
                     ContiguityTypes::None => panic!("Matrix multiplication requires contiguous memory layout (either row-major or column-major)"),
@@ -1847,50 +1857,98 @@ macro_rules! cublas_impl {
         impl BackendMatMul<$t> for Cuda {
             fn matmul(
                 &self,
-                lhs: (&Self::Buf<$t>, &MetaTensor),
-                rhs: (&Self::Buf<$t>, &MetaTensor),
+                lhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
+                rhs: (&Self::Buf<$t>, &MetaTensor, ContiguityTypes),
                 dst: &mut Self::Buf<$t>,
                 b: usize,
                 m: usize,
                 k: usize,
-                n: usize,
-                contiguity: ContiguityTypes,
+                n: usize
             ) -> Result<(), TensorError> {
-                let (lhs_buf, lhs_meta) = lhs;
-                let (rhs_buf, rhs_meta) = rhs;
+                let (lhs_buf, lhs_meta, lhs_contiguity) = lhs;
+                let (rhs_buf, rhs_meta, rhs_contiguity) = rhs;
 
-                let lhs_ptr = rhs_buf.ptr.slice(rhs_meta.offset..);
-                let rhs_ptr = lhs_buf.ptr.slice(lhs_meta.offset..);
-                let ldc = n as i32;
+                let lhs_ptr = lhs_buf.ptr.slice(lhs_meta.offset..);
+                let rhs_ptr = rhs_buf.ptr.slice(rhs_meta.offset..);
+                
+                // batch stride for C (output is always row-major and contiguous)
                 let stride_c = (m * n) as i64;
 
-                let bstride_lhs = if rhs_meta.rank() > 2 {
-                    rhs_meta.strides()[rhs_meta.rank() - 3] as i64
+                let bstride_lhs = if lhs_meta.rank() > 2 {
+                    lhs_meta.strides()[lhs_meta.rank() - 3] as usize
                 } else {
-                    n as i64 * k as i64
+                    assert!(b == 1);
+                    m * k
                 };
-                let bstride_rhs = if lhs_meta.rank() > 2 {
-                    lhs_meta.strides()[lhs_meta.rank() - 3] as i64
+                
+                let bstride_rhs = if rhs_meta.rank() > 2 {
+                    rhs_meta.strides()[rhs_meta.rank() - 3] as usize
                 } else {
-                    k as i64 * m as i64
+                    assert!(b == 1);
+                    k * n
                 };
 
-                // vary by contiguity
-                let (stride_idx, transpose) = match contiguity {
-                    ContiguityTypes::ColumnMajor => (1, cublasOperation_t::CUBLAS_OP_T),
-                    ContiguityTypes::RowMajor => (2, cublasOperation_t::CUBLAS_OP_N),
-                    _ => panic!("cuBLAS matmul only supports RowMajor and ColumnMajor contiguity"),
+                let (
+                    transpose_lhs, 
+                    transpose_rhs, 
+                    m_gemm, 
+                    n_gemm, 
+                    use_lhs_first, // if true, use lhs then rhs; if false, use rhs then lhs
+                    bstride_first, 
+                    bstride_second,
+                    lda,
+                    ldb
+                ) = match (lhs_contiguity, rhs_contiguity) {
+                    (ContiguityTypes::ColumnMajor, ContiguityTypes::ColumnMajor) => (
+                        cublasOperation_t::CUBLAS_OP_T, 
+                        cublasOperation_t::CUBLAS_OP_T,
+                        n, m,
+                        false, // use rhs first
+                        bstride_rhs as i64,
+                        bstride_lhs as i64,
+                        rhs_meta.strides()[lhs_meta.rank() - 1] as i32,
+                        lhs_meta.strides()[rhs_meta.rank() - 1] as i32
+                    ), // because the output should be row major, and we are doing col major gemm, thus we transpose both
+                    (ContiguityTypes::RowMajor, ContiguityTypes::ColumnMajor) => (
+                        cublasOperation_t::CUBLAS_OP_T, // transpose of row major matrix is og matrix in col major
+                        cublasOperation_t::CUBLAS_OP_N,
+                        n, m,
+                        false, // use lhs first
+                        bstride_rhs as i64,
+                        bstride_lhs as i64,
+                        rhs_meta.strides()[lhs_meta.rank() - 1] as i32,
+                        lhs_meta.strides()[rhs_meta.rank() - 2] as i32,
+                    ),
+                    (ContiguityTypes::ColumnMajor, ContiguityTypes::RowMajor) => (
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublasOperation_t::CUBLAS_OP_T,
+                        n, m,
+                        false, // use rhs first
+                        bstride_rhs as i64,
+                        bstride_lhs as i64,
+                        rhs_meta.strides()[rhs_meta.rank() - 2] as i32,
+                        lhs_meta.strides()[lhs_meta.rank() - 1] as i32
+                    ),
+                    (ContiguityTypes::RowMajor, ContiguityTypes::RowMajor) => (
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublasOperation_t::CUBLAS_OP_N,
+                        n, m,
+                        false, // use rhs first
+                        bstride_rhs as i64,
+                        bstride_lhs as i64,
+                        rhs_meta.strides()[rhs_meta.rank() - 2] as i32,
+                        lhs_meta.strides()[lhs_meta.rank() - 2] as i32
+                    ), // transpose of row major matrix is og matrix in col major,
+                    _ => panic!("Invalid contiguity for matmul")
                 };
 
-                let lda = rhs_meta.strides()[rhs_meta.rank() - stride_idx] as i32;
-                let ldb = lhs_meta.strides()[lhs_meta.rank() - stride_idx] as i32;
-                let (m, n, k) = (n, m, k);
+                let ldc = m_gemm as i32;
 
                 let cfg = GemmConfig {
-                    transa: transpose,
-                    transb: transpose,
-                    m: m as i32,
-                    n: n as i32,
+                    transa: transpose_lhs,
+                    transb: transpose_rhs,
+                    m: m_gemm as i32,
+                    n: n_gemm as i32,
                     k: k as i32,
                     alpha: 1.0,
                     lda,
@@ -1901,21 +1959,31 @@ macro_rules! cublas_impl {
                 let cfg = StridedBatchedConfig {
                     gemm: cfg,
                     batch_size: b as i32,
-                    stride_a: bstride_lhs,
-                    stride_b: bstride_rhs,
+                    stride_a: bstride_first,
+                    stride_b: bstride_second,
                     stride_c,
                 };
                 // let mut res = self.alloc(b*n*m)?;
                 unsafe {
-                    // Note: operands are swapped (B, A instead of A, B)
-                    self.cublas
-                        .gemm_strided_batched(
-                            cfg,
-                            &lhs_ptr, // B comes first
-                            &rhs_ptr, // A comes second
-                            &mut dst.ptr,
-                        )
-                        .map_err(|e| TensorError::CudaError(e.to_string()))?;
+                    if use_lhs_first {
+                        self.cublas
+                            .gemm_strided_batched(
+                                cfg,
+                                &lhs_ptr,
+                                &rhs_ptr,
+                                &mut dst.ptr,
+                            )
+                            .map_err(|e| TensorError::CudaError(e.to_string()))?;
+                    } else {
+                        self.cublas
+                            .gemm_strided_batched(
+                                cfg,
+                                &rhs_ptr,
+                                &lhs_ptr,
+                                &mut dst.ptr,
+                            )
+                            .map_err(|e| TensorError::CudaError(e.to_string()))?;
+                    }
                 }
                 self.dirty();
                 Ok(())
