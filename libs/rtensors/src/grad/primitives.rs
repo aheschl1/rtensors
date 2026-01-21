@@ -146,7 +146,7 @@ impl<T: TensorValue, B: Backend> MetaTensorView for GradTensorInner<T, B> {
     }
 }
 
-pub type GradTensorRef<T, B> = Arc<RefCell<GradTensorInner<T, B>>>;
+// pub type GradTensorRef<T, B> = Arc<RefCell<GradTensorInner<T, B>>>;
 
 impl<T: TensorValue, B: Backend> std::fmt::Debug for GradTensorInner<T, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

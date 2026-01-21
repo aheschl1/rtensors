@@ -1,6 +1,6 @@
 use slotmap::{new_key_type, SecondaryMap};
 
-use crate::{backend::{cpu::Cpu, Backend, BackendMatMul}, core::{idx::Idx, primitives::TensorBase, tensor::TensorError, value::{TensorValue, WeightValue}, Shape, Strides}, grad::primitives::{GradTensor, GradTensorRef}};
+use crate::{backend::{Backend, BackendMatMul, cpu::Cpu}, core::{Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, value::{TensorValue, WeightValue}}};
 #[cfg(feature = "cuda")]
 use crate::backend::cuda::Cuda;
 use std::{any::{Any, TypeId}, cell::RefCell};
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 mod backwards;
 pub mod optim;
-pub mod primitives;
+// pub mod primitives;
 
 pub use proc::when_enabled;
 
@@ -19,10 +19,10 @@ new_key_type! {
 }
 
 /// Each variant of a node holds parents and any tensors that need to be saved for backward.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GradNode<T: TensorValue, B: Backend> {
     // LEAF NODES
-    Leaf( GradTensorRef<T, B> ),
+    Leaf( Grad<T, B> ),
     None,
     // OPS
     BroadcastAdd { 
@@ -101,7 +101,7 @@ pub(crate) enum GradNode<T: TensorValue, B: Backend> {
         // consider siamese networks
         target: NodeKey,
         grad_map: TensorBase<T, B>, // where is the diff greater than zero
-        loss: GradTensorRef<T, B>,
+        loss: TensorBase<T, B>,
     },
 }
 
@@ -110,7 +110,7 @@ impl<T: WeightValue, B: Backend> GradNode<T, B> {
         matches!(self, GradNode::Leaf(..))
     }
 
-    pub fn leaf(inner: GradTensorRef<T, B>) -> Self {
+    pub fn leaf(inner: Grad<T, B>) -> Self {
         GradNode::Leaf(inner)
     }
 
@@ -190,6 +190,12 @@ impl<T: WeightValue, B: Backend> GradNode<T, B> {
             // _ => Err(TensorError::UnsupportedOperation("Backward not implemented for this node type.".into())),
         }
     }
+    fn loss(&self) -> Option<&TensorBase<T, B>> {
+        match self {
+            GradNode::L1 { loss, .. } => Some(loss),
+            _ => None,
+        }
+    }
 }
 
 pub struct GradContext<T: TensorValue, B: Backend> {
@@ -218,26 +224,23 @@ impl<T: WeightValue, B: Backend> GradContext<T, B> {
     #[inline]
     pub(crate) fn make_leaf(
         &self,
-        inner: GradTensorRef<T, B>,
-    ) -> GradTensor<T, B> {
-        let node = GradNode::leaf(inner.clone());
-        self.attach(inner, node)
+        inner: &TensorBase<T, B>,
+    ) {
+        let node = GradNode::leaf(inner.grad.clone());
+        self.attach(inner, node);
     }
 
     #[inline]
     pub(crate) fn attach(
         &self,
-        inner: GradTensorRef<T, B>,
+        inner: &impl OpTensor,
         op: GradNode<T, B>,
-    ) -> GradTensor<T, B> {
+    ) {
         let node_id = self.nodes.borrow_mut().insert(op);
-        GradTensor {
-            inner,
-            node: node_id,
-        }
+        inner.set_op(node_id);
     }
 
-    pub fn backwards(&self, root: &GradTensor<T, B>) -> Result<(), TensorError> 
+    pub fn backwards(&self, root: &impl OpTensor) -> Result<(), TensorError> 
     where 
         B: BackendMatMul<T>
     {
@@ -246,7 +249,7 @@ impl<T: WeightValue, B: Backend> GradContext<T, B> {
         let mut stack = Vec::new();
         let mut marks = SecondaryMap::new();
         let mut node_order = Vec::new();
-        stack.push(StackState::Enter(root.node));
+        stack.push(StackState::Enter(root.op().expect("Root tensor has no associated grad node.")));
 
         enum StackState {
             Enter (NodeKey),
@@ -279,8 +282,13 @@ impl<T: WeightValue, B: Backend> GradContext<T, B> {
             }
         }
         // could in theory move this into the above loop but this is clearer
+        let root_node_key = root.op().expect("Root tensor has no associated grad node.");
+        let loss = self.nodes.borrow().get(root_node_key)
+            .and_then(|n| n.loss().cloned())
+            .ok_or_else(|| TensorError::GradError("Root node does not contain a loss.".into()))?;
+
         let mut accumulations = HashMap::new();
-        accumulations.insert(root.node, vec![root.borrow().tensor.clone()]);
+        accumulations.insert(root_node_key, vec![loss]);
 
         // println!("{:?}", node_order
         //     .iter()

@@ -8,7 +8,7 @@ use cudarc::{
     driver::{CudaContext, CudaSlice, DevicePtr},
 };
 
-use crate::{backend::ContiguityTypes, core::{value::WeightValue, Dim}, ops::reduction::{NormType, ReductionOpTypes}};
+use crate::{backend::ContiguityTypes, core::{Dim, value::{WeightValue, types::boolean}}, ops::reduction::{NormType, ReductionOpTypes}};
 use crate::{
     backend::{Backend, BackendMatMul},
     core::{
@@ -54,6 +54,90 @@ const CUDA_BACKENDS: LazyLock<Vec<Cuda>> = LazyLock::new(|| {
 pub struct CudaBuf<T: TensorValue> {
     pub(crate) ptr: CudaSlice<T>,
     pub(crate) len: usize,
+}
+
+impl<T: TensorValue> PartialEq for CudaBuf<T> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        // Allocate result buffer on device
+        let backend = Cuda::new();
+        let stream = backend.stream();
+        // Allocate a single bool on device to store the result
+        let result_buf = match backend.alloc::<boolean>(1) {
+            Ok(buf) => buf,
+            Err(_) => return false,
+        };
+        let (a_ptr, _) = self.ptr.device_ptr(&stream);
+        let (b_ptr, _) = other.ptr.device_ptr(&stream);
+        let (result_ptr, _) = result_buf.ptr.device_ptr(&stream);
+        
+        macro_rules! launch_equal {
+            ($launch_fn:ident, $t:ty) => {{
+                unsafe {
+                    $launch_fn(
+                        a_ptr as *const $t,
+                        b_ptr as *const $t,
+                        result_ptr as *mut bool,
+                        self.len,
+                        DEFAULT_BLOCK_SIZE,
+                    );
+                }
+                backend.dirty();
+            }};
+        }
+        
+        // Dispatch based on type
+        match std::any::TypeId::of::<T>() {
+            id if id == std::any::TypeId::of::<f32>() => {
+                launch_equal!(launch_buffer_equal_f32, f32)
+            }
+            id if id == std::any::TypeId::of::<f64>() => {
+                launch_equal!(launch_buffer_equal_f64, f64)
+            }
+            id if id == std::any::TypeId::of::<u8>() => {
+                launch_equal!(launch_buffer_equal_u8, u8)
+            }
+            id if id == std::any::TypeId::of::<u16>() => {
+                launch_equal!(launch_buffer_equal_u16, u16)
+            }
+            id if id == std::any::TypeId::of::<u32>() => {
+                launch_equal!(launch_buffer_equal_u32, u32)
+            }
+            id if id == std::any::TypeId::of::<u64>() => {
+                launch_equal!(launch_buffer_equal_u64, u64)
+            }
+            id if id == std::any::TypeId::of::<u128>() => {
+                launch_equal!(launch_buffer_equal_u128, u128)
+            }
+            id if id == std::any::TypeId::of::<i8>() => {
+                launch_equal!(launch_buffer_equal_i8, i8)
+            }
+            id if id == std::any::TypeId::of::<i16>() => {
+                launch_equal!(launch_buffer_equal_i16, i16)
+            }
+            id if id == std::any::TypeId::of::<i32>() => {
+                launch_equal!(launch_buffer_equal_i32, i32)
+            }
+            id if id == std::any::TypeId::of::<i64>() => {
+                launch_equal!(launch_buffer_equal_i64, i64)
+            }
+            id if id == std::any::TypeId::of::<i128>() => {
+                launch_equal!(launch_buffer_equal_i128, i128)
+            }
+            id if id == std::any::TypeId::of::<types::boolean>() => {
+                launch_equal!(launch_buffer_equal_boolean, bool)
+            }
+            _ => return false,
+        }
+        
+        // Read result back to host
+        match backend.read(&result_buf, 0) {
+            Ok(result) => result.0,
+            Err(_) => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

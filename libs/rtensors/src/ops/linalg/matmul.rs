@@ -1,4 +1,4 @@
-use crate::{backend::BackendMatMul, core::{meta::ContiguityTypes, primitives::TensorBase, shape_to_stride, tensor::{seal, AsTensor, AsView, TensorAccess, TensorError}, value::{TensorValue, WeightValue}, Dim, MetaTensor, MetaTensorView, Shape, Strides}, grad::{primitives::GradTensor, GradNode}, ops::linalg::MatMul};
+use crate::{backend::BackendMatMul, core::{meta::ContiguityTypes, primitives::TensorBase, shape_to_stride, tensor::{seal, AsTensor, AsView, TensorAccess, TensorError}, value::{TensorValue, WeightValue}, Dim, MetaTensor, MetaTensorView, Shape, Strides}, grad::{GradNode}, ops::linalg::MatMul};
 
 // broadcasting state:
 // does not broadcast batch dims, they must match exactly

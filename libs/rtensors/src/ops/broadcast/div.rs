@@ -1,7 +1,7 @@
 use std::ops::{Div, DivAssign};
 
 
-use crate::{backend::Backend, core::{primitives::TensorBase, value::{TensorValue, WeightValue}, MetaTensor, MetaTensorView, TensorView, TensorViewMut}, grad::{primitives::GradTensor, GradNode}, ops::{broadcast::compute_broadcasted_params, unary::UnaryOp}};
+use crate::{backend::Backend, core::{primitives::TensorBase, value::{TensorValue, WeightValue}, MetaTensor, MetaTensorView, TensorView, TensorViewMut}, grad::{GradNode}, ops::{broadcast::compute_broadcasted_params, unary::UnaryOp}};
 use crate::ops::base::BinaryOpType;
 
 /// Macro to implement DivAssign for mutable tensor types (TensorBase and TensorViewMut)

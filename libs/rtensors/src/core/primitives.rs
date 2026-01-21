@@ -1,23 +1,65 @@
+use std::cell::RefCell;
 use std::fmt::Debug;
 #[cfg(feature = "remote")]
 use std::net::IpAddr;
+use std::sync::{Arc, RwLock};
 
 
 use crate::backend::Backend;
 use crate::backend::cpu::Cpu;
-use crate::core::value::{DType, TensorValue};
+use crate::core::value::TensorValue;
 use crate::core::{shape_to_stride, MetaTensor, MetaTensorView, Shape};
 use crate::core::tensor::{compute_squeezed_parameters, compute_unsqueezed_parameters, TensorError};
+
+#[derive(Debug, Clone)]
+pub struct Grad<T: TensorValue, B: Backend>(Arc<RwLock<Option<TensorBase<T, B>>>>);
+
+impl<T: TensorValue, B: Backend> Grad<T, B> {
+    pub fn default() -> Self {
+        Self(Arc::new(RwLock::new(None)))
+    }
+
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<TensorBase<T, B>>> {
+        self.0.read().unwrap()
+    } 
+
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<TensorBase<T, B>>> {
+        self.0.write().unwrap()
+    }
+}
 
 /// A generic tensor with backend-specific storage.
 /// 
 /// This is the base type for all tensors, parameterized by element type `T` and backend `B`.
 /// Most users will use type aliases like `Tensor<T>` (CPU) or `CudaTensor<T>` (GPU).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct TensorBase<T: TensorValue, B: Backend> {
     pub(crate) backend: B,
     pub(crate) buf: B::Buf<T>,
     pub(crate) meta: MetaTensor,
+    pub(crate) grad: Grad<T, B>,    // relevant for params with auto-grad
+    pub(crate) op: NodeKey, // relevant when there is a ctx for tracking ops
+}
+
+impl<T: TensorValue, B: Backend> PartialEq for TensorBase<T, B> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.meta != other.meta { return false; }
+        if self.buf != other.buf { return false; }
+        if self.grad != other.grad { return false; }
+        true
+    }
+}
+
+impl<T: TensorValue, B: Backend> PartialEq for Grad<T, B> {
+    fn eq(&self, other: &Self) -> bool {
+        let self_guard = self.0.read().unwrap();
+        let other_guard = other.0.read().unwrap();
+        match (&*self_guard, &*other_guard) {
+            (Some(t1), Some(t2)) => t1 == t2,
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 impl<B: Backend, T: TensorValue> Clone for TensorBase<T, B> {
@@ -28,6 +70,8 @@ impl<B: Backend, T: TensorValue> Clone for TensorBase<T, B> {
             backend: new_backend,
             buf: new_buffer,
             meta: self.meta.clone(),
+            grad: Grad::default(),
+            op: RwLock::new(None).into(),
         }
 
     }
@@ -44,6 +88,7 @@ pub type Tensor<T> = TensorBase<T, Cpu>;
 
 #[cfg(feature = "remote")]
 use crate::backend::remote::client::RemoteBackend;
+use crate::grad::NodeKey;
 
 #[cfg(feature = "remote")]
 pub type RemoteTensor<T> = TensorBase<T, RemoteBackend>;
@@ -109,6 +154,7 @@ where
     pub(crate) buf: &'a B::Buf<T>,
     pub(crate) backend: &'a B,
     pub(crate) meta: MetaTensor,
+    pub(crate) op: NodeKey
 }
 
 /// A non-owning mutable view over tensor data.
@@ -122,6 +168,7 @@ where
     pub(crate) buf: &'a mut B::Buf<T>,
     pub(crate) backend: &'a B,
     pub(crate) meta: MetaTensor,
+    pub(crate) op: NodeKey
 }
 
 impl<'a, T, B> TensorView<'a, T, B>
@@ -140,6 +187,7 @@ where
             buf,
             backend,
             meta,
+            op: None.into(),
         }
     }
 
@@ -170,7 +218,8 @@ where
         Self {
             buf: raw,
             backend,
-            meta
+            meta,
+            op: None.into(),
         }
     }
 
@@ -183,6 +232,31 @@ where
 
     pub fn unsqueeze_inplace(&mut self) {
         self.unsqueeze_at_inplace(0).unwrap();
+    }
+}
+
+pub(crate) trait OpTensor {
+    fn op(&self) -> Option<NodeKey>;
+    fn set_op(&self, op: NodeKey);
+}
+
+impl<T: TensorValue, B: Backend> OpTensor for TensorBase<T, B> {
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
+    }
+}
+
+impl<'a, T: TensorValue, B: Backend> OpTensor for TensorView<'a, T, B> {
+    fn op(&self) -> Option<NodeKey> {
+        self.op.borrow().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.borrow_mut().replace(op);
     }
 }
 
@@ -208,7 +282,9 @@ where
         Self {
             backend,
             buf: raw,
-            meta
+            meta,
+            grad: Grad::default(),
+            op: RwLock::new(None).into(),
         }
     }
 
@@ -246,12 +322,19 @@ where
         Ok(Self {
             backend,
             buf: buffer,
-            meta: MetaTensor::new(shape, stride, 0)
+            meta: MetaTensor::new(shape, stride, 0),
+            grad: Grad::default(),
+            op: RwLock::new(None).into(),
         })
     }
 
-    pub fn to_buf(&self) -> Result<Box<[T]>, TensorError> {
+    pub fn to_box(&self) -> Result<Box<[T]>, TensorError> {
         self.backend.dump(&self.buf)
+    }
+
+    pub fn zero_grad(&mut self) {
+        let mut grad_ref = self.grad.write();
+        *grad_ref = None;
     }
 
     /// Creates a rank-0 (scalar) tensor.
@@ -374,6 +457,7 @@ where
 
 }
 
+use image::imageops::FilterType::Triangle;
 #[cfg(feature = "remote")]
 use serde::{Deserialize, Serialize};
 

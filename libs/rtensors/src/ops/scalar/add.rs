@@ -1,6 +1,6 @@
 use std::{ops::{Add, AddAssign}};
 
-use crate::{backend::Backend, core::{primitives::TensorBase, value::{TensorValue, WeightValue}, TensorView, TensorViewMut}, grad::{self, primitives::GradTensor, GradNode}};
+use crate::{backend::Backend, core::{primitives::TensorBase, value::{TensorValue, WeightValue}, TensorView, TensorViewMut}, grad::{self, GradNode}};
 use crate::core::tensor::AsTensor;
 
 impl<'a, T, B> AddAssign<T> for TensorViewMut<'a, T, B> 

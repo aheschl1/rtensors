@@ -1,6 +1,6 @@
 use std::{ops::{Mul, MulAssign}};
 
-use crate::{backend::Backend, core::{primitives::TensorBase, tensor::AsTensor, value::{TensorValue, WeightValue}, TensorView, TensorViewMut}, grad::{self, primitives::GradTensor, GradNode}};
+use crate::{backend::Backend, core::{primitives::TensorBase, tensor::AsTensor, value::{TensorValue, WeightValue}, TensorView, TensorViewMut}, grad::{self, GradNode}};
 
 impl<'a, T, B> MulAssign<T> for TensorViewMut<'a, T, B> 
     where T: TensorValue,

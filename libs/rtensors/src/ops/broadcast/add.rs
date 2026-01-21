@@ -1,6 +1,6 @@
 use std::ops::{Add, AddAssign};
 
-use crate::{backend::Backend, core::{primitives::TensorBase, value::{TensorValue, WeightValue}, MetaTensor, MetaTensorView, TensorView, TensorViewMut}, grad::{primitives::GradTensor, GradNode}, ops::broadcast::compute_broadcasted_params};
+use crate::{backend::Backend, core::{primitives::TensorBase, value::{TensorValue, WeightValue}, MetaTensor, MetaTensorView, TensorView, TensorViewMut}, grad::{GradNode}, ops::broadcast::compute_broadcasted_params};
 use crate::ops::base::BinaryOpType;
 
 /// Macro to implement AddAssign for mutable tensor types (TensorBase and TensorViewMut)

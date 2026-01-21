@@ -1,4 +1,4 @@
-use crate::{backend::{Backend, BackendMatMul}, core::{idx::Idx, primitives::TensorBase, tensor::{TensorAccess, TensorError}, value::WeightValue, Shape, Strides}, grad::GradNode, ops::{reduction::ReductionOp, unary::UnaryOp}};
+use crate::{backend::{Backend, BackendMatMul}, core::{Shape, Strides, Tensor, idx::Idx, primitives::TensorBase, tensor::{TensorAccess, TensorError}, value::WeightValue}, grad::GradNode, ops::{reduction::ReductionOp, unary::UnaryOp}};
 use crate::ops::linalg::MatMul;
 
 #[inline]
@@ -10,13 +10,13 @@ pub(crate) fn accumulate_grad<T: WeightValue, B: Backend>(
         return Err(TensorError::UnsupportedOperation("Invalid node type passed to accumulate_grad.".into()));
     };
 
-    let mut grad_tensor = grad_ref.borrow_mut();
-    if let Some(existing_grad) = &mut grad_tensor.grad {
+    let mut grad_tensor = grad_ref.write();
+    if let Some(existing_grad) = grad_tensor.as_mut() {
         // Accumulate gradient
         *existing_grad += upstream;
     } else {
         // First gradient assignment
-        grad_tensor.grad = Some(upstream.clone());
+        *grad_tensor = Some(upstream.clone());
     }
 
     Ok(vec![upstream.clone()])

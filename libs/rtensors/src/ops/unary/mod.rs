@@ -5,7 +5,6 @@ use crate::{
         primitives::TensorBase, primops::{Exp, InvExp, SquareRoot}, tensor::{AsTensor, AsViewMut, TensorAccess, TensorAccessMut, TensorError}, value::{TensorValue, WeightValue}, MetaTensorView, TensorView, TensorViewMut
     }, grad::GradNode,
 };
-use crate::grad::primitives::GradTensor;
 use crate::core::tensor::seal;
 use crate::grad;
 

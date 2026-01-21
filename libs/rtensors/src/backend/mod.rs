@@ -215,7 +215,7 @@ macro_rules! specify_trait_scalar_cabal {
 
 
 pub trait Backend: Send + Sync + 'static + Clone + Debug {
-    type Buf<T: TensorValue>: Send + Sync + Debug;
+    type Buf<T: TensorValue>: Send + Sync + Debug + PartialEq;
 
     fn device_type() -> crate::core::primitives::DeviceType;
     fn alloc_from_slice<T: TensorValue>(&self, src: Box<[T]>) -> Result<Self::Buf<T>, TensorError>;
