@@ -1,4 +1,4 @@
-use crate::{backend::Backend, core::{primitives::{Grad, TensorBase}, tensor::{AsViewMut, TensorError}, value::WeightValue}, grad};
+use crate::{backend::Backend, core::{primitives::{Grad, OpTensor, TensorBase}, tensor::{AsViewMut, TensorError}, value::WeightValue}, grad};
 
 pub trait Optim<T: WeightValue, B: Backend> {
     fn step(&mut self) -> Result<(), TensorError>;
@@ -46,7 +46,7 @@ impl<T: WeightValue, B: Backend> Optim<T, B> for SGD<T, B> {
     fn register_parameter(&mut self, param: &mut TensorBase<T, B>) -> Result<(), TensorError> {
         // check is leaf node
         let nodes = ctx.nodes.borrow();
-        let node = param.op.read().unwrap().ok_or_else(|| TensorError::GradError("Parameter has no associated node.".into()))?;
+        let node = param.op().ok_or_else(|| TensorError::GradError("Parameter has no associated node.".into()))?;
         let node = nodes.get(node).ok_or_else(|| TensorError::GradError("Parameter not found in grad context.".into()))?;
         if !node.is_leaf() {
             return Err(TensorError::GradError("Only leaf tensors can be registered as parameters.".into()));

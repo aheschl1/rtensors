@@ -1,6 +1,6 @@
 use slotmap::{new_key_type, SecondaryMap};
 
-use crate::{backend::{Backend, BackendMatMul, cpu::Cpu}, core::{Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, value::{TensorValue, WeightValue}}};
+use crate::{backend::{Backend, BackendMatMul, cpu::Cpu}, core::{Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, untyped::UntypedTensor, value::{TensorValue, Value, WeightValue}}};
 #[cfg(feature = "cuda")]
 use crate::backend::cuda::Cuda;
 use std::{any::{Any, TypeId}, cell::RefCell};
@@ -19,10 +19,10 @@ new_key_type! {
 }
 
 /// Each variant of a node holds parents and any tensors that need to be saved for backward.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum GradNode<T: TensorValue, B: Backend> {
+#[derive(Debug)]
+pub(crate) enum GradNode {
     // LEAF NODES
-    Leaf( Grad<T, B> ),
+    Leaf( Grad ),
     None,
     // OPS
     BroadcastAdd { 
@@ -44,8 +44,8 @@ pub(crate) enum GradNode<T: TensorValue, B: Backend> {
     BroadcastMul { 
         left: NodeKey, 
         right: NodeKey, 
-        lhs_input: TensorBase<T, B>,
-        rhs_input: TensorBase<T, B>,
+        lhs_input: Box<dyn UntypedTensor>,
+        rhs_input: Box<dyn UntypedTensor>,
         lhs_strides: Strides, // strides so we know when to reduce
         rhs_strides: Strides, 
         lhs_shape: Shape,  // shapes so that we know when to squeeze
@@ -54,40 +54,40 @@ pub(crate) enum GradNode<T: TensorValue, B: Backend> {
     BroadcastDiv { 
         left: NodeKey, 
         right: NodeKey, 
-        lhs_input: TensorBase<T, B>,
-        rhs_input_reciprocal: TensorBase<T, B>,
+        lhs_input: Box<dyn UntypedTensor>,
+        rhs_input_reciprocal: Box<dyn UntypedTensor>,
         lhs_strides: Strides, // strides so we know when to reduce
         rhs_strides: Strides, 
         lhs_shape: Shape,  // shapes so that we know when to squeeze
         rhs_shape: Shape 
     },
     AddScalar { input: NodeKey },
-    MulScalar { input: NodeKey, scalar: T },
-    DivScalar { input: NodeKey, scalar: T },
-    Abs { input: NodeKey, grad_map: TensorBase<T, B> },
-    ReLU { input: NodeKey, grad_map: TensorBase<T, B> },
-    Sigmoid { input: NodeKey, result: TensorBase<T, B> },
+    MulScalar { input: NodeKey, scalar: Value },
+    DivScalar { input: NodeKey, scalar: Value },
+    Abs { input: NodeKey, grad_map: Box<dyn UntypedTensor> },
+    ReLU { input: NodeKey, grad_map: Box<dyn UntypedTensor> },
+    Sigmoid { input: NodeKey, result: Box<dyn UntypedTensor> },
     Negate { input: NodeKey },
-    Sqrt { input: NodeKey, output: TensorBase<T, B> },
-    Ln { input: NodeKey, x_reciprocal: TensorBase<T, B> }, // store 1/x for backward
-    Sin { input: NodeKey, input_tensor: TensorBase<T, B> },
-    Cos { input: NodeKey, input_tensor: TensorBase<T, B> },
-    Tan { input: NodeKey, input_tensor: TensorBase<T, B> },
-    Tanh { input: NodeKey, result: TensorBase<T, B> },
-    Exp { input: NodeKey, result: TensorBase<T, B> },
-    Square { input: NodeKey, input_tensor: TensorBase<T, B> },
-    Cube { input: NodeKey, input_tensor: TensorBase<T, B> },
-    Reciprocal { input: NodeKey, result: TensorBase<T, B> },
-    Rsqrt { input: NodeKey, result: TensorBase<T, B> },
-    Sinh { input: NodeKey, input_tensor: TensorBase<T, B> },
-    Cosh { input: NodeKey, input_tensor: TensorBase<T, B> },
-    ExpM1 { input: NodeKey, input_tensor: TensorBase<T, B> },
-    Ln1p { input: NodeKey, input_tensor: TensorBase<T, B> },
+    Sqrt { input: NodeKey, output: Box<dyn UntypedTensor> },
+    Ln { input: NodeKey, x_reciprocal: Box<dyn UntypedTensor> }, // store 1/x for backward
+    Sin { input: NodeKey, input_tensor: Box<dyn UntypedTensor> },
+    Cos { input: NodeKey, input_tensor: Box<dyn UntypedTensor> },
+    Tan { input: NodeKey, input_tensor: Box<dyn UntypedTensor> },
+    Tanh { input: NodeKey, result: Box<dyn UntypedTensor> },
+    Exp { input: NodeKey, result: Box<dyn UntypedTensor> },
+    Square { input: NodeKey, input_tensor: Box<dyn UntypedTensor> },
+    Cube { input: NodeKey, input_tensor: Box<dyn UntypedTensor> },
+    Reciprocal { input: NodeKey, result: Box<dyn UntypedTensor> },
+    Rsqrt { input: NodeKey, result: Box<dyn UntypedTensor> },
+    Sinh { input: NodeKey, input_tensor: Box<dyn UntypedTensor> },
+    Cosh { input: NodeKey, input_tensor: Box<dyn UntypedTensor> },
+    ExpM1 { input: NodeKey, input_tensor: Box<dyn UntypedTensor> },
+    Ln1p { input: NodeKey, input_tensor: Box<dyn UntypedTensor> },
     MatMul {
         left: NodeKey,
         right: NodeKey,
-        left_input: TensorBase<T, B>,
-        right_input: TensorBase<T, B>,
+        left_input: Box<dyn UntypedTensor>,
+        right_input: Box<dyn UntypedTensor>,
     },
     // VIEW OPS
     Permute {
@@ -100,17 +100,23 @@ pub(crate) enum GradNode<T: TensorValue, B: Backend> {
         // it is likely that this is leaf; however, it is not always the case
         // consider siamese networks
         target: NodeKey,
-        grad_map: TensorBase<T, B>, // where is the diff greater than zero
-        loss: TensorBase<T, B>,
+        grad_map: Box<dyn UntypedTensor>, // where is the diff greater than zero
+        loss: Box<dyn UntypedTensor>,
     },
 }
 
-impl<T: WeightValue, B: Backend> GradNode<T, B> {
+impl Default for GradNode {
+    fn default() -> Self {
+        GradNode::None
+    }
+}
+
+impl GradNode {
     pub fn is_leaf(&self) -> bool {
         matches!(self, GradNode::Leaf(..))
     }
 
-    pub fn leaf(inner: Grad<T, B>) -> Self {
+    pub fn leaf(inner: Grad) -> Self {
         GradNode::Leaf(inner)
     }
 
@@ -150,8 +156,9 @@ impl<T: WeightValue, B: Backend> GradNode<T, B> {
         }
     }
 
-    fn backwards(&self, upstream: &TensorBase<T, B>, _ctx: &GradContext<T, B>) -> Result<Vec<TensorBase<T, B>>, TensorError> 
+    fn backwards<T, B>(&self, upstream: &TensorBase<T, B>, _ctx: &GradContext) -> Result<Vec<TensorBase<T, B>>, TensorError> 
     where
+        T: WeightValue,
         B: BackendMatMul<T>
     {
         match self {
@@ -190,7 +197,7 @@ impl<T: WeightValue, B: Backend> GradNode<T, B> {
             // _ => Err(TensorError::UnsupportedOperation("Backward not implemented for this node type.".into())),
         }
     }
-    fn loss(&self) -> Option<&TensorBase<T, B>> {
+    fn loss(&self) -> Option<&Box<dyn UntypedTensor>> {
         match self {
             GradNode::L1 { loss, .. } => Some(loss),
             _ => None,
@@ -198,18 +205,18 @@ impl<T: WeightValue, B: Backend> GradNode<T, B> {
     }
 }
 
-pub struct GradContext<T: TensorValue, B: Backend> {
+pub struct GradContext {
     // tape: Vec<NodeKey>, // holds references to all inner tensors that require gradients
-    pub(crate) nodes: RefCell<slotmap::SlotMap<NodeKey, GradNode<T, B>>>,
+    pub(crate) nodes: RefCell<slotmap::SlotMap<NodeKey, GradNode>>,
 }
 
-impl<T: WeightValue, B: Backend> Default for GradContext<T, B> {
+impl Default for GradContext {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: WeightValue, B: Backend> GradContext<T, B> {
+impl GradContext {
     pub fn new() -> Self {
         Self { 
             nodes: RefCell::new(slotmap::SlotMap::with_key()),
@@ -222,7 +229,7 @@ impl<T: WeightValue, B: Backend> GradContext<T, B> {
     // }
 
     #[inline]
-    pub(crate) fn make_leaf(
+    pub(crate) fn make_leaf<T: TensorValue, B: Backend>(
         &self,
         inner: &TensorBase<T, B>,
     ) {
@@ -234,14 +241,15 @@ impl<T: WeightValue, B: Backend> GradContext<T, B> {
     pub(crate) fn attach(
         &self,
         inner: &impl OpTensor,
-        op: GradNode<T, B>,
+        op: GradNode,
     ) {
         let node_id = self.nodes.borrow_mut().insert(op);
         inner.set_op(node_id);
     }
 
-    pub fn backwards(&self, root: &impl OpTensor) -> Result<(), TensorError> 
-    where 
+    pub fn backwards<T, B>(&self, root: &impl OpTensor) -> Result<(), TensorError> 
+    where
+        T: WeightValue,
         B: BackendMatMul<T>
     {
         // holds nodes to visit along with their upstream gradients
@@ -283,12 +291,12 @@ impl<T: WeightValue, B: Backend> GradContext<T, B> {
         }
         // could in theory move this into the above loop but this is clearer
         let root_node_key = root.op().expect("Root tensor has no associated grad node.");
-        let loss = self.nodes.borrow().get(root_node_key)
-            .and_then(|n| n.loss().cloned())
+        let nodes = self.nodes.borrow();
+        let loss = nodes.get(root_node_key)
+            .and_then(|n| n.loss().as_ref().cloned())
             .ok_or_else(|| TensorError::GradError("Root node does not contain a loss.".into()))?;
-
         let mut accumulations = HashMap::new();
-        accumulations.insert(root_node_key, vec![loss]);
+        accumulations.insert(root_node_key, vec![loss.typed::<T, B>().expect("Loss is the wrong datatype.").clone()]);
 
         // println!("{:?}", node_order
         //     .iter()
@@ -306,7 +314,7 @@ impl<T: WeightValue, B: Backend> GradContext<T, B> {
                     if let Some(accum) = acc {
                         Some(accum + grad)
                     } else {
-                        Some(grad)
+                        Some(grad) // clone here is lame
                     }
                 })
                 .unwrap(); // must have at least one upstream grad
@@ -335,173 +343,70 @@ impl<T: WeightValue, B: Backend> GradContext<T, B> {
     }
 }
 
-impl<T: TensorValue, B: Backend> std::fmt::Debug for GradContext<T, B> {
+impl std::fmt::Debug for GradContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "GradContext {{ nodes_len: {} }}", self.nodes.borrow().len())
     }
 }
 
 thread_local! {
-    static GRAD_CONTEXT_CPU: std::cell::RefCell<HashMap<TypeId, Box<dyn Any>>> = std::cell::RefCell::new(HashMap::new());
-    #[cfg(feature = "cuda")]
-    static GRAD_CONTEXT_CUDA: std::cell::RefCell<HashMap<TypeId, Box<dyn Any>>> = std::cell::RefCell::new(HashMap::new());
+    static GRAD_CONTEXT: std::cell::RefCell<Option<GradContext>> = std::cell::RefCell::new(None);
 }
 
 
-pub fn with<T: WeightValue, B: Backend>(
-    f: impl FnOnce(&GradContext<T, B>)
-){
-    let type_id = TypeId::of::<T>();
-    
-    if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Cpu>() {
-        GRAD_CONTEXT_CPU.with(|ctx_cell| {
-            let mut ctx_map = ctx_cell.borrow_mut();
-            let _ = ctx_map
-                .entry(type_id)
-                .or_insert_with(|| Box::new(GradContext::<T, Cpu>::new()));
-            drop(ctx_map);
-            let ctx = ctx_cell.borrow();
-            let ctx = ctx.get(&type_id).unwrap();
-            
-            // SAFETY: We know the TypeId matches T, and we've verified B is Cpu
-            let ctx = ctx.downcast_ref::<GradContext<T, Cpu>>().unwrap();
-            let ctx = unsafe { &*(ctx as *const GradContext<T, Cpu> as *const GradContext<T, B>) };
-            f(ctx);
-        });
-        return;
-    }
-    
-    #[cfg(feature = "cuda")]
-    {
-        if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Cuda>() {
-            GRAD_CONTEXT_CUDA.with(|ctx_cell| {
-                let mut ctx_map = ctx_cell.borrow_mut();
-                let _ = ctx_map
-                    .entry(type_id)
-                    .or_insert_with(|| Box::new(GradContext::<T, Cuda>::new()));
-                drop(ctx_map);
-                let ctx = ctx_cell.borrow();
-                let ctx = ctx.get(&type_id).unwrap();
-                // SAFETY: We know the TypeId matches T, and we've verified B is Cuda
-                let ctx = ctx.downcast_ref::<GradContext<T, Cuda>>().unwrap();
-                let ctx = unsafe { &*(ctx as *const GradContext<T, Cuda> as *const GradContext<T, B>) };
-                f(ctx);
-            });
-            return;
-        }
-    }
-    
-    panic!("Unsupported backend for GradContext");
+pub fn with(
+    f: impl FnOnce(&GradContext)
+){    
+    GRAD_CONTEXT.with(|ctx_cell| {
+        let mut ctx_map = ctx_cell.borrow_mut();
+        ctx_map.get_or_insert_with(|| GradContext::new());
+        drop(ctx_map);
+        let ctx = ctx_cell.borrow();
+        f(ctx.as_ref().unwrap());
+    });
+    return;
 }
 
 #[inline]
-pub fn is_enabled<T: TensorValue, B: Backend>() -> bool {
-    let type_id = TypeId::of::<T>();
-    
-    if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Cpu>() {
-        return GRAD_CONTEXT_CPU.with(|ctx_cell| {
-            let ctx_map = ctx_cell.borrow();
-            ctx_map.contains_key(&type_id)
-        });
-    }
-    
-    #[cfg(feature = "cuda")]
-    {
-        if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Cuda>() {
-            return GRAD_CONTEXT_CUDA.with(|ctx_cell| {
-                let ctx_map = ctx_cell.borrow();
-                ctx_map.contains_key(&type_id)
-            });
-        }
-    }
-    
-    panic!("Unsupported backend for GradContext");
+pub fn is_enabled() -> bool {
+    GRAD_CONTEXT.with(|ctx_cell| {
+        let ctx_map = ctx_cell.borrow();
+        ctx_map.is_some()
+    })
 }
 
 /// Runs the provided closure if the gradient context is enabled for the given backend.
-pub fn when_enabled<T: TensorValue, B: Backend, R>(
-    f: impl FnOnce(&GradContext<T, B>) -> R
+pub fn when_enabled<R>(
+    f: impl FnOnce(&GradContext) -> R
 ) -> Option<R>{
-    let type_id = TypeId::of::<T>();
-    
-    if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Cpu>() {
-        return GRAD_CONTEXT_CPU.with(|ctx_cell| {
-            let ctx_map = ctx_cell.borrow();
-            if let Some(ctx_box) = ctx_map.get(&type_id) {
-                // SAFETY: We know the TypeId matches T, and we've verified B is Cpu
-                if let Some(ctx) = ctx_box.downcast_ref::<GradContext<T, Cpu>>() {
-                    let ctx = unsafe { &*(ctx as *const GradContext<T, Cpu> as *const GradContext<T, B>) };
-                    Some(f(ctx))
-                }else{
-                    None
-                }
-            } else {
-                None
-            }
-        });
-    }
-    
-    #[cfg(feature = "cuda")]
-    {
-        if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Cuda>() {
-            return GRAD_CONTEXT_CUDA.with(|ctx_cell| {
-                let ctx_map = ctx_cell.borrow();
-                if let Some(ctx_box) = ctx_map.get(&type_id) {
-                    // SAFETY: We know the TypeId matches T, and we've verified B is Cuda
-                    if let Some(ctx) = ctx_box.downcast_ref::<GradContext<T, Cuda>>() {
-                        let ctx = unsafe { &*(ctx as *const GradContext<T, Cuda> as *const GradContext<T, B>) };
-                        Some(f(ctx))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            });
+    let mut result = None;
+    GRAD_CONTEXT.with(|ctx_cell| {
+        let ctx_map = ctx_cell.borrow();
+        if let Some(ctx) = ctx_map.as_ref() {
+            result = Some(f(ctx));
         }
-    }
-    
-    panic!("Unsupported backend for GradContext");
+    });
+    result
 }
 
-pub fn when_disabled<T: TensorValue, B: Backend>(
+pub fn when_disabled(
     f: impl FnOnce()
 ) {
-    let type_id = TypeId::of::<T>();
-    
-    if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Cpu>() {
-        GRAD_CONTEXT_CPU.with(|ctx_cell| {
-            let ctx_map = ctx_cell.borrow();
-            if !ctx_map.contains_key(&type_id) {
-                f();
-            }
-        });
-        return;
-    }
-    
-    #[cfg(feature = "cuda")]
-    {
-        if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Cuda>() {
-            GRAD_CONTEXT_CUDA.with(|ctx_cell| {
-                let ctx_map = ctx_cell.borrow();
-                if !ctx_map.contains_key(&type_id) {
-                    f();
-                }
-            });
-            return;
+    GRAD_CONTEXT.with(|ctx_cell| {
+        let ctx_map = ctx_cell.borrow();
+        if ctx_map.is_none() {
+            f();
         }
-    }
-    
-    panic!("Unsupported backend for GradContext");
+    });
 }
 
 /// same as anabled but warns if not enabled
-pub fn enabled_or_warn<T: WeightValue, B: Backend>(
-    f: impl FnOnce(&GradContext<T, B>),
+pub fn enabled_or_warn(
+    f: impl FnOnce(&GradContext),
     msg: &str,
 ) {
-    when_disabled::<T, B>(|| {
+    when_disabled(|| {
         tracing::warn!("{}", msg);
     });
-    with::<T, B>(f);
+    with(f);
 }

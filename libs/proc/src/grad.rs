@@ -12,7 +12,7 @@ pub fn when_enabled(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     match item {
         Item::Fn(func_block) => {
-            requires_grad_func(&args, func_block, true, true)
+            requires_grad_func(&args, func_block)
         },
         Item::Impl(impl_block) => {
             requires_grad_impl(&args, impl_block)
@@ -30,15 +30,15 @@ fn make_wrapped_block(
     sig: &Signature,
     block: &Block,
     args: &GradArgs,
-    has_t: bool,
-    has_b: bool,
+    // has_t: bool,
+    // has_b: bool,
 ) -> syn::Result<Block> {
-    if !has_t || !has_b {
-        return Err(syn::Error::new_spanned(
-            &sig.generics,
-            "#[requires_grad] functions must have generic parameters T and B.",
-        ));
-    }
+    // if !has_t || !has_b {
+    //     return Err(syn::Error::new_spanned(
+    //         &sig.generics,
+    //         "#[requires_grad] functions must have generic parameters T and B.",
+    //     ));
+    // }
 
     let ctx_ident = &args.ctx;
     let default_failure = format!(
@@ -49,7 +49,7 @@ fn make_wrapped_block(
 
     Ok(syn::parse_quote! {
         {
-            grad::when_enabled::<T, B, _>(|#ctx_ident| {
+            grad::when_enabled::<_>(|#ctx_ident| {
                 #block
             })
             .expect(#failure_msg)
@@ -61,15 +61,15 @@ fn make_wrapped_block(
 fn requires_grad_func(
     args: &GradArgs,
     mut func: syn::ItemFn,
-    inherited_t: bool,
-    inherited_b: bool,
+    // inherited_t: bool,
+    // inherited_b: bool,
 ) -> TokenStream {
     let generics = &func.sig.generics;
 
-    let has_t = inherited_t || generics.type_params().any(|tp| tp.ident == "T");
-    let has_b = inherited_b || generics.type_params().any(|tp| tp.ident == "B");
+    // let has_t = inherited_t || generics.type_params().any(|tp| tp.ident == "T");
+    // let has_b = inherited_b || generics.type_params().any(|tp| tp.ident == "B");
 
-    match make_wrapped_block(&func.sig, &func.block, args, has_t, has_b) {
+    match make_wrapped_block(&func.sig, &func.block, args) {
         Ok(new_block) => {
             func.block = Box::new(new_block);
             quote!(#func).into()
@@ -85,8 +85,8 @@ fn requires_grad_impl(
 ) -> TokenStream {
     let generics = &impl_block.generics;
 
-    let has_t = generics.type_params().any(|tp| tp.ident == "T");
-    let has_b = generics.type_params().any(|tp| tp.ident == "B");
+    // let has_t = generics.type_params().any(|tp| tp.ident == "T");
+    // let has_b = generics.type_params().any(|tp| tp.ident == "B");
 
     for item in impl_block.items.iter_mut() {
         if let syn::ImplItem::Fn(method) = item {
@@ -94,8 +94,8 @@ fn requires_grad_impl(
                 &method.sig,
                 &method.block,
                 args,
-                has_t,
-                has_b,
+                // has_t,
+                // has_b,
             ) {
                 Ok(new_block) => {
                     method.block = new_block;

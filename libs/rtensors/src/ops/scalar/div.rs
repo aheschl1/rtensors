@@ -1,6 +1,24 @@
 use std::{ops::{Div, DivAssign}};
 
-use crate::{backend::Backend, core::{primitives::TensorBase, tensor::AsTensor, value::{TensorValue, WeightValue}, TensorView, TensorViewMut}, grad::{self, GradNode}};
+use crate::{backend::Backend, core::{TensorView, TensorViewMut, primitives::{NodeOp, OpTensor, TensorBase}, tensor::AsTensor, value::{TensorValue, WeightValue}}, grad::{self, GradNode, NodeKey}};
+
+#[inline]
+fn attach_div_grad<T, B>(
+    ctx: &grad::GradContext,
+    view: &impl OpTensor,
+    scalar: T,
+)
+where
+    T: TensorValue,
+    B: Backend,
+{
+    let node = view.op().unwrap_or_default();
+    let op = GradNode::DivScalar {
+        input: node,
+        scalar: scalar.into()
+    };
+    ctx.attach(view, op);
+}
 
 impl<'a, T, B> DivAssign<T> for TensorViewMut<'a, T, B> 
     where T: TensorValue,
@@ -12,6 +30,9 @@ impl<'a, T, B> DivAssign<T> for TensorViewMut<'a, T, B>
             rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_div_grad::<T, B>(ctx, self, rhs);
+        });
     }
 }
 
@@ -25,6 +46,9 @@ impl<'a, T, B> DivAssign<&T> for TensorViewMut<'a, T, B>
             *rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_div_grad::<T, B>(ctx, self, *rhs);
+        });
     }
 }
 
@@ -37,7 +61,10 @@ impl<T, B> DivAssign<T> for TensorBase<T, B>
             &mut self.buf, 
             rhs,
             &self.meta
-        ).unwrap();
+        ).unwrap();        
+        grad::when_enabled(|ctx| {
+            attach_div_grad::<T, B>(ctx, self, rhs);
+        });
     }
 }
 
@@ -51,6 +78,9 @@ impl<T, B> DivAssign<&T> for TensorBase<T, B>
             *rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_div_grad::<T, B>(ctx, self, *rhs);
+        });
     }
 }
 
@@ -92,43 +122,3 @@ impl_div!(&TensorView<'a, T, B>);
 impl_div!(TensorView<'a, T, B>);
 impl_div!(&TensorBase<T, B>);
 impl_div!(TensorBase<T, B>);
-
-impl<T, B> std::ops::Div<T> for &GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    #[grad::when_enabled(ctx)]
-    fn div(self, rhs: T) -> Self::Output {
-        self.borrow_mut().tensor /= rhs;
-        let op = GradNode::DivScalar { // both are the same as addition of negative scalar
-            input: self.node,
-            scalar: rhs,
-        };
-        ctx.attach(
-            self.inner.clone(),
-            op
-        )
-    }
-}
-
-impl<T, B> std::ops::Div<T> for GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    #[grad::when_enabled(ctx)]
-    fn div(self, rhs: T) -> Self::Output {
-        self.borrow_mut().tensor /= rhs;
-        let op = GradNode::DivScalar { // both are the same as addition of negative scalar
-            input: self.node,
-            scalar: rhs,
-        };
-        ctx.attach(
-            self.inner.clone(),
-            op
-        )
-    }
-}

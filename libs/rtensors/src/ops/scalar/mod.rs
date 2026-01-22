@@ -1,5 +1,6 @@
 use crate::core::tensor::TensorAccess;
 use crate::core::tensor::TensorAccessMut;
+use crate::core::untyped::AsUntypedTensor;
 use crate::core::value::WeightValue;
 use crate::core::value::TensorValue;
 use crate::backend::Backend;
@@ -8,6 +9,7 @@ use crate::core::tensor::{AsViewMut, AsTensor, TensorError};
 use crate::core::MetaTensorView;
 use crate::grad::GradNode;
 use crate::grad;
+use crate::core::primitives::OpTensor;
 
 pub mod add;
 pub mod sub;
@@ -66,9 +68,9 @@ macro_rules! specify_binary_scalar_op_template {
                     {
                         let view = self.view_mut();
                         //  ========== GRAPH BUILDING ============
-                        let REQUIRE_INPUT: bool = $requires_input;
+                        let requires_input: bool = $requires_input;
                         let input = grad::when_enabled(|$ctx| {
-                            if REQUIRE_INPUT { 
+                            if requires_input { 
                                 Some(view.owned()) // TODO extra memory copy here, optimize later
                             } else {
                                 None
@@ -85,9 +87,10 @@ macro_rules! specify_binary_scalar_op_template {
                             let input = input.expect("Input tensor required for gradient computation but not captured.");
                             let $scalar = value;
                             let $input = input;
+                            let $grad_node = view.op().expect("Input tensor has no associated gradient node.");
                             let $result = view;
-                            let $grad_node = view.op;
-                            let node: Result<GradNode<T, B>, TensorError> = $grad_fn;
+                            let node: Result<GradNode, TensorError> = $grad_fn;
+                            $ctx.attach(&$result, node.expect("Failed to create gradient node."))
                         });
                     }
                 }
@@ -153,7 +156,7 @@ specify_binary_scalar_op_template!(
 
         let node = GradNode::ReLU {
             input: grad_node,
-            grad_map,
+            grad_map: grad_map.as_untyped(),
         };
         Ok(node)    
     },

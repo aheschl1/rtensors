@@ -7,26 +7,29 @@ use std::sync::{Arc, RwLock};
 
 use crate::backend::Backend;
 use crate::backend::cpu::Cpu;
+use crate::core::untyped::UntypedTensor;
 use crate::core::value::TensorValue;
 use crate::core::{shape_to_stride, MetaTensor, MetaTensorView, Shape};
 use crate::core::tensor::{compute_squeezed_parameters, compute_unsqueezed_parameters, TensorError};
 
 #[derive(Debug, Clone)]
-pub struct Grad<T: TensorValue, B: Backend>(Arc<RwLock<Option<TensorBase<T, B>>>>);
+pub struct Grad(Arc<RwLock<Option<Box<dyn UntypedTensor>>>>);
 
-impl<T: TensorValue, B: Backend> Grad<T, B> {
+impl Grad {
     pub fn default() -> Self {
         Self(Arc::new(RwLock::new(None)))
     }
 
-    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<TensorBase<T, B>>> {
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<Box<dyn UntypedTensor>>> {
         self.0.read().unwrap()
     } 
 
-    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<TensorBase<T, B>>> {
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<Box<dyn UntypedTensor>>> {
         self.0.write().unwrap()
     }
 }
+
+pub type NodeOp = Arc<RwLock<Option<NodeKey>>>;
 
 /// A generic tensor with backend-specific storage.
 /// 
@@ -37,8 +40,8 @@ pub struct TensorBase<T: TensorValue, B: Backend> {
     pub(crate) backend: B,
     pub(crate) buf: B::Buf<T>,
     pub(crate) meta: MetaTensor,
-    pub(crate) grad: Grad<T, B>,    // relevant for params with auto-grad
-    pub(crate) op: NodeKey, // relevant when there is a ctx for tracking ops
+    pub(crate) grad: Grad,    // relevant for params with auto-grad
+    pub(crate) op: NodeOp, // relevant when there is a ctx for tracking ops
 }
 
 impl<T: TensorValue, B: Backend> PartialEq for TensorBase<T, B> {
@@ -50,12 +53,12 @@ impl<T: TensorValue, B: Backend> PartialEq for TensorBase<T, B> {
     }
 }
 
-impl<T: TensorValue, B: Backend> PartialEq for Grad<T, B> {
+impl PartialEq for Grad {
     fn eq(&self, other: &Self) -> bool {
         let self_guard = self.0.read().unwrap();
         let other_guard = other.0.read().unwrap();
         match (&*self_guard, &*other_guard) {
-            (Some(t1), Some(t2)) => t1 == t2,
+            (Some(t1), Some(t2)) => t1.typed_unknown() == t2.typed_unknown(),
             (None, None) => true,
             _ => false,
         }
@@ -154,7 +157,7 @@ where
     pub(crate) buf: &'a B::Buf<T>,
     pub(crate) backend: &'a B,
     pub(crate) meta: MetaTensor,
-    pub(crate) op: NodeKey
+    pub(crate) op: NodeOp
 }
 
 /// A non-owning mutable view over tensor data.
@@ -168,7 +171,7 @@ where
     pub(crate) buf: &'a mut B::Buf<T>,
     pub(crate) backend: &'a B,
     pub(crate) meta: MetaTensor,
-    pub(crate) op: NodeKey
+    pub(crate) op: NodeOp
 }
 
 impl<'a, T, B> TensorView<'a, T, B>
@@ -187,7 +190,7 @@ where
             buf,
             backend,
             meta,
-            op: None.into(),
+            op: RwLock::new(None).into(),
         }
     }
 
@@ -219,7 +222,7 @@ where
             buf: raw,
             backend,
             meta,
-            op: None.into(),
+            op: RwLock::new(None).into(),
         }
     }
 
@@ -252,11 +255,22 @@ impl<T: TensorValue, B: Backend> OpTensor for TensorBase<T, B> {
 
 impl<'a, T: TensorValue, B: Backend> OpTensor for TensorView<'a, T, B> {
     fn op(&self) -> Option<NodeKey> {
-        self.op.borrow().clone()
+        self.op.read().unwrap().clone()
     }
 
     fn set_op(&self, op: NodeKey) {
-        self.op.borrow_mut().replace(op);
+        self.op.write().unwrap().replace(op);
+    }
+}
+
+
+impl<'a, T: TensorValue, B: Backend> OpTensor for TensorViewMut<'a, T, B> {
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
     }
 }
 
