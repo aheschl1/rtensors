@@ -1,6 +1,25 @@
 use std::{ops::{Mul, MulAssign}};
 
-use crate::{backend::Backend, core::{primitives::TensorBase, tensor::AsTensor, value::{TensorValue, WeightValue}, TensorView, TensorViewMut}, grad::{self, GradNode}};
+use crate::{backend::Backend, core::{TensorView, TensorViewMut, primitives::{OpTensor, TensorBase}, tensor::AsTensor, value::{TensorValue, WeightValue}}, grad::{self, GradNode}};
+
+
+#[inline]
+fn attach_mul_grad<T, B>(
+    ctx: &grad::GradContext,
+    view: &impl OpTensor,
+    scalar: T,
+)
+where
+    T: TensorValue,
+    B: Backend,
+{
+    let node = view.op().unwrap_or_default();
+    let op = GradNode::MulScalar {
+        input: node,
+        scalar: scalar.into()
+    };
+    ctx.attach(view, op);
+}
 
 impl<'a, T, B> MulAssign<T> for TensorViewMut<'a, T, B> 
     where T: TensorValue,
@@ -12,6 +31,9 @@ impl<'a, T, B> MulAssign<T> for TensorViewMut<'a, T, B>
             rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_mul_grad::<T, B>(ctx, self, rhs);
+        });
     }
 }
 
@@ -25,6 +47,9 @@ impl<'a, T, B> MulAssign<&T> for TensorViewMut<'a, T, B>
             *rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_mul_grad::<T, B>(ctx, self, *rhs);
+        });
     }
 }
 
@@ -38,6 +63,9 @@ impl<T, B> MulAssign<T> for TensorBase<T, B>
             rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_mul_grad::<T, B>(ctx, self, rhs);
+        });
     }
 }
 
@@ -51,6 +79,9 @@ impl<T, B> MulAssign<&T> for TensorBase<T, B>
             *rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_mul_grad::<T, B>(ctx, self, *rhs);
+        });
     }
 }
 
@@ -92,43 +123,3 @@ impl_mul!(&TensorView<'a, T, B>);
 impl_mul!(TensorView<'a, T, B>);
 impl_mul!(&TensorBase<T, B>);
 impl_mul!(TensorBase<T, B>);
-
-impl<T, B> std::ops::Mul<T> for &GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    #[grad::when_enabled(ctx)]
-    fn mul(self, rhs: T) -> Self::Output {
-        self.borrow_mut().tensor *= rhs;
-        let op = GradNode::MulScalar { // both are the same as addition of negative scalar
-            input: self.node,
-            scalar: rhs,
-        };
-        ctx.attach(
-            self.inner.clone(),
-            op
-        )
-    }
-}
-
-impl<T, B> std::ops::Mul<T> for GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    #[grad::when_enabled(ctx)]
-    fn mul(self, rhs: T) -> Self::Output {
-        self.borrow_mut().tensor *= rhs;
-        let op = GradNode::MulScalar { // both are the same as addition of negative scalar
-            input: self.node,
-            scalar: rhs,
-        };
-        ctx.attach(
-            self.inner.clone(),
-            op
-        )
-    }
-}
