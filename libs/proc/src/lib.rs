@@ -30,6 +30,11 @@ pub fn when_enabled(attr: TokenStream, item: TokenStream) -> TokenStream {
     grad::when_enabled(attr, item)
 }
 
+#[proc_macro_attribute]
+pub fn if_enabled(attr: TokenStream, item: TokenStream) -> TokenStream {
+    grad::if_enabled(attr, item)
+}
+
 // #[proc_macro_attribute]
 /// Attribute macro to mark the main entry point of a program that uses gradients.
 /// This macro initializes a gradient context and ensures it is available during the execution of the annotated function.

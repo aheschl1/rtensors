@@ -12,10 +12,39 @@ pub fn when_enabled(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     match item {
         Item::Fn(func_block) => {
-            requires_grad_func(&args, func_block)
+            requires_grad_func(&args, func_block, true)
         },
         Item::Impl(impl_block) => {
-            requires_grad_impl(&args, impl_block)
+            requires_grad_impl(&args, impl_block, true)
+        },
+        _ => {
+            syn::Error::new_spanned(
+                item,
+                "#[requires_grad] can only be applied to functions or impl blocks.",
+            ).to_compile_error().into()
+        }
+    }
+}
+
+/// allow syntax like #[if_enabled(ctx)]
+/// this is the inner function of the proc macro
+pub fn if_enabled(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as GradArgs);
+    let item = parse_macro_input!(item as Item);
+
+    if args.message.is_some() {
+        return syn::Error::new_spanned(
+            item,
+            "#[if_enabled] does not support a custom message argument.",
+        ).to_compile_error().into();
+    }
+
+    match item {
+        Item::Fn(func_block) => {
+            requires_grad_func(&args, func_block, false)
+        },
+        Item::Impl(impl_block) => {
+            requires_grad_impl(&args, impl_block, false)
         },
         _ => {
             syn::Error::new_spanned(
@@ -30,6 +59,7 @@ fn make_wrapped_block(
     sig: &Signature,
     block: &Block,
     args: &GradArgs,
+    expect: bool 
     // has_t: bool,
     // has_b: bool,
 ) -> syn::Result<Block> {
@@ -47,12 +77,18 @@ fn make_wrapped_block(
     );
     let failure_msg = args.message.as_deref().unwrap_or(&default_failure);
 
+    let expectation = if expect {
+        quote! {.expect(#failure_msg) }
+    } else {
+        quote! {}
+    };
+
     Ok(syn::parse_quote! {
         {
             grad::when_enabled::<_>(|#ctx_ident| {
                 #block
             })
-            .expect(#failure_msg)
+            #expectation
         }
     })
 }
@@ -61,15 +97,12 @@ fn make_wrapped_block(
 fn requires_grad_func(
     args: &GradArgs,
     mut func: syn::ItemFn,
-    // inherited_t: bool,
-    // inherited_b: bool,
+    expect: bool 
 ) -> TokenStream {
-    let generics = &func.sig.generics;
-
     // let has_t = inherited_t || generics.type_params().any(|tp| tp.ident == "T");
     // let has_b = inherited_b || generics.type_params().any(|tp| tp.ident == "B");
 
-    match make_wrapped_block(&func.sig, &func.block, args) {
+    match make_wrapped_block(&func.sig, &func.block, args, expect) {
         Ok(new_block) => {
             func.block = Box::new(new_block);
             quote!(#func).into()
@@ -82,18 +115,16 @@ fn requires_grad_func(
 fn requires_grad_impl(
     args: &GradArgs,
     mut impl_block: syn::ItemImpl,
+    expect: bool 
 ) -> TokenStream {
-    let generics = &impl_block.generics;
-
-    // let has_t = generics.type_params().any(|tp| tp.ident == "T");
-    // let has_b = generics.type_params().any(|tp| tp.ident == "B");
-
+    
     for item in impl_block.items.iter_mut() {
         if let syn::ImplItem::Fn(method) = item {
             match make_wrapped_block(
                 &method.sig,
                 &method.block,
                 args,
+                expect,
                 // has_t,
                 // has_b,
             ) {

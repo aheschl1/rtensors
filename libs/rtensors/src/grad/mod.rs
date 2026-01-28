@@ -11,6 +11,7 @@ pub mod optim;
 // pub mod primitives;
 
 pub use proc::when_enabled;
+pub use proc::if_enabled;
 
 // struct NodeKey;
 
