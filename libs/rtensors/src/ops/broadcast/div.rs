@@ -1,8 +1,9 @@
 use std::ops::{Div, DivAssign};
 
 
-use crate::{backend::Backend, core::{primitives::TensorBase, value::{TensorValue, WeightValue}, MetaTensor, MetaTensorView, TensorView, TensorViewMut}, grad::{GradNode}, ops::{broadcast::compute_broadcasted_params, unary::UnaryOp}};
+use crate::{backend::Backend, core::{MetaTensor, MetaTensorView, Shape, Strides, TensorView, TensorViewMut, primitives::{OpTensor, TensorBase}, tensor::{TensorAccess, TensorAccessMut}, untyped::AsUntypedTensor, value::TensorValue}, grad::{self, GradNode}, ops::{broadcast::compute_broadcasted_params, unary::UnaryOp}};
 use crate::ops::base::BinaryOpType;
+use crate::core::tensor::AsTensor;
 
 /// Macro to implement DivAssign for mutable tensor types (TensorBase and TensorViewMut)
 macro_rules! impl_div_assign {
@@ -17,7 +18,15 @@ macro_rules! impl_div_assign {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    self,
+                );
                 if self.meta.shape != out_shape {
                     panic!(
                         "Incompatible shapes for in-place division: {:?} does not broadcast to {:?}",
@@ -48,7 +57,15 @@ macro_rules! impl_div_assign {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    self,
+                );
                 if self.meta.shape != out_shape {
                     panic!(
                         "Incompatible shapes for in-place division: {:?} does not broadcast to {:?}",
@@ -79,7 +96,15 @@ macro_rules! impl_div_assign {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    self,
+                );
                 if self.meta.shape != out_shape {
                     panic!(
                         "Incompatible shapes for in-place division: {:?} does not broadcast to {:?}",
@@ -110,7 +135,15 @@ macro_rules! impl_div_assign {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    self,
+                );
                 if self.meta.shape != out_shape {
                     panic!(
                         "Incompatible shapes for in-place division: {:?} does not broadcast to {:?}",
@@ -146,10 +179,18 @@ macro_rules! impl_div {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                
-                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
-                let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
                 let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
+                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
+                let meta_b = MetaTensor::new(out_shape, broadcast_strb, rhs.offset());
                 let meta_c = MetaTensor::new(result.shape().clone(), result.strides().clone(), result.offset());
 
                 result.backend.broadcast(
@@ -174,10 +215,18 @@ macro_rules! impl_div {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                
-                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
-                let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
                 let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
+                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
+                let meta_b = MetaTensor::new(out_shape, broadcast_strb, rhs.offset());
                 let meta_c = MetaTensor::new(result.shape().clone(), result.strides().clone(), result.offset());
 
                 result.backend.broadcast(
@@ -202,10 +251,18 @@ macro_rules! impl_div {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                
-                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
-                let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
                 let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
+                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
+                let meta_b = MetaTensor::new(out_shape, broadcast_strb, rhs.offset());
                 let meta_c = MetaTensor::new(result.shape().clone(), result.strides().clone(), result.offset());
 
                 result.backend.broadcast(
@@ -230,10 +287,18 @@ macro_rules! impl_div {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                
-                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
-                let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
                 let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
+                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
+                let meta_b = MetaTensor::new(out_shape, broadcast_strb, rhs.offset());
                 let meta_c = MetaTensor::new(result.shape().clone(), result.strides().clone(), result.offset());
 
                 result.backend.broadcast(
@@ -466,111 +531,34 @@ impl_div!(&TensorViewMut, &TensorView<'_, T, B>, view);
 // &TensorViewMut / &TensorViewMut
 impl_div!(&TensorViewMut, &TensorViewMut<'_, T, B>, view);
 
-
-impl<T, B> std::ops::Div<GradTensor<T, B>> for GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
+#[inline(always)]
+#[grad::if_enabled(ctx)]
+fn attach_broadcast_div_grad<T: TensorValue, B: Backend>(
+    left: TensorBase<T, B>,
+    right: TensorBase<T, B>,
+    lhs_strides: &Strides,
+    rhs_strides: &Strides,
+    lhs_shape: &Shape,
+    rhs_shape: &Shape,
+    result: &impl OpTensor,
+) -> Option<()>
 {
-    type Output = GradTensor<T, B>;
-
-    fn div(self, rhs: GradTensor<T, B> ) -> Self::Output {
-        let value = &self.borrow().tensor / &rhs.borrow().tensor;
-        let (_, broadcast_stra, broadcast_strb) = 
-            compute_broadcasted_params(&self.borrow().tensor.meta, &rhs.borrow().tensor.meta).unwrap();
-
-        let rhs_input_reciprocal = rhs.borrow().tensor.reciprocal();
-        
-        let op = GradNode::BroadcastDiv {
-            left: self.node, 
-            right: rhs.node,
-            lhs_input: self.borrow().tensor.clone(),
-            rhs_input_reciprocal,
-            lhs_strides: broadcast_stra, 
-            rhs_strides: broadcast_strb,
-            lhs_shape: self.borrow().tensor.meta.shape.clone(),
-            rhs_shape: rhs.borrow().tensor.meta.shape.clone(),
-        };
-        GradTensor::from_op(value, op)
+    // TODO make .reciprical valid for all types
+    let mut rhs_reciprocal = TensorBase::<T, B>::zeros(rhs_shape);
+    for coord in right.iter_coords() {
+        let val = right.get(&coord).unwrap();
+        rhs_reciprocal.set(&coord, T::ONE / val).unwrap();
     }
-}
 
-impl<T, B> std::ops::Div<&GradTensor<T, B>> for GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    fn div(self, rhs: &GradTensor<T, B> ) -> Self::Output {
-        let (_, broadcast_stra, broadcast_strb) = 
-            compute_broadcasted_params(&self.borrow().tensor.meta, &rhs.borrow().tensor.meta).unwrap();
-
-        let value = &self.borrow().tensor / &rhs.borrow().tensor;
-        let rhs_input_reciprocal = rhs.borrow().tensor.reciprocal();
-
-        let op = GradNode::BroadcastDiv { 
-            lhs_input: self.borrow().tensor.clone(),
-            rhs_input_reciprocal,
-            left: self.node, 
-            right: rhs.node, 
-            lhs_strides: broadcast_stra, 
-            rhs_strides: broadcast_strb,
-            lhs_shape: self.borrow().tensor.meta.shape.clone(),
-            rhs_shape: rhs.borrow().tensor.meta.shape.clone(),
-        };
-        GradTensor::from_op(value, op)
-    }
-}
-
-impl<T, B> std::ops::Div<&GradTensor<T, B>> for &GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    fn div(self, rhs: &GradTensor<T, B> ) -> Self::Output {
-        let value = &self.borrow().tensor / &rhs.borrow().tensor;
-        let (_, broadcast_stra, broadcast_strb) = 
-            compute_broadcasted_params(&self.borrow().tensor.meta, &rhs.borrow().tensor.meta).unwrap();
-        
-        let rhs_input_reciprocal = rhs.borrow().tensor.reciprocal();
-
-        let op = GradNode::BroadcastDiv { 
-            left: self.node, 
-            right: rhs.node, 
-            lhs_input: self.borrow().tensor.clone(),
-            rhs_input_reciprocal,
-            lhs_strides: broadcast_stra, 
-            rhs_strides: broadcast_strb,
-            lhs_shape: self.borrow().tensor.meta.shape.clone(),
-            rhs_shape: rhs.borrow().tensor.meta.shape.clone(),
-        };
-        GradTensor::from_op(value, op)
-    }
-}
-
-impl<T, B> std::ops::Div<GradTensor<T, B>> for &GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    fn div(self, rhs: GradTensor<T, B> ) -> Self::Output {
-        let value = &self.borrow().tensor / &rhs.borrow().tensor;
-        let (_, broadcast_stra, broadcast_strb) = 
-            compute_broadcasted_params(&self.borrow().tensor.meta, &rhs.borrow().tensor.meta).unwrap();
-        
-        let rhs_input_reciprocal = rhs.borrow().tensor.reciprocal();
-
-        let op = GradNode::BroadcastDiv { 
-            left: self.node, 
-            right: rhs.node, 
-            lhs_input: self.borrow().tensor.clone(),
-            rhs_input_reciprocal,
-            lhs_strides: broadcast_stra, 
-            rhs_strides: broadcast_strb,
-            lhs_shape: self.borrow().tensor.meta.shape.clone(),
-            rhs_shape: rhs.borrow().tensor.meta.shape.clone(),
-        };
-        GradTensor::from_op(value, op)
-    }
+    let op = GradNode::BroadcastDiv {
+        left: left.op().unwrap_or_default(),
+        right: right.op().unwrap_or_default(),
+        lhs_input: left.as_untyped(),
+        rhs_input_reciprocal: rhs_reciprocal.as_untyped(),
+        lhs_strides: lhs_strides.clone(),
+        rhs_strides: rhs_strides.clone(),
+        lhs_shape: lhs_shape.clone(),
+        rhs_shape: rhs_shape.clone(),
+    };
+    ctx.attach(result, op);
 }

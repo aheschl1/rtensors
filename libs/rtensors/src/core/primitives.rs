@@ -253,7 +253,27 @@ impl<T: TensorValue, B: Backend> OpTensor for TensorBase<T, B> {
     }
 }
 
+impl<T: TensorValue, B: Backend> OpTensor for &TensorBase<T, B> {
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
+    }
+}
+
 impl<'a, T: TensorValue, B: Backend> OpTensor for TensorView<'a, T, B> {
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
+    }
+}
+
+impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorView<'a, T, B> {
     fn op(&self) -> Option<NodeKey> {
         self.op.read().unwrap().clone()
     }
@@ -265,6 +285,16 @@ impl<'a, T: TensorValue, B: Backend> OpTensor for TensorView<'a, T, B> {
 
 
 impl<'a, T: TensorValue, B: Backend> OpTensor for TensorViewMut<'a, T, B> {
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
+    }
+}
+
+impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorViewMut<'a, T, B> {
     fn op(&self) -> Option<NodeKey> {
         self.op.read().unwrap().clone()
     }
