@@ -1,4 +1,4 @@
-use crate::{backend::Backend, core::{Dim, MetaTensor, MetaTensorView, Shape, Strides, TensorView, TensorViewMut, idx::Idx, meta::is_contiguous_relaxed, primitives::{DeviceType, OpTensor, TensorBase}, value::{TensorValue, WeightValue}}, grad::{self, NodeKey}, ops::linalg::PaddingType};
+use crate::{backend::Backend, core::{Dim, MetaTensor, MetaTensorView, Shape, Strides, TensorView, TensorViewMut, idx::Idx, meta::is_contiguous_relaxed, primitives::{DeviceType, OpTensor, TensorBase}, value::{TensorValue, WeightValue}}, grad::{self, GradNode, NodeKey}, ops::linalg::PaddingType};
 use super::slice::{Slice, compute_sliced_parameters};
 use thiserror::Error;
 
@@ -554,15 +554,19 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
     }
     
     fn permute(&self, dims: impl Into<Idx>) -> Result<TensorView<'_, T, B>, TensorError> {
+        let dims = dims.into();
+        let input_op = self.view().op();
         let mut view = self.view();
         let (new_shape, new_stride) = compute_permuted_parameters(
             view.meta.shape(),
             view.meta.strides(),
-            &dims.into()
+            &dims
         )?;
 
         view.meta.shape = new_shape;
         view.meta.strides = new_stride;
+        
+        attach_permute_grad::<T, B>(&view, input_op, &dims);
 
         Ok(view)
     }
@@ -641,15 +645,19 @@ where V: AsViewMut<T, B> + seal::Sealed
     }
 
     fn permute_mut(&mut self, dims: impl Into<Idx>) -> Result<TensorViewMut<'_, T, B>, TensorError> {
+        let dims = dims.into();
+        let input_op = self.view().op();
         let mut view = self.view_mut();
         let (new_shape, new_stride) = compute_permuted_parameters(
             view.meta.shape(),
             view.meta.strides(),
-            &dims.into()
+            &dims
         )?;
 
         view.meta.shape = new_shape;
         view.meta.strides = new_stride;
+        
+        attach_permute_grad::<T, B>(&view, input_op, &dims);
 
         Ok(view)
     }
@@ -858,4 +866,19 @@ pub(crate) fn compute_squeezed_parameters(shape: &Shape, stride: &Strides, dim: 
         }
     }
     Ok((result_shape, result_stride))
+}
+
+#[inline(always)]
+#[grad::if_enabled(ctx)]
+fn attach_permute_grad<T: TensorValue, B: Backend>(
+    result: &impl OpTensor,
+    input_op: Option<NodeKey>,
+    dims: &Idx,
+) -> Option<()>
+{
+    let op = GradNode::Permute {
+        input: input_op,
+        dims: dims.clone(),
+    };
+    ctx.attach(result, op);
 }

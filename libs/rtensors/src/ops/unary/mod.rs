@@ -75,16 +75,14 @@ macro_rules! specify_unary_op_template {
                             panic!("Failed to apply abs: {}", e);
                         }
                         // ========== GRAD NODE CREATION ============
-                        grad::when_enabled(|$ctx| {
-                            grad::no_grad(|| {
-                                // unwrap when_enabled error
-                                let $input = input.expect("Input tensor required for gradient computation but not captured.");
-                                let $grad_node = $result.op();
-                                let _ = (&$grad_node, &$input); // to remove warning if not used
-    
-                                let node: Result<GradNode, TensorError> = $grad_fn;
-                                $ctx.attach(&$result, node.expect("Failed to create gradient node."))
-                            });
+                        grad::without_enabled(|$ctx| {
+                            // unwrap when_enabled error
+                            let $input = input.expect("Input tensor required for gradient computation but not captured.");
+                            let $grad_node = $result.op();
+                            let _ = (&$grad_node, &$input); // to remove warning if not used
+
+                            let node: Result<GradNode, TensorError> = $grad_fn;
+                            $ctx.attach(&$result, node.expect("Failed to create gradient node."))
                         });
                     }
                 }

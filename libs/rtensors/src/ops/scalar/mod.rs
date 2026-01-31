@@ -82,17 +82,15 @@ macro_rules! specify_binary_scalar_op_template {
                         }
 
                         // ========== GRADIENT NODE CREATION ============
-                        grad::when_enabled(|$ctx| {
-                            grad::no_grad(|| {
-                                // unwrap when_enabled error
-                                let input = input.expect("Input tensor required for gradient computation but not captured.");
-                                let $scalar = value;
-                                let $input = input;
-                                let $grad_node = view.op();
-                                let $result = view;
-                                let node: Result<GradNode, TensorError> = $grad_fn;
-                                $ctx.attach(&$result, node.expect("Failed to create gradient node."))
-                            });
+                        grad::without_enabled(|$ctx| {
+                            // unwrap when_enabled error
+                            let input = input.expect("Input tensor required for gradient computation but not captured.");
+                            let $scalar = value;
+                            let $input = input;
+                            let $grad_node = view.op();
+                            let $result = view;
+                            let node: Result<GradNode, TensorError> = $grad_fn;
+                            $ctx.attach(&$result, node.expect("Failed to create gradient node."))
                         });
                     }
                 }

@@ -8,3 +8,5 @@ openblas-linux*
 testing_plan.md
 *.zip
 .cargo
+*.dot
+*.svg

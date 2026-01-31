@@ -1,6 +1,6 @@
 use slotmap::{new_key_type, SecondaryMap};
 
-use crate::{backend::{Backend, BackendMatMul, cpu::Cpu}, core::{Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, untyped::UntypedTensor, value::{TensorValue, Value, WeightValue}}, grad};
+use crate::{backend::{Backend, BackendMatMul, cpu::Cpu}, core::{MetaTensorView, Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, untyped::UntypedTensor, value::{TensorValue, Value, WeightValue}}, grad};
 use std::{cell::RefCell};
 use std::collections::HashMap;
 
@@ -110,6 +110,44 @@ pub(crate) enum GradNode {
 impl Default for GradNode {
     fn default() -> Self {
         GradNode::None
+    }
+}
+
+impl Into<String> for &GradNode {
+    fn into(self) -> String {
+        match self {
+            GradNode::Leaf(_) => "{Leaf|requires_grad=true}".to_string(),
+            GradNode::None => "{None}".to_string(),
+            GradNode::BroadcastAdd { .. } => "{BroadcastAdd}".to_string(),
+            GradNode::BroadcastSub { .. } => "{BroadcastSub}".to_string(),
+            GradNode::BroadcastMul { .. } => "{BroadcastMul}".to_string(),
+            GradNode::BroadcastDiv { .. } => "{BroadcastDiv}".to_string(),
+            GradNode::AddScalar { .. } => "{AddScalar}".to_string(),
+            GradNode::MulScalar { .. } => "{MulScalar}".to_string(),
+            GradNode::DivScalar { .. } => "{DivScalar}".to_string(),
+            GradNode::Abs { .. } => "{Abs}".to_string(),
+            GradNode::ReLU { .. } => "{ReLU}".to_string(),
+            GradNode::Sigmoid { .. } => "{Sigmoid}".to_string(),
+            GradNode::Negate { .. } => "{Negate}".to_string(),
+            GradNode::Sqrt { .. } => "{Sqrt}".to_string(),
+            GradNode::Ln { .. } => "{Ln}".to_string(),
+            GradNode::Sin { .. } => "{Sin}".to_string(),
+            GradNode::Cos { .. } => "{Cos}".to_string(),
+            GradNode::Tan { .. } => "{Tan}".to_string(),
+            GradNode::Tanh { .. } => "{Tanh}".to_string(),
+            GradNode::Exp { .. } => "{Exp}".to_string(),
+            GradNode::Square { .. } => "{Square}".to_string(),
+            GradNode::Cube { .. } => "{Cube}".to_string(),
+            GradNode::Reciprocal { .. } => "{Reciprocal}".to_string(),
+            GradNode::Rsqrt { .. } => "{Rsqrt}".to_string(),
+            GradNode::Sinh { .. } => "{Sinh}".to_string(),
+            GradNode::Cosh { .. } => "{Cosh}".to_string(),
+            GradNode::ExpM1 { .. } => "{ExpM1}".to_string(),
+            GradNode::Ln1p { .. } => "{Ln1p}".to_string(),
+            GradNode::MatMul { .. } => "{MatMul}".to_string(),
+            GradNode::Permute { .. } => "{Permute}".to_string(),
+            GradNode::L1 { .. } => "{L1Loss}".to_string(),
+        }
     }
 }
 
@@ -247,12 +285,8 @@ impl GradContext {
         }
     }
 
-    #[grad::no_grad] // dont track the backward pass itself
-    pub fn backwards<T, B>(&self, root: &impl OpTensor) -> Result<(), TensorError> 
-    where
-        T: WeightValue,
-        B: BackendMatMul<T>
-    {
+    #[inline]
+    fn graph_toposort(&self, root: &impl OpTensor) -> Result<Vec<NodeKey>, TensorError> {
         // holds nodes to visit along with their upstream gradients
         // topo sort, because concider a graph like A->C<-B<-D where BFS should visit C too early
         let mut stack = Vec::new();
@@ -292,18 +326,91 @@ impl GradContext {
                 }
             }
         }
-        // could in theory move this into the above loop but this is clearer
-        let root_node_key = self.resolve_maybe_key(root.op());
+        Ok(node_order)
+    }
+
+    #[grad::no_grad]
+    pub fn visualize(&self, root: &impl OpTensor) -> Result<String, TensorError> {
+        fn sanitize_node_id(node_key_str: &str) -> String {
+            // Extract content from NodeKey(...) format
+            // e.g., "NodeKey(1v1)" -> "node_1v1"
+            if let Some(start) = node_key_str.find('(') {
+                if let Some(end) = node_key_str.find(')') {
+                    return format!("node_{}", &node_key_str[start + 1..end]);
+                }
+            }
+            // Fallback: replace invalid characters
+            node_key_str.replace('(', "_").replace(')', "_")
+        }
+        let node_order = self.graph_toposort(root)?;
+
+        let mut dot = String::from("digraph Autograd {\n");
+        dot.push_str("    node [shape=record fontname=monospace];\n\n");
+
+        let nodes = self.nodes.borrow();
+        
+        // Create nodes
+        for &node_key in &node_order {
+            if let Some(node) = nodes.get(node_key) {
+                let node_id = sanitize_node_id(&format!("{:?}", node_key));
+                let node_label: String = node.into();
+                dot.push_str(&format!("    {} [label=\"{}\"];\n", node_id, node_label));
+            }
+        }
+
+        dot.push_str("\n");
+
+        // Create edges (parent -> child)
+        let none_node_id = sanitize_node_id(&format!("{:?}", self.none_node));
+        for &node_key in &node_order {
+            if let Some(node) = nodes.get(node_key) {
+                let child_id = sanitize_node_id(&format!("{:?}", node_key));
+                let parents = node.parents();
+                
+                for parent in parents {
+                    if let Some(parent_key) = parent {
+                        let parent_id = sanitize_node_id(&format!("{:?}", parent_key));
+                        dot.push_str(&format!("    {} -> {};\n", parent_id, child_id));
+                    } else {
+                        // Visualize None parents as edges from the sentinel node
+                        dot.push_str(&format!("    {} -> {} [style=dashed color=gray];\n", none_node_id, child_id));
+                    }
+                }
+            }
+        }
+
+        dot.push_str("}\n");
+        Ok(dot)
+    }
+
+    #[grad::no_grad] // dont track the backward pass itself
+    pub fn backwards<T, B>(&self, root: &impl OpTensor) -> Result<(), TensorError> 
+    where
+        T: WeightValue,
+        B: BackendMatMul<T>
+    {
+        let node_order = self.graph_toposort(root)?;
+
+        let root_node_key = root.op().expect("Root node must have an associated GradNode.");
+
         let nodes = self.nodes.borrow();
         let loss = nodes.get(root_node_key)
             .and_then(|n: &GradNode| n.loss().as_ref().cloned())
             .ok_or_else(|| TensorError::GradError("Root node does not contain a loss.".into()))?;
+        
         let mut accumulations = HashMap::new();
         accumulations.insert(root_node_key, vec![loss.typed::<T, B>().expect("Loss is the wrong datatype.").clone()]);
-
         drop(nodes); // free borrow
+
         let mut nodes = self.nodes.borrow_mut();
         for node_key in node_order.into_iter().rev() {
+            if node_key == self.none_node {
+                // skip the none node
+                // this is a sentinel which is invalid, and marks an input tensor
+                // we have no guarantee that we can fold, and we have no guarantee there is an 
+                // accumulation to be done
+                continue; 
+            }
             // accumulate grad. because of topo sort, we can assume to just sum the upstreams present to us
             // and then propagate downstream
             let dldy = accumulations.remove(&node_key)
@@ -323,7 +430,10 @@ impl GradContext {
 
             let parents = node.parents();
             for (parent, grad) in parents.into_iter().zip(upstreams.into_iter()) {
-                accumulations.entry(self.resolve_maybe_key(parent)).or_insert_with(Vec::new).push(grad);
+                if let Some(parent_key) = parent { // multiple nodes use the same sentinel for None
+                    // we do not want to fold over the multiple sentinels later
+                    accumulations.entry(parent_key).or_insert_with(Vec::new).push(grad);
+                }
             }
 
             match node {
@@ -447,11 +557,11 @@ pub fn enabled_or_warn(
 #[cfg(test)]
 mod tests {
     use crate::{backend::{Backend, cpu::Cpu}, core::{
-        Tensor, primitives::{OpTensor, TensorBase}, tensor::{RandomTensor, TensorAccess}, value::WeightValue}, 
+        Tensor, primitives::TensorBase, tensor::{RandomTensor, TensorAccess}, value::WeightValue}, 
         grad::{self, optim::{Optim, SGD}}, ops::{broadcast::l1::mean_l1_loss, linalg::MatMul, scalar::ScalarOp, unary::UnaryOp}};
 
     #[test]
-    fn playground() {
+    fn _playground() {
 
         fn model(wa: &TensorBase<f32, Cpu>, wb: &TensorBase<f32, Cpu>, target: &TensorBase<f32, Cpu>) -> TensorBase<f32, Cpu> {
             let c = wa + wb;
@@ -479,7 +589,9 @@ mod tests {
             target: &TensorBase<f32, Cpu> // [3, 2]
         ) -> TensorBase<f32, Cpu> {
             let inter = input + wa; // [2, 3]
-            let inter2 = inter.permute((1, 0)).unwrap().abs();
+            let inter2 = inter.permute((1, 0)).unwrap();
+            let inter2 = inter2.abs();
+            
             // println!("Intermediate: {:?}", inter);
             let c = wb + &inter2;
             let loss = mean_l1_loss(&c, target);
@@ -584,6 +696,8 @@ mod tests {
             for _ in 0..10 {
                 let loss = modelv3(&input, &wa, &wb, &target);
                 println!("Loss: {:?}", loss.item());
+                // let graphdot = ctx.visualize(&loss).unwrap();
+                // std::fs::write("grad_graph.dot", graphdot).unwrap();
                 ctx.backwards::<f32, Cpu>(&loss).unwrap();
                 optim.step().unwrap();
             }
@@ -625,6 +739,9 @@ mod tests {
                 optim.step().unwrap();
             }
             let final_loss = modelv5(&input, &target).item().unwrap();
+            // visualize
+            let graphdot = ctx.visualize(&modelv5(&input, &target)).unwrap();
+            std::fs::write("grad_graph_final.dot", graphdot).unwrap();
             assert!(initial_loss - final_loss > 0.5, 
                 "Loss should reduce by at least 0.5, initial: {}, final: {}", initial_loss, final_loss);
 
