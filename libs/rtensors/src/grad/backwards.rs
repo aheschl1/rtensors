@@ -74,8 +74,8 @@ pub(crate) fn backwards_mul<T: WeightValue, B: Backend>(
         return Err(TensorError::UnsupportedOperation("Invalid node type passed to Mul backwards.".into()));
     };
 
-    let mut lhs_grad = upstream * rhs_input;
-    let mut rhs_grad = upstream * lhs_input;
+    let mut lhs_grad = upstream * rhs_input.typed().expect(MIXED_TYPE_ERROR);
+    let mut rhs_grad = upstream * lhs_input.typed().expect(MIXED_TYPE_ERROR);
     inverse_broadcast_gradient(&mut lhs_grad, lhs_strides, lhs_shape)?;
     inverse_broadcast_gradient(&mut rhs_grad, rhs_strides, rhs_shape)?;
 
@@ -98,7 +98,7 @@ pub(crate) fn backwards_div<T: WeightValue, B: Backend>(
         return Err(TensorError::UnsupportedOperation("Invalid node type passed to Div backwards.".into()));
     };
 
-    let mut lhs_grad = upstream * rhs_input_reciprocal;
+    let mut lhs_grad = upstream * rhs_input_reciprocal.typed().expect(MIXED_TYPE_ERROR);
     let mut rhs_grad = upstream * -(lhs_input.typed().expect(MIXED_TYPE_ERROR) * rhs_input_reciprocal.typed().expect(MIXED_TYPE_ERROR).square());
     inverse_broadcast_gradient(&mut lhs_grad, lhs_strides, lhs_shape)?;
     inverse_broadcast_gradient(&mut rhs_grad, rhs_strides, rhs_shape)?;
@@ -127,7 +127,9 @@ pub(crate) fn backwards_mul_scalar<T: WeightValue, B: Backend>(
         return Err(TensorError::UnsupportedOperation("Invalid node type passed to Mul backwards.".into()));
     };
 
-    Ok(vec![upstream * s])
+
+
+    Ok(vec![upstream * s.convert::<T>()])
 }
 
 #[inline]
@@ -139,7 +141,7 @@ pub(crate) fn backwards_div_scalar<T: WeightValue, B: Backend>(
         return Err(TensorError::UnsupportedOperation("Invalid node type passed to Div backwards.".into()));
     };
 
-    Ok(vec![upstream / s])
+    Ok(vec![upstream / s.convert::<T>()])
 }
 
 #[inline]
@@ -214,10 +216,10 @@ pub fn backwards_sqrt<T: WeightValue, B: Backend>(
     upstream: &TensorBase<T, B>,
 ) -> Result<Vec<TensorBase<T, B>>, TensorError>{
     let GradNode::Sqrt { output, .. } = node else {
-        return Err(TensorError::UnsupportedOperation("Invalid node type passed to Sqrt backwards.".into()));
+        return Err(TensorError::UnsupportedOperation("Invalid node passed to Sqrt backwards.".into()));
     };
     let two = T::from_f32(2.0);
-    let grad = upstream / (output * two);
+    let grad = upstream / (output.typed().expect(MIXED_TYPE_ERROR) * two.convert::<T>());
     Ok(vec![grad])
 }
 
@@ -229,7 +231,7 @@ pub fn backwards_abs<T: WeightValue, B: Backend>(
     let GradNode::Abs { grad_map, .. } = node else {
         return Err(TensorError::UnsupportedOperation("Invalid node type passed to Abs backwards.".into()));
     };
-    let grad = grad_map * upstream;
+    let grad = grad_map.typed().expect(MIXED_TYPE_ERROR) * upstream;
     Ok(vec![grad])
 }
 
@@ -256,7 +258,7 @@ pub fn backwards_ln<T: WeightValue, B: Backend>(
     let GradNode::Ln { x_reciprocal, .. } = node else {
         return Err(TensorError::UnsupportedOperation("Invalid node type passed to Ln backwards.".into()));
     };
-    let grad = x_reciprocal * upstream;
+    let grad = x_reciprocal.typed().expect(MIXED_TYPE_ERROR) * upstream;
     Ok(vec![grad])
 }
 
@@ -328,7 +330,7 @@ pub fn backwards_exp<T: WeightValue, B: Backend>(
         return Err(TensorError::UnsupportedOperation("Invalid node type passed to Exp backwards.".into()));
     };
     // d/dx(exp(x)) = exp(x)
-    let grad = result * upstream;
+    let grad = result.typed().expect(MIXED_TYPE_ERROR) * upstream;
     Ok(vec![grad])
 }
 
@@ -342,7 +344,7 @@ pub fn backwards_square<T: WeightValue, B: Backend>(
     };
     // d/dx(x²) = 2x
     let two = T::from_f32(2.0);
-    let grad = input_tensor * two * upstream;
+    let grad = input_tensor.typed().expect(MIXED_TYPE_ERROR) * two.convert::<T>() * upstream;
     Ok(vec![grad])
 }
 

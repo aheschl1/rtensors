@@ -324,9 +324,18 @@ macro_rules! impl_div {
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
                 
+                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
                 let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
                 let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
                 let meta_c = MetaTensor::new(result.shape().clone(), result.strides().clone(), result.offset());
 
                 result.backend.broadcast(
@@ -352,9 +361,18 @@ macro_rules! impl_div {
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
                 
+                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
                 let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
                 let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
                 let meta_c = MetaTensor::new(result.shape().clone(), result.strides().clone(), result.offset());
 
                 result.backend.broadcast(
@@ -380,9 +398,18 @@ macro_rules! impl_div {
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
                 
+                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
                 let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
                 let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
                 let meta_c = MetaTensor::new(result.shape().clone(), result.strides().clone(), result.offset());
 
                 result.backend.broadcast(
@@ -408,9 +435,18 @@ macro_rules! impl_div {
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
                 
+                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                attach_broadcast_div_grad(
+                    self.contiguous(),
+                    rhs.contiguous(),
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
                 let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
                 let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
                 let meta_c = MetaTensor::new(result.shape().clone(), result.strides().clone(), result.offset());
 
                 result.backend.broadcast(
@@ -551,8 +587,8 @@ fn attach_broadcast_div_grad<T: TensorValue, B: Backend>(
     }
 
     let op = GradNode::BroadcastDiv {
-        left: left.op().unwrap_or_default(),
-        right: right.op().unwrap_or_default(),
+        left: left.op(),
+        right: right.op(),
         lhs_input: left.as_untyped(),
         rhs_input_reciprocal: rhs_reciprocal.as_untyped(),
         lhs_strides: lhs_strides.clone(),

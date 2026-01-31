@@ -568,9 +568,10 @@ fn attach_broadcast_mul_grad<T: TensorValue, B: Backend>(
     result: &impl OpTensor,
 ) -> Option<()>
 {
+    println!("Attaching broadcast mul grad");
     let op = GradNode::BroadcastMul {
-        left: left.op().unwrap_or_default(),
-        right: right.op().unwrap_or_default(),
+        left: left.op(),
+        right: right.op(),
         lhs_input: left.as_untyped(),
         rhs_input: right.as_untyped(),
         lhs_strides: lhs_strides.clone(),

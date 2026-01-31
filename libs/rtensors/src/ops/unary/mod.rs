@@ -60,29 +60,27 @@ macro_rules! specify_unary_op_template {
                         T: $first $(+ $extra)*
                     )?
                     {
-                        let view = self.view_mut();
+                        let $result = self.view_mut();
                         //  ========== GRAPH BUILDING ============
                         let requires_input: bool = $requires_input;
                         let input = grad::when_enabled(|_| {
                             if requires_input { 
-                                Some(view.owned()) // TODO extra memory copy here, optimize later
+                                Some($result.owned()) // TODO extra memory copy here, optimize later
                             } else {
                                 None
                             }
                         });
                         // ========== APPLICATION OF OPERATION ============
-                        if let Err(e) = view.backend.[<apply_ $op>](view.buf, &view.meta) {
+                        if let Err(e) = $result.backend.[<apply_ $op>]($result.buf, &$result.meta) {
                             panic!("Failed to apply abs: {}", e);
                         }
                         // ========== GRAD NODE CREATION ============
                         grad::when_enabled(|$ctx| {
                             // unwrap when_enabled error
-                            let input = input.expect("Input tensor required for gradient computation but not captured.");
-                            let $input = input;
-                            let $grad_node = view.op().expect("Input tensor has no associated gradient node.");
-                            &$grad_node;
-                            &$input; // becayse annpying unused variable warning
-                            let $result = view;
+                            let $input = input.expect("Input tensor required for gradient computation but not captured.");
+                            let $grad_node = $result.op();
+                            let _ = (&$grad_node, &$input); // to remove warning if not used
+
                             let node: Result<GradNode, TensorError> = $grad_fn;
                             $ctx.attach(&$result, node.expect("Failed to create gradient node."))
                         });
@@ -305,7 +303,8 @@ specify_unary_op_template! {
         Err(TensorError::UnsupportedOperation("Truncating is not differentiable.".into()))
     },
     (Sign) sign where T: WeightValue; |false, _input, result, _ctx, grad_node| {
-        Err(TensorError::UnsupportedOperation("Sign is not differentiable.".into()))
+        // Err(TensorError::UnsupportedOperation("Sign is not differentiable.".into()))
+        Ok(GradNode::None)
     },
 }
 

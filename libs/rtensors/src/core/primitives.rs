@@ -74,7 +74,7 @@ impl<B: Backend, T: TensorValue> Clone for TensorBase<T, B> {
             buf: new_buffer,
             meta: self.meta.clone(),
             grad: Grad::default(),
-            op: RwLock::new(None).into(),
+            op: RwLock::new(self.op()).into(),
         }
 
     }
@@ -91,7 +91,7 @@ pub type Tensor<T> = TensorBase<T, Cpu>;
 
 #[cfg(feature = "remote")]
 use crate::backend::remote::client::RemoteBackend;
-use crate::grad::NodeKey;
+use crate::grad::{self, GradNode, NodeKey};
 
 #[cfg(feature = "remote")]
 pub type RemoteTensor<T> = TensorBase<T, RemoteBackend>;
@@ -106,7 +106,7 @@ impl<T: TensorValue> CudaTensor<T> {
     pub fn cpu(&self) -> Result<Tensor<T>, TensorError> {
         let cpu_backend = Cpu;
         let cpu_buffer = self.backend.dump(&self.buf)?;
-        let cpu = Tensor::from_parts(cpu_backend, cpu_buffer, self.meta.clone());
+        let cpu = Tensor::from_parts(cpu_backend, cpu_buffer, self.meta.clone(), self.op());
         Ok(cpu)
     }
 }
@@ -117,7 +117,7 @@ impl<T: TensorValue> Tensor<T> {
     pub fn cuda(&self) -> Result<CudaTensor<T>, TensorError> {
         let cuda_backend = crate::backend::cuda::Cuda::construct(0)?;
         let cuda_buffer = cuda_backend.alloc_from_slice(self.backend.dump(&self.buf)?)?;
-        let cuda = CudaTensor::from_parts(cuda_backend, cuda_buffer, self.meta.clone());
+        let cuda = CudaTensor::from_parts(cuda_backend, cuda_buffer, self.meta.clone(), self.op());
         Ok(cuda)
     }
 }
@@ -184,13 +184,14 @@ where
     pub(crate) fn from_parts(
         buf: &'a B::Buf<T>,
         backend: &'a B,
-        meta: MetaTensor
+        meta: MetaTensor,
+        op: Option<NodeKey>,
     ) -> Self {
         Self {
             buf,
             backend,
             meta,
-            op: RwLock::new(None).into(),
+            op: RwLock::new(op).into(),
         }
     }
 
@@ -216,13 +217,14 @@ where
     pub(crate) fn from_parts(
         raw: &'a mut B::Buf<T>,
         backend: &'a B,
-        meta: MetaTensor
+        meta: MetaTensor,
+        op: Option<NodeKey>,
     ) -> Self {
         Self {
             buf: raw,
             backend,
             meta,
-            op: RwLock::new(None).into(),
+            op: RwLock::new(op).into(),
         }
     }
 
@@ -238,12 +240,13 @@ where
     }
 }
 
-pub(crate) trait OpTensor {
+pub trait OpTensor {
     fn op(&self) -> Option<NodeKey>;
     fn set_op(&self, op: NodeKey);
 }
 
 impl<T: TensorValue, B: Backend> OpTensor for TensorBase<T, B> {
+    #[inline]
     fn op(&self) -> Option<NodeKey> {
         self.op.read().unwrap().clone()
     }
@@ -254,6 +257,7 @@ impl<T: TensorValue, B: Backend> OpTensor for TensorBase<T, B> {
 }
 
 impl<T: TensorValue, B: Backend> OpTensor for &TensorBase<T, B> {
+    #[inline]
     fn op(&self) -> Option<NodeKey> {
         self.op.read().unwrap().clone()
     }
@@ -264,6 +268,7 @@ impl<T: TensorValue, B: Backend> OpTensor for &TensorBase<T, B> {
 }
 
 impl<'a, T: TensorValue, B: Backend> OpTensor for TensorView<'a, T, B> {
+    #[inline]
     fn op(&self) -> Option<NodeKey> {
         self.op.read().unwrap().clone()
     }
@@ -274,6 +279,7 @@ impl<'a, T: TensorValue, B: Backend> OpTensor for TensorView<'a, T, B> {
 }
 
 impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorView<'a, T, B> {
+    #[inline]
     fn op(&self) -> Option<NodeKey> {
         self.op.read().unwrap().clone()
     }
@@ -285,6 +291,7 @@ impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorView<'a, T, B> {
 
 
 impl<'a, T: TensorValue, B: Backend> OpTensor for TensorViewMut<'a, T, B> {
+    #[inline]
     fn op(&self) -> Option<NodeKey> {
         self.op.read().unwrap().clone()
     }
@@ -295,6 +302,7 @@ impl<'a, T: TensorValue, B: Backend> OpTensor for TensorViewMut<'a, T, B> {
 }
 
 impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorViewMut<'a, T, B> {
+    #[inline]
     fn op(&self) -> Option<NodeKey> {
         self.op.read().unwrap().clone()
     }
@@ -322,13 +330,18 @@ where
 {
     /// Internal constructor from raw parts. Used for creating tensors from
     /// existing backend buffers without copying.
-    pub(crate) fn from_parts(backend: B, raw: B::Buf<T>, meta: MetaTensor) -> Self {
+    pub(crate) fn from_parts(
+        backend: B, 
+        raw: B::Buf<T>, 
+        meta: MetaTensor, 
+        op: Option<NodeKey>
+    ) -> Self {
         Self {
             backend,
             buf: raw,
             meta,
             grad: Grad::default(),
-            op: RwLock::new(None).into(),
+            op: RwLock::new(op).into(),
         }
     }
 
@@ -495,13 +508,20 @@ where
         Ok(TensorBase::<N, B>::from_parts(
             self.backend.clone(),
             new_buf,
-            self.meta.clone()
+            self.meta.clone(),
+            self.op()
         ))
     }
 
+    #[grad::if_enabled(ctx)]
+    pub fn param(&mut self) -> Option<()>{
+        let op = GradNode::Leaf(self.grad.clone());
+        ctx.attach(self, op);
+    }
+
+
 }
 
-use image::imageops::FilterType::Triangle;
 #[cfg(feature = "remote")]
 use serde::{Deserialize, Serialize};
 

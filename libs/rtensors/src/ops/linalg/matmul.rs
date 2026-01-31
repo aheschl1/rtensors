@@ -126,6 +126,7 @@ where
             lhs_view.backend.clone(),
             buf,
             MetaTensor::new(out_shape.clone(), out_strides.clone(), 0),
+            None
         );
 
         attach_matmul_grad::<T, B>(
@@ -169,8 +170,8 @@ where
     B: BackendMatMul<T>,
 {
     let op = GradNode::MatMul {
-        left: left.op().unwrap_or_default(),
-        right: right.op().unwrap_or_default(),
+        left: left.op(),
+        right: right.op(),
         left_input: left.as_untyped(),
         right_input: right.as_untyped(),
     };

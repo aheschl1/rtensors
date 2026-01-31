@@ -670,15 +670,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mnist"
-version = "0.1.0"
-dependencies = [
- "image",
- "rand",
- "rtensors",
-]
-
-[[package]]
 name = "moxcms"
 version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

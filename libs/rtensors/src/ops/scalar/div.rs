@@ -12,7 +12,7 @@ where
     T: TensorValue,
     B: Backend,
 {
-    let node = view.op().unwrap_or_default();
+    let node = view.op();
     let op = GradNode::DivScalar {
         input: node,
         scalar: scalar.into()

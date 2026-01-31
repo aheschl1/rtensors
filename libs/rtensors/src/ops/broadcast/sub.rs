@@ -591,8 +591,8 @@ fn attach_broadcast_sub_grad(
 ) -> Option<()>
 {
     let op = GradNode::BroadcastSub {
-        left: left.op().unwrap_or_default(),
-        right: right.op().unwrap_or_default(),
+        left: left.op(),
+        right: right.op(),
         lhs_strides: lhs_strides.clone(),
         rhs_strides: rhs_strides.clone(),
         lhs_shape: lhs_shape.clone(),

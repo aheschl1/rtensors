@@ -487,7 +487,7 @@ impl_absolute_ident!(
 #[cfg(feature = "remote")]
 use serde::{Deserialize, Serialize};
 
-use crate::core::value::types::boolean;
+use crate::core::{tensor::seal, value::types::boolean};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "remote", derive(Serialize, Deserialize))]
@@ -523,6 +523,26 @@ pub enum Value {
     F32(f32),
     F64(f64),
     BOOL(boolean),
+}
+
+impl Value {
+    pub (crate) fn convert<T: TensorValue>(self) -> T{
+        match self {
+            Value::U8(v) => v.convert::<T>(),
+            Value::I8(v) => v.convert::<T>(),
+            Value::U16(v) => v.convert::<T>(),
+            Value::I16(v) => v.convert::<T>(),
+            Value::U32(v) => v.convert::<T>(),
+            Value::U128(v) => v.convert::<T>(),
+            Value::I32(v) => v.convert::<T>(),
+            Value::U64(v) => v.convert::<T>(),
+            Value::I64(v) => v.convert::<T>(),
+            Value::I128(v) => v.convert::<T>(),
+            Value::F32(v) => v.convert::<T>(),
+            Value::F64(v) => v.convert::<T>(),
+            Value::BOOL(v) => v.convert::<T>(),
+        }
+    }
 }
 
 impl<T> From<T> for Value where T: TensorValue {

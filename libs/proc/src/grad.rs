@@ -3,6 +3,45 @@ use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Block, Ident, Item, Lit, Meta, MetaNameValue, Result, Signature, Token};
 
+// replaces body with grad::no_grad(|| { original body })
+pub fn no_grad(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(item as Item);
+
+    match item {
+        Item::Fn(mut func_block) => {
+            let original_block = &func_block.block;
+            func_block.block = Box::new(syn::parse_quote! {
+                {
+                    grad::no_grad(|| {
+                        #original_block
+                    })
+                }
+            });
+            quote!(#func_block).into()
+        },
+        Item::Impl(mut impl_block) => {
+            for item in impl_block.items.iter_mut() {
+                if let syn::ImplItem::Fn(method) = item {
+                    let original_block = &method.block;
+                    method.block = syn::parse_quote! {
+                        {
+                            grad::no_grad(|| {
+                                #original_block
+                            })
+                        }
+                    };
+                }
+            }
+            quote!(#impl_block).into()
+        },
+        _ => {
+            syn::Error::new_spanned(
+                item,
+                "#[no_grad] can only be applied to functions or impl blocks.",
+            ).to_compile_error().into()
+        }
+    }
+}
 
 /// allow syntax like #[requires_grad(message = "custom error message")]
 /// this is the inner function of the proc macro

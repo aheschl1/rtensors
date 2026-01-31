@@ -27,16 +27,22 @@ impl<T: WeightValue, B: Backend> SGD<T, B> {
 
 impl<T: WeightValue, B: Backend> Optim<T, B> for SGD<T, B> {
     fn step(&mut self) -> Result<(), TensorError> {
-        for param_ref in self.parameters {
-            let mut param = unsafe { param_ref.as_mut().expect("Null pointer where it shouldn't be") };
+        for param_ref in &self.parameters {
+            let param = unsafe { param_ref.as_mut().expect("Invalid parameter registered with optimizer") };
             let mut grad = param.grad.write();
-            if let Some(grad_inner) =  grad.as_ref(){
+            let u = if let Some(grad_inner) =  grad.as_ref(){
                 // Update parameter: param = param - learning_rate * grad
-                let update = grad_inner * self.learning_rate;
+                let update: TensorBase<T, B> = grad_inner.typed().expect("Mixed precision training not supported.") * self.learning_rate;
+                // Clear gradient after update. CONCIDER zero_grad method instead
+                *grad = None;
+                Some(update)
+            } else {
+                None
+            };
+            drop(grad);
+            if let Some(update) = u {
                 let mut v = param.view_mut();
                 v -= update;
-                // Clear gradient after update
-                *grad = None;
             }
         }
         Ok(())  
@@ -45,9 +51,10 @@ impl<T: WeightValue, B: Backend> Optim<T, B> for SGD<T, B> {
     #[grad::when_enabled(ctx, message = "Cannot register a parameter without a grad context.")]
     fn register_parameter(&mut self, param: &mut TensorBase<T, B>) -> Result<(), TensorError> {
         // check is leaf node
+        param.param();
         let nodes = ctx.nodes.borrow();
-        let node = param.op().ok_or_else(|| TensorError::GradError("Parameter has no associated node.".into()))?;
-        let node = nodes.get(node).ok_or_else(|| TensorError::GradError("Parameter not found in grad context.".into()))?;
+        let node_key = ctx.resolve_maybe_key(param.op());
+        let node = nodes.get(node_key).ok_or_else(|| TensorError::GradError("Parameter not found in grad context.".into()))?;
         if !node.is_leaf() {
             return Err(TensorError::GradError("Only leaf tensors can be registered as parameters.".into()));
         }

@@ -87,7 +87,7 @@ macro_rules! specify_binary_scalar_op_template {
                             let input = input.expect("Input tensor required for gradient computation but not captured.");
                             let $scalar = value;
                             let $input = input;
-                            let $grad_node = view.op().expect("Input tensor has no associated gradient node.");
+                            let $grad_node = view.op();
                             let $result = view;
                             let node: Result<GradNode, TensorError> = $grad_fn;
                             $ctx.attach(&$result, node.expect("Failed to create gradient node."))

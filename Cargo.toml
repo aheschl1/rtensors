@@ -4,8 +4,7 @@ resolver = "3"
 members = [
     "libs/rtensors",
     "libs/proc", 
-    "libs/benchmark",
-    "examples/mnist"
+    "libs/benchmark"
 ]
 
 [profile.release]

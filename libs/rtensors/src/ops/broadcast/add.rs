@@ -23,6 +23,16 @@ macro_rules! impl_add_assign {
                         rhs.meta.shape.0, self.meta.shape
                     );
                 }
+                       
+                attach_broadcast_add_grad(
+                    self,
+                    &rhs,
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    self,
+                );
                 
                 let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
                 let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
@@ -47,6 +57,14 @@ macro_rules! impl_add_assign {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
+                
+                if self.meta.shape != out_shape {
+                    panic!(
+                        "Incompatible shapes for in-place addition: {:?} does not broadcast to {:?}",
+                        rhs.meta.shape.0, self.meta.shape
+                    );
+                }
+                
                 attach_broadcast_add_grad(
                     self,
                     &rhs,
@@ -56,13 +74,7 @@ macro_rules! impl_add_assign {
                     &rhs.meta.shape,
                     self,
                 );
-                if self.meta.shape != out_shape {
-                    panic!(
-                        "Incompatible shapes for in-place addition: {:?} does not broadcast to {:?}",
-                        rhs.meta.shape.0, self.meta.shape
-                    );
-                }
-                
+
                 let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
                 let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
                 self.backend.broadcast(
@@ -169,12 +181,22 @@ macro_rules! impl_add {
             fn add(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                
-                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
-                let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
-                
-                let mut result = TensorBase::<T, B>::zeros(out_shape);
 
+                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+
+                attach_broadcast_add_grad(
+                    &self,
+                    &rhs,
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
+
+                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
+                let meta_b = MetaTensor::new(out_shape, broadcast_strb, rhs.offset());
+                
                 self.backend.broadcast(
                     (&self.buf as *const B::Buf<T>, &meta_a),
                     (&rhs.buf as *const B::Buf<T>, &meta_b),
@@ -237,10 +259,21 @@ macro_rules! impl_add {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
                 
-                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
-                let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
+                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
                 
-                let mut result = TensorBase::<T, B>::zeros(out_shape);
+                attach_broadcast_add_grad(
+                    &self,
+                    &rhs,
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
+                
+                let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
+                let meta_b = MetaTensor::new(out_shape, broadcast_strb, rhs.offset());
+                
 
                 self.backend.broadcast(
                     (self.buf as *const B::Buf<T>, &meta_a),
@@ -264,11 +297,21 @@ macro_rules! impl_add {
             fn add(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                
+                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+
+                attach_broadcast_add_grad(
+                    &self,
+                    &rhs,
+                    &broadcast_stra,
+                    &broadcast_strb,
+                    &self.meta.shape,
+                    &rhs.meta.shape,
+                    &result,
+                );
+
                 let meta_a = MetaTensor::new(out_shape.clone(), broadcast_stra, self.offset());
-                let meta_b = MetaTensor::new(out_shape.clone(), broadcast_strb, rhs.offset());
+                let meta_b = MetaTensor::new(out_shape, broadcast_strb, rhs.offset());
                 
-                let mut result = TensorBase::<T, B>::zeros(out_shape);
 
                 self.backend.broadcast(
                     (self.buf as *const B::Buf<T>, &meta_a),
@@ -553,8 +596,8 @@ fn attach_broadcast_add_grad(
 ) -> Option<()>
 {
     let op = GradNode::BroadcastAdd {
-        left: left.op().unwrap_or_default(),
-        right: right.op().unwrap_or_default(),
+        left: left.op(),
+        right: right.op(),
         lhs_strides: lhs_strides.clone(),
         rhs_strides: rhs_strides.clone(),
         lhs_shape: lhs_shape.clone(),

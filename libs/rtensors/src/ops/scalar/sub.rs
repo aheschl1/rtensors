@@ -13,7 +13,7 @@ where
 {
     // subtraction by a scalar is equivalent to adding a negative scalar; the
     // backward for scalar-sub uses the same AddScalar node (no scalar stored)
-    let node = view.op().unwrap_or_default();
+    let node = view.op();
     let op = GradNode::AddScalar { input: node };
     ctx.attach(view, op);
 }

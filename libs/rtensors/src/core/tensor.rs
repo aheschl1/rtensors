@@ -1,4 +1,4 @@
-use crate::{backend::Backend, core::{idx::Idx, meta::is_contiguous_relaxed, primitives::{DeviceType, TensorBase}, value::{TensorValue, WeightValue}, Dim, MetaTensor, MetaTensorView, Shape, Strides, TensorView, TensorViewMut}, grad::{self}, ops::linalg::PaddingType};
+use crate::{backend::Backend, core::{Dim, MetaTensor, MetaTensorView, Shape, Strides, TensorView, TensorViewMut, idx::Idx, meta::is_contiguous_relaxed, primitives::{DeviceType, OpTensor, TensorBase}, value::{TensorValue, WeightValue}}, grad::{self, NodeKey}, ops::linalg::PaddingType};
 use super::slice::{Slice, compute_sliced_parameters};
 use thiserror::Error;
 
@@ -64,7 +64,7 @@ pub(crate) mod seal {
 }
 
 /// Provides immutable view access to tensor data.
-pub trait AsView<T: TensorValue, B: Backend> {
+pub trait AsView<T: TensorValue, B: Backend> : OpTensor{
     /// Returns the device type where this tensor resides.
     fn device(&self) -> DeviceType {
         B::device_type()
@@ -107,11 +107,14 @@ pub trait AsTensor<T: TensorValue, B: Backend> {
 
 impl<T: TensorValue, B: Backend> AsView<T, B> for TensorBase<T, B> {
     fn view(&self) -> TensorView<'_, T, B> {
-        TensorView::<T, B>::from_parts(
+        let mut v = TensorView::<T, B>::from_parts(
             &self.buf, 
             &self.backend, 
-            self.meta.clone()
-        )
+            self.meta.clone(),
+            None
+        );
+        v.op = self.op.clone();
+        v
     }
     
     /// Logical reinterpretation of a contiguous memory layout.
@@ -122,11 +125,14 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for TensorBase<T, B> {
 
 impl<T: TensorValue, B: Backend> AsView<T, B> for &TensorBase<T, B> {
     fn view(&self) -> TensorView<'_, T, B> {
-        TensorView::<T, B>::from_parts(
+        let mut v = TensorView::<T, B>::from_parts(
             &self.buf, 
             &self.backend, 
-            self.meta.clone()
-        )
+            self.meta.clone(),
+            None
+        );
+        v.op = self.op.clone();
+        v
     }
     
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
@@ -136,11 +142,14 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for &TensorBase<T, B> {
 
 impl<T: TensorValue, B: Backend> AsViewMut<T, B> for TensorBase<T, B> {
     fn view_mut(&'_ mut self) -> TensorViewMut<'_, T, B> {
-        TensorViewMut::<T, B>::from_parts(
+        let mut v = TensorViewMut::<T, B>::from_parts(
             &mut self.buf, 
             &self.backend, 
-            self.meta.clone()
-        )
+            self.meta.clone(),
+            None
+        );
+        v.op = self.op.clone();
+        v
     }
     
     fn view_as_mut(&'_ mut self, shape: impl Into<Shape>) -> Result<TensorViewMut<'_, T, B>, TensorError> {
@@ -151,11 +160,14 @@ impl<T: TensorValue, B: Backend> AsViewMut<T, B> for TensorBase<T, B> {
 impl<T: TensorValue, B: Backend> AsView<T, B> for TensorView<'_, T, B> 
 {
     fn view(&self) -> TensorView<'_, T, B> {
-        TensorView::from_parts(
+        let mut v = TensorView::from_parts(
             self.buf, 
             self.backend,
-            self.meta.clone()
-        )
+            self.meta.clone(),
+            None
+        );
+        v.op = self.op.clone();
+        v
     }
     
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
@@ -167,11 +179,14 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for TensorView<'_, T, B>
 impl<T: TensorValue, B: Backend> AsView<T, B> for TensorViewMut<'_, T, B> 
 {
     fn view(&self) -> TensorView<'_, T, B> {
-        TensorView::from_parts(
+        let mut v = TensorView::from_parts(
             self.buf,
             self.backend,
-            self.meta.clone()
-        )
+            self.meta.clone(),
+            None
+        );
+        v.op = self.op.clone();
+        v
     }
     
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
@@ -182,11 +197,14 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for TensorViewMut<'_, T, B>
 impl<T: TensorValue, B: Backend> AsViewMut<T, B> for TensorViewMut<'_, T, B> 
 {
     fn view_mut(&'_ mut self) -> TensorViewMut<'_, T, B> {
-        TensorViewMut::from_parts(
+        let mut v = TensorViewMut::from_parts(
             self.buf,
             self.backend,
-            self.meta.clone()
-        )
+            self.meta.clone(),
+            None
+        );
+        v.op = self.op.clone();
+        v
     }
     
     fn view_as_mut(&'_ mut self, shape: impl Into<Shape>) -> Result<TensorViewMut<'_, T, B>, TensorError> {
@@ -205,7 +223,7 @@ impl <T: TensorValue, B: Backend> AsTensor<T, B> for TensorBase<T, B> {
             // fast path: already contiguous
             self.clone()
         } else {
-            view_to_contiguous(&self.meta, &self.buf, &self.backend).unwrap()
+            view_to_contiguous(&self.meta, &self.buf, &self.backend, self.op()).unwrap()
         }
     }
     
@@ -227,7 +245,7 @@ impl <T: TensorValue, B: Backend> AsTensor<T, B> for TensorBase<T, B> {
 
 impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorView<'a, T, B> {
     fn owned(&self) -> TensorBase<T, B> {
-        view_to_contiguous(&self.meta, self.buf, self.backend).unwrap()
+        view_to_contiguous(&self.meta, self.buf, self.backend, self.op()).unwrap()
     }
 
     fn contiguous(&self) -> TensorBase<T, B> {
@@ -252,7 +270,7 @@ impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorView<'a, T, B> {
 
 impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorViewMut<'a, T, B> {
     fn owned(&self) -> TensorBase<T, B> {
-        view_to_contiguous(&self.meta, self.buf, self.backend).unwrap()
+        view_to_contiguous(&self.meta, self.buf, self.backend, self.op()).unwrap()
     }
 
     fn contiguous(&self) -> TensorBase<T, B> {
@@ -276,7 +294,7 @@ impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorViewMut<'a, T, B> 
 }
 
 #[inline]
-fn view_to_contiguous<T: TensorValue, B: Backend>(meta: &MetaTensor, raw: &B::Buf<T>, backend: &B) -> Result<TensorBase<T, B>, TensorError> {
+fn view_to_contiguous<T: TensorValue, B: Backend>(meta: &MetaTensor, raw: &B::Buf<T>, backend: &B, op: Option<NodeKey>) -> Result<TensorBase<T, B>, TensorError> {
     let size = meta.size();
     let new_backend = backend.clone();
     let mut new_buf = new_backend.alloc(size)?;
@@ -301,7 +319,7 @@ fn view_to_contiguous<T: TensorValue, B: Backend>(meta: &MetaTensor, raw: &B::Bu
     let new_stride = super::shape_to_stride(&new_shape);
     let new_meta = MetaTensor::new(new_shape, new_stride, 0);
     
-    Ok(TensorBase::from_parts(new_backend, new_buf, new_meta))
+    Ok(TensorBase::from_parts(new_backend, new_buf, new_meta, op))
 }
 
 #[inline]
@@ -526,7 +544,12 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
             idx
         )?;
         
-        let v = TensorView::from_parts(view.buf, view.backend, MetaTensor::new(new_shape, new_stride, offset));
+        let v = TensorView::from_parts(
+            view.buf, 
+            view.backend, 
+            MetaTensor::new(new_shape, new_stride, offset),
+            view.op() // TODO this should be a special slice op
+        );
         Ok(v)
     }
     
@@ -562,7 +585,8 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
         let res = TensorView::from_parts(
             view.buf, 
             view.backend, 
-            MetaTensor::new(new_shape, new_strides, view.meta.offset())
+            MetaTensor::new(new_shape, new_strides, view.meta.offset()),
+            view.op() // TODO this should be a special unsqueeze op
         );
         Ok(res)
     }
@@ -601,7 +625,12 @@ where V: AsViewMut<T, B> + seal::Sealed
         let (new_shape, new_stride, offset) =
             compute_sliced_parameters(view.meta.shape(), view.meta.strides(), view.meta.offset(), dim, idx)?;
     
-        Ok(TensorViewMut::from_parts(view.buf, view.backend, MetaTensor::new(new_shape, new_stride, offset)))
+        Ok(TensorViewMut::from_parts(
+            view.buf, 
+            view.backend, 
+            MetaTensor::new(new_shape, new_stride, offset),
+            view.op() 
+        ))// TODO this should be a special slice op
     }
     
     fn set<I: Into<Idx>>(&mut self, idx: I, value: T) -> Result<(), TensorError> {
@@ -686,7 +715,7 @@ impl<T: WeightValue, B: Backend> RandomTensor<T, B> for TensorBase<T, B> {
             shape,
             stride,
             0
-        )))
+        ), None))
     }
 }
 
