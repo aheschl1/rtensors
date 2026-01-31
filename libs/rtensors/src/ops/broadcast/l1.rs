@@ -25,33 +25,37 @@ fn attach_l1_grad<T: WeightValue, B: Backend>(
 
     let input_node = input.op();
     let target_node = target.op();
-    let grad_map = diff.sign();
-    let grad_map = match reduction {
-        ReductionType::Mean => {
-            grad_map / T::from_usize(diff.size())
-        },
-        _ => grad_map,
-    };
-    let op = GradNode::L1 { 
-        input: input_node, 
-        target: target_node, 
-        grad_map: grad_map.as_untyped(),
-        loss: loss.clone().as_untyped()
-    };
-    ctx.attach(loss, op);
+
+    grad::no_grad(||{
+        let grad_map = diff.sign();
+        let grad_map = match reduction {
+            ReductionType::Mean => {
+                grad_map / T::from_usize(diff.size())
+            },
+            _ => grad_map,
+        };
+        let op = GradNode::L1 { 
+            input: input_node, 
+            target: target_node, 
+            grad_map: grad_map.as_untyped(),
+            loss: loss.clone().as_untyped()
+        };
+        ctx.attach(loss, op);
+    });
+
 }
 
 impl<T: WeightValue, B: Backend, V: AsView<T, B>> L1<T, B> for V {
     fn l1(&self, target: &impl AsView<T, B>, reduction: ReductionType) -> TensorBase<T, B> {
         let lhs = self.view();
         let target = target.view();
-        let diff = (&lhs - &target).abs();
+        let diff = grad::no_grad(|| (&lhs - &target).abs());
         
-        let gmap = grad::when_enabled(|_| {
+        let gmap = grad::without_enabled(|_| {
             diff.sign()
         });
 
-        let result = match reduction {
+        let result = grad::no_grad(|| match reduction {
             ReductionType::Mean => {
                 diff.mean().expect("Failed to reduce")
             },
@@ -61,7 +65,7 @@ impl<T: WeightValue, B: Backend, V: AsView<T, B>> L1<T, B> for V {
             ReductionType::None => {
                 diff
             },
-        };
+        });
 
         attach_l1_grad(&lhs, &target, &result, &gmap, reduction);
 

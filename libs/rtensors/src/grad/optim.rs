@@ -26,6 +26,7 @@ impl<T: WeightValue, B: Backend> SGD<T, B> {
 }
 
 impl<T: WeightValue, B: Backend> Optim<T, B> for SGD<T, B> {
+    #[grad::no_grad] // do not track the optimization step itself
     fn step(&mut self) -> Result<(), TensorError> {
         for param_ref in &self.parameters {
             let param = unsafe { param_ref.as_mut().expect("Invalid parameter registered with optimizer") };
@@ -33,7 +34,7 @@ impl<T: WeightValue, B: Backend> Optim<T, B> for SGD<T, B> {
             let u = if let Some(grad_inner) =  grad.as_ref(){
                 // Update parameter: param = param - learning_rate * grad
                 let update: TensorBase<T, B> = grad_inner.typed().expect("Mixed precision training not supported.") * self.learning_rate;
-                // Clear gradient after update. CONCIDER zero_grad method instead
+                // Clear gradient after update. CONCIDER an explicit zero_grad method instead
                 *grad = None;
                 Some(update)
             } else {

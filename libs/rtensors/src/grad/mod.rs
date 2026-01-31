@@ -229,20 +229,6 @@ impl GradContext {
         }
     }
 
-    /// Clears the tape, removing all recorded tensors.
-    // pub fn clear(&mut self) {
-    //     self.tape.clear();
-    // }
-
-    #[inline]
-    pub(crate) fn make_leaf<T: TensorValue, B: Backend>(
-        &self,
-        inner: &TensorBase<T, B>,
-    ) {
-        let node = GradNode::leaf(inner.grad.clone());
-        self.attach(inner, node);
-    }
-
     #[inline]
     pub(crate) fn attach(
         &self,
@@ -261,7 +247,7 @@ impl GradContext {
         }
     }
 
-    #[grad::no_grad]
+    #[grad::no_grad] // dont track the backward pass itself
     pub fn backwards<T, B>(&self, root: &impl OpTensor) -> Result<(), TensorError> 
     where
         T: WeightValue,
@@ -315,13 +301,8 @@ impl GradContext {
         let mut accumulations = HashMap::new();
         accumulations.insert(root_node_key, vec![loss.typed::<T, B>().expect("Loss is the wrong datatype.").clone()]);
 
-        // println!("{:?}", node_order
-        //     .iter()
-        //     .map(|k| self.nodes.borrow().get(*k).unwrap().clone())
-        //     .collect::<Vec<_>>()
-        // );
-
         drop(nodes); // free borrow
+        let mut nodes = self.nodes.borrow_mut();
         for node_key in node_order.into_iter().rev() {
             // accumulate grad. because of topo sort, we can assume to just sum the upstreams present to us
             // and then propagate downstream
@@ -337,7 +318,6 @@ impl GradContext {
                 })
                 .unwrap(); // must have at least one upstream grad
             
-            let mut nodes = self.nodes.borrow_mut();
             let node = nodes.get(node_key).unwrap(); // we would never have discovered this node if it was not present
             let upstreams: Vec<TensorBase<T, B>> = node.backwards(&dldy, self)?;
 
@@ -371,6 +351,8 @@ thread_local! {
     static GRAD_DISABLED: std::cell::RefCell<bool> = std::cell::RefCell::new(false);
 }
 
+/// Runs the provided closure with gradient tracking disabled.
+/// Resumes the previous state after the closure completes.
 pub fn no_grad<R>(
     f: impl FnOnce() -> R
 ) -> R {
@@ -425,6 +407,15 @@ pub fn when_enabled<R>(
         }
     });
     result
+}
+
+/// Gives access to the gradient context, but disables tracking
+pub fn without_enabled<R>(
+    f: impl FnOnce(&GradContext) -> R
+) -> Option<R>{
+    when_enabled(|ctx| {
+        no_grad(|| f(ctx))
+    })
 }
 
 pub fn when_disabled(
@@ -877,7 +868,6 @@ mod tests {
     #[test]
     fn test_trig_and_hyperbolic() {
         // Test sin, cos, tan, sinh, cosh, tanh
-        #[grad::when_enabled(ctx)]
         fn model_with_trig(
             wa: &TensorBase<f32, Cpu>,
             input: &TensorBase<f32, Cpu>,
@@ -928,20 +918,20 @@ mod tests {
             assert!(initial_loss - final_loss > 0.01, 
                 "Trig loss should reduce by at least 0.01, initial: {}, final: {}", initial_loss, final_loss);
 
-            // println!("\n=== Testing Hyperbolic Functions ===");
-            // let mut wb = Tensor::<f32>::ones((2, 3));
-            // optim.register_parameter(&mut wb).unwrap();
+            println!("\n=== Testing Hyperbolic Functions ===");
+            let mut wb = Tensor::<f32>::ones((2, 3));
+            optim.register_parameter(&mut wb).unwrap();
             
-            // let initial_loss = model_with_hyperbolic(&wb, &input, &target).item().unwrap();
-            // for i in 0..10 {
-            //     let loss = model_with_hyperbolic(&wb, &input, &target);
-            //     println!("Iter {}: Loss = {:?}", i, loss.item());
-            //     ctx.backwards::<f32, Cpu>(&loss).unwrap();
-            //     optim.step().unwrap();
-            // }
-            // let final_loss = model_with_hyperbolic(&wb, &input, &target).item().unwrap();
-            // assert!(initial_loss - final_loss > 0.5, 
-            //     "Hyperbolic loss should reduce by at least 0.5, initial: {}, final: {}", initial_loss, final_loss);
+            let initial_loss = model_with_hyperbolic(&wb, &input, &target).item().unwrap();
+            for i in 0..10 {
+                let loss = model_with_hyperbolic(&wb, &input, &target);
+                println!("Iter {}: Loss = {:?}", i, loss.item());
+                ctx.backwards::<f32, Cpu>(&loss).unwrap();
+                optim.step().unwrap();
+            }
+            let final_loss = model_with_hyperbolic(&wb, &input, &target).item().unwrap();
+            assert!(initial_loss - final_loss > 0.5, 
+                "Hyperbolic loss should reduce by at least 0.5, initial: {}, final: {}", initial_loss, final_loss);
         });
     }
 

@@ -76,13 +76,15 @@ macro_rules! specify_unary_op_template {
                         }
                         // ========== GRAD NODE CREATION ============
                         grad::when_enabled(|$ctx| {
-                            // unwrap when_enabled error
-                            let $input = input.expect("Input tensor required for gradient computation but not captured.");
-                            let $grad_node = $result.op();
-                            let _ = (&$grad_node, &$input); // to remove warning if not used
-
-                            let node: Result<GradNode, TensorError> = $grad_fn;
-                            $ctx.attach(&$result, node.expect("Failed to create gradient node."))
+                            grad::no_grad(|| {
+                                // unwrap when_enabled error
+                                let $input = input.expect("Input tensor required for gradient computation but not captured.");
+                                let $grad_node = $result.op();
+                                let _ = (&$grad_node, &$input); // to remove warning if not used
+    
+                                let node: Result<GradNode, TensorError> = $grad_fn;
+                                $ctx.attach(&$result, node.expect("Failed to create gradient node."))
+                            });
                         });
                     }
                 }
@@ -303,8 +305,7 @@ specify_unary_op_template! {
         Err(TensorError::UnsupportedOperation("Truncating is not differentiable.".into()))
     },
     (Sign) sign where T: WeightValue; |false, _input, result, _ctx, grad_node| {
-        // Err(TensorError::UnsupportedOperation("Sign is not differentiable.".into()))
-        Ok(GradNode::None)
+        Err(TensorError::UnsupportedOperation("Sign is not differentiable.".into()))
     },
 }
 
