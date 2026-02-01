@@ -1,4 +1,4 @@
-use crate::{backend::BackendMatMul, core::{meta::ContiguityTypes, primitives::TensorBase, shape_to_stride, tensor::{seal, AsTensor, AsView, TensorAccess, TensorError}, value::{TensorValue, WeightValue}, Dim, MetaTensor, MetaTensorView, Shape, Strides}, grad::{primitives::GradTensor, GradNode}, ops::linalg::MatMul};
+use crate::{backend::BackendMatMul, core::{Dim, MetaTensor, MetaTensorView, Shape, Strides, meta::ContiguityTypes, primitives::{OpTensor, TensorBase}, shape_to_stride, tensor::{AsTensor, AsView, TensorAccess, TensorError, seal}, untyped::AsUntypedTensor, value::{TensorValue, WeightValue}}, grad::{self, GradNode}, ops::linalg::MatMul};
 
 // broadcasting state:
 // does not broadcast batch dims, they must match exactly
@@ -122,11 +122,20 @@ where
             n
         )?;
 
-        Ok(TensorBase::from_parts(
+        let result = TensorBase::from_parts(
             lhs_view.backend.clone(),
             buf,
-            MetaTensor::new(out_shape, out_strides, 0),
-        ))
+            MetaTensor::new(out_shape.clone(), out_strides.clone(), 0),
+            None
+        );
+
+        attach_matmul_grad::<T, B>(
+            &result,
+            lhs_view.contiguous(),
+            rhs_view.contiguous(),
+        );
+
+        Ok(result)
     }
 
     fn dot(&self, rhs: &R) -> Result<TensorBase<T, B>, TensorError>
@@ -149,38 +158,25 @@ where
 
 }
 
-
-impl<T, B> MatMul<GradTensor<T, B>, T, B> for GradTensor<T, B> 
+#[inline(always)]
+#[grad::if_enabled(ctx)]
+fn attach_matmul_grad<T, B>(
+    output: &TensorBase<T, B>,
+    left: TensorBase<T, B>,
+    right: TensorBase<T, B>,
+) -> Option<()>
 where
-    T: WeightValue,
+    T: TensorValue,
     B: BackendMatMul<T>,
 {
-
-    type Output = GradTensor<T, B>;
-
-    fn matmul(&self, rhs: &GradTensor<T, B>) -> Result<GradTensor<T, B>, TensorError> {
-        let value = self.borrow().tensor.matmul(&rhs.borrow().tensor)?;
-        let op = GradNode::MatMul {
-            left: self.node,
-            right: rhs.node,
-            left_input: self.borrow().tensor.contiguous(),
-            right_input: rhs.borrow().tensor.contiguous(),
-        };
-        Ok(GradTensor::from_op(value, op))
-    }
-
-    fn dot(&self, rhs: &GradTensor<T, B>) -> Result<GradTensor<T, B>, TensorError> {
-        let result = self.borrow().tensor.dot(&rhs.borrow().tensor)?;
-        let op = GradNode::MatMul {
-            left: self.node,
-            right: rhs.node,
-            left_input: self.borrow().tensor.contiguous(),
-            right_input: rhs.borrow().tensor.contiguous(),
-        };
-        Ok(GradTensor::from_op(result, op))
-    }
-} 
-
+    let op = GradNode::MatMul {
+        left: left.op(),
+        right: right.op(),
+        left_input: left.as_untyped(),
+        right_input: right.as_untyped(),
+    };
+    ctx.attach(output, op);
+}
 
 // we are only concerned with the last two dims for matmul
 // this is because gemm expects one of the following:

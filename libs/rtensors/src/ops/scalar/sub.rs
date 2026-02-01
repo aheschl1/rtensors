@@ -1,6 +1,22 @@
 use std::{ops::{Sub, SubAssign}};
 
-use crate::{backend::Backend, core::{primitives::TensorBase, tensor::AsTensor, value::{TensorValue, WeightValue}, TensorView, TensorViewMut}, grad::{self, primitives::GradTensor, GradNode}};
+use crate::{backend::Backend, core::{primitives::TensorBase, tensor::AsTensor, value::TensorValue, TensorView, TensorViewMut}, grad::{self, GradNode}};
+
+#[inline]
+fn attach_sub_grad<T, B>(
+    ctx: &grad::GradContext,
+    view: &impl crate::core::primitives::OpTensor,
+)
+where
+    T: TensorValue,
+    B: Backend,
+{
+    // subtraction by a scalar is equivalent to adding a negative scalar; the
+    // backward for scalar-sub uses the same AddScalar node (no scalar stored)
+    let node = view.op();
+    let op = GradNode::AddScalar { input: node };
+    ctx.attach(view, op);
+}
 
 impl<'a, T, B> SubAssign<T> for TensorViewMut<'a, T, B> 
     where T: TensorValue,
@@ -12,6 +28,9 @@ impl<'a, T, B> SubAssign<T> for TensorViewMut<'a, T, B>
             rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_sub_grad::<T, B>(ctx, self);
+        });
     }
 }
 
@@ -25,6 +44,9 @@ impl<'a, T, B> SubAssign<&T> for TensorViewMut<'a, T, B>
             *rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_sub_grad::<T, B>(ctx, self);
+        });
     }
 }
 
@@ -38,6 +60,9 @@ impl<T, B> SubAssign<T> for TensorBase<T, B>
             rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_sub_grad::<T, B>(ctx, self);
+        });
     }
 }
 
@@ -51,6 +76,9 @@ impl<T, B> SubAssign<&T> for TensorBase<T, B>
             *rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_sub_grad::<T, B>(ctx, self);
+        });
     }
 }
 
@@ -93,41 +121,3 @@ impl_sub!(TensorView<'a, T, B>);
 impl_sub!(&TensorBase<T, B>);
 impl_sub!(TensorBase<T, B>);
 
-
-impl<T, B> std::ops::Sub<T> for &GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    #[grad::when_enabled(ctx)]
-    fn sub(self, rhs: T) -> Self::Output {
-        self.borrow_mut().tensor -= rhs;
-        let op = GradNode::AddScalar { // both are the same as addition of negative scalar
-            input: self.node
-        };
-        ctx.attach(
-            self.inner.clone(),
-            op
-        )
-    }
-}
-
-impl<T, B> std::ops::Sub<T> for GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    #[grad::when_enabled(ctx)]
-    fn sub(self, rhs: T) -> Self::Output {
-        self.borrow_mut().tensor -= rhs;
-        let op = GradNode::AddScalar { // both are the same as addition of negative scalar
-            input: self.node
-        };
-        ctx.attach(
-            self.inner.clone(),
-            op
-        )
-    }
-}

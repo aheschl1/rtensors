@@ -1,7 +1,21 @@
 use std::{ops::{Add, AddAssign}};
 
-use crate::{backend::Backend, core::{primitives::TensorBase, value::{TensorValue, WeightValue}, TensorView, TensorViewMut}, grad::{self, primitives::GradTensor, GradNode}};
+use crate::{backend::Backend, core::{primitives::TensorBase, value::TensorValue, TensorView, TensorViewMut}, grad::{self, GradNode}};
 use crate::core::tensor::AsTensor;
+
+#[inline]
+fn attach_add_grad<T, B>(
+    ctx: &grad::GradContext,
+    view: &impl crate::core::primitives::OpTensor,
+)
+where
+    T: TensorValue,
+    B: Backend,
+{
+    let node = view.op();
+    let op = GradNode::AddScalar { input: node };
+    ctx.attach(view, op);
+}
 
 impl<'a, T, B> AddAssign<T> for TensorViewMut<'a, T, B> 
     where T: TensorValue,
@@ -13,6 +27,9 @@ impl<'a, T, B> AddAssign<T> for TensorViewMut<'a, T, B>
             rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_add_grad::<T, B>(ctx, self);
+        });
     }
 }
 
@@ -26,6 +43,9 @@ impl<'a, T, B> AddAssign<&T> for TensorViewMut<'a, T, B>
             *rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_add_grad::<T, B>(ctx, self);
+        });
     }
 }
 
@@ -39,6 +59,9 @@ impl<T, B> AddAssign<T> for TensorBase<T, B>
             rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_add_grad::<T, B>(ctx, self);
+        });
     }
 }
 
@@ -52,6 +75,9 @@ impl<T, B> AddAssign<&T> for TensorBase<T, B>
             *rhs,
             &self.meta
         ).unwrap();
+        grad::when_enabled(|ctx| {
+            attach_add_grad::<T, B>(ctx, self);
+        });
     }
 }
 
@@ -93,41 +119,3 @@ impl_add!(&TensorView<'a, T, B>);
 impl_add!(TensorView<'a, T, B>);
 impl_add!(&TensorBase<T, B>);
 impl_add!(TensorBase<T, B>);
-
-impl<T, B> Add<T> for GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    #[grad::when_enabled(ctx)]
-    fn add(self, rhs: T) -> Self::Output {
-        self.borrow_mut().tensor += rhs;
-        let op = GradNode::AddScalar {
-            input: self.node
-        };
-        ctx.attach(
-            self.inner.clone(),
-            op
-        )
-    }
-}
-
-impl<T, B> Add<T> for &GradTensor<T, B> 
-    where T: WeightValue,
-          B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    #[grad::when_enabled(ctx)]
-    fn add(self, rhs: T) -> Self::Output {
-        self.borrow_mut().tensor += rhs;
-        let op = GradNode::AddScalar {
-            input: self.node
-        };
-        ctx.attach(
-            self.inner.clone(),
-            op
-        )
-    }
-}

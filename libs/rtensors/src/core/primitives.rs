@@ -1,23 +1,68 @@
+use std::cell::RefCell;
 use std::fmt::Debug;
 #[cfg(feature = "remote")]
 use std::net::IpAddr;
+use std::sync::{Arc, RwLock};
 
 
 use crate::backend::Backend;
 use crate::backend::cpu::Cpu;
-use crate::core::value::{DType, TensorValue};
+use crate::core::untyped::UntypedTensor;
+use crate::core::value::TensorValue;
 use crate::core::{shape_to_stride, MetaTensor, MetaTensorView, Shape};
 use crate::core::tensor::{compute_squeezed_parameters, compute_unsqueezed_parameters, TensorError};
+
+#[derive(Debug, Clone)]
+pub struct Grad(Arc<RwLock<Option<Box<dyn UntypedTensor>>>>);
+
+impl Grad {
+    pub fn default() -> Self {
+        Self(Arc::new(RwLock::new(None)))
+    }
+
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<Box<dyn UntypedTensor>>> {
+        self.0.read().unwrap()
+    } 
+
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<Box<dyn UntypedTensor>>> {
+        self.0.write().unwrap()
+    }
+}
+
+pub type NodeOp = Arc<RwLock<Option<NodeKey>>>;
 
 /// A generic tensor with backend-specific storage.
 /// 
 /// This is the base type for all tensors, parameterized by element type `T` and backend `B`.
 /// Most users will use type aliases like `Tensor<T>` (CPU) or `CudaTensor<T>` (GPU).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct TensorBase<T: TensorValue, B: Backend> {
     pub(crate) backend: B,
     pub(crate) buf: B::Buf<T>,
     pub(crate) meta: MetaTensor,
+    pub(crate) grad: Grad,    // relevant for params with auto-grad
+    pub(crate) op: NodeOp, // relevant when there is a ctx for tracking ops
+}
+
+impl<T: TensorValue, B: Backend> PartialEq for TensorBase<T, B> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.meta != other.meta { return false; }
+        if self.buf != other.buf { return false; }
+        if self.grad != other.grad { return false; }
+        true
+    }
+}
+
+impl PartialEq for Grad {
+    fn eq(&self, other: &Self) -> bool {
+        let self_guard = self.0.read().unwrap();
+        let other_guard = other.0.read().unwrap();
+        match (&*self_guard, &*other_guard) {
+            (Some(t1), Some(t2)) => t1.typed_unknown() == t2.typed_unknown(),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 impl<B: Backend, T: TensorValue> Clone for TensorBase<T, B> {
@@ -28,6 +73,8 @@ impl<B: Backend, T: TensorValue> Clone for TensorBase<T, B> {
             backend: new_backend,
             buf: new_buffer,
             meta: self.meta.clone(),
+            grad: Grad::default(),
+            op: RwLock::new(self.op()).into(),
         }
 
     }
@@ -44,6 +91,7 @@ pub type Tensor<T> = TensorBase<T, Cpu>;
 
 #[cfg(feature = "remote")]
 use crate::backend::remote::client::RemoteBackend;
+use crate::grad::{self, GradNode, NodeKey};
 
 #[cfg(feature = "remote")]
 pub type RemoteTensor<T> = TensorBase<T, RemoteBackend>;
@@ -58,7 +106,7 @@ impl<T: TensorValue> CudaTensor<T> {
     pub fn cpu(&self) -> Result<Tensor<T>, TensorError> {
         let cpu_backend = Cpu;
         let cpu_buffer = self.backend.dump(&self.buf)?;
-        let cpu = Tensor::from_parts(cpu_backend, cpu_buffer, self.meta.clone());
+        let cpu = Tensor::from_parts(cpu_backend, cpu_buffer, self.meta.clone(), self.op());
         Ok(cpu)
     }
 }
@@ -69,7 +117,7 @@ impl<T: TensorValue> Tensor<T> {
     pub fn cuda(&self) -> Result<CudaTensor<T>, TensorError> {
         let cuda_backend = crate::backend::cuda::Cuda::construct(0)?;
         let cuda_buffer = cuda_backend.alloc_from_slice(self.backend.dump(&self.buf)?)?;
-        let cuda = CudaTensor::from_parts(cuda_backend, cuda_buffer, self.meta.clone());
+        let cuda = CudaTensor::from_parts(cuda_backend, cuda_buffer, self.meta.clone(), self.op());
         Ok(cuda)
     }
 }
@@ -109,6 +157,7 @@ where
     pub(crate) buf: &'a B::Buf<T>,
     pub(crate) backend: &'a B,
     pub(crate) meta: MetaTensor,
+    pub(crate) op: NodeOp
 }
 
 /// A non-owning mutable view over tensor data.
@@ -122,6 +171,7 @@ where
     pub(crate) buf: &'a mut B::Buf<T>,
     pub(crate) backend: &'a B,
     pub(crate) meta: MetaTensor,
+    pub(crate) op: NodeOp
 }
 
 impl<'a, T, B> TensorView<'a, T, B>
@@ -134,12 +184,14 @@ where
     pub(crate) fn from_parts(
         buf: &'a B::Buf<T>,
         backend: &'a B,
-        meta: MetaTensor
+        meta: MetaTensor,
+        op: Option<NodeKey>,
     ) -> Self {
         Self {
             buf,
             backend,
             meta,
+            op: RwLock::new(op).into(),
         }
     }
 
@@ -165,12 +217,14 @@ where
     pub(crate) fn from_parts(
         raw: &'a mut B::Buf<T>,
         backend: &'a B,
-        meta: MetaTensor
+        meta: MetaTensor,
+        op: Option<NodeKey>,
     ) -> Self {
         Self {
             buf: raw,
             backend,
-            meta
+            meta,
+            op: RwLock::new(op).into(),
         }
     }
 
@@ -183,6 +237,78 @@ where
 
     pub fn unsqueeze_inplace(&mut self) {
         self.unsqueeze_at_inplace(0).unwrap();
+    }
+}
+
+pub trait OpTensor {
+    fn op(&self) -> Option<NodeKey>;
+    fn set_op(&self, op: NodeKey);
+}
+
+impl<T: TensorValue, B: Backend> OpTensor for TensorBase<T, B> {
+    #[inline]
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
+    }
+}
+
+impl<T: TensorValue, B: Backend> OpTensor for &TensorBase<T, B> {
+    #[inline]
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
+    }
+}
+
+impl<'a, T: TensorValue, B: Backend> OpTensor for TensorView<'a, T, B> {
+    #[inline]
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
+    }
+}
+
+impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorView<'a, T, B> {
+    #[inline]
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
+    }
+}
+
+
+impl<'a, T: TensorValue, B: Backend> OpTensor for TensorViewMut<'a, T, B> {
+    #[inline]
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
+    }
+}
+
+impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorViewMut<'a, T, B> {
+    #[inline]
+    fn op(&self) -> Option<NodeKey> {
+        self.op.read().unwrap().clone()
+    }
+
+    fn set_op(&self, op: NodeKey) {
+        self.op.write().unwrap().replace(op);
     }
 }
 
@@ -204,11 +330,18 @@ where
 {
     /// Internal constructor from raw parts. Used for creating tensors from
     /// existing backend buffers without copying.
-    pub(crate) fn from_parts(backend: B, raw: B::Buf<T>, meta: MetaTensor) -> Self {
+    pub(crate) fn from_parts(
+        backend: B, 
+        raw: B::Buf<T>, 
+        meta: MetaTensor, 
+        op: Option<NodeKey>
+    ) -> Self {
         Self {
             backend,
             buf: raw,
-            meta
+            meta,
+            grad: Grad::default(),
+            op: RwLock::new(op).into(),
         }
     }
 
@@ -246,12 +379,19 @@ where
         Ok(Self {
             backend,
             buf: buffer,
-            meta: MetaTensor::new(shape, stride, 0)
+            meta: MetaTensor::new(shape, stride, 0),
+            grad: Grad::default(),
+            op: RwLock::new(None).into(),
         })
     }
 
-    pub fn to_buf(&self) -> Result<Box<[T]>, TensorError> {
+    pub fn to_box(&self) -> Result<Box<[T]>, TensorError> {
         self.backend.dump(&self.buf)
+    }
+
+    pub fn zero_grad(&mut self) {
+        let mut grad_ref = self.grad.write();
+        *grad_ref = None;
     }
 
     /// Creates a rank-0 (scalar) tensor.
@@ -368,9 +508,17 @@ where
         Ok(TensorBase::<N, B>::from_parts(
             self.backend.clone(),
             new_buf,
-            self.meta.clone()
+            self.meta.clone(),
+            self.op()
         ))
     }
+
+    #[grad::if_enabled(ctx)]
+    pub fn param(&mut self) -> Option<()>{
+        let op = GradNode::Leaf(self.grad.clone());
+        ctx.attach(self, op);
+    }
+
 
 }
 

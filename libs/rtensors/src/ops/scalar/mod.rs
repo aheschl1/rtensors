@@ -1,5 +1,6 @@
 use crate::core::tensor::TensorAccess;
 use crate::core::tensor::TensorAccessMut;
+use crate::core::untyped::AsUntypedTensor;
 use crate::core::value::WeightValue;
 use crate::core::value::TensorValue;
 use crate::backend::Backend;
@@ -7,8 +8,8 @@ use crate::core::primitives::TensorBase;
 use crate::core::tensor::{AsViewMut, AsTensor, TensorError};
 use crate::core::MetaTensorView;
 use crate::grad::GradNode;
-use crate::grad::primitives::GradTensor;
 use crate::grad;
+use crate::core::primitives::OpTensor;
 
 pub mod add;
 pub mod sub;
@@ -18,7 +19,7 @@ pub mod div;
 macro_rules! specify_binary_scalar_op_template {
     (
         $(
-            ($name:ident) $op:ident $(where T: $first:path $(, $extra:path)*)?; |$input:ident, $result:ident, $ctx:ident, $grad_node:ident, $scalar:ident| $grad_fn:block
+            ($name:ident) $op:ident $(where T: $first:path $(, $extra:path)*)?; |$requires_input:literal, $input:ident, $result:ident, $ctx:ident, $grad_node:ident, $scalar:ident| $grad_fn:block
         ),+ $(,)?
     ) => {
 
@@ -66,9 +67,31 @@ macro_rules! specify_binary_scalar_op_template {
                     )?
                     {
                         let view = self.view_mut();
+                        //  ========== GRAPH BUILDING ============
+                        let requires_input: bool = $requires_input;
+                        let input = grad::when_enabled(|$ctx| {
+                            if requires_input { 
+                                Some(view.owned()) // TODO extra memory copy here, optimize later
+                            } else {
+                                None
+                            }
+                        });
+                        // ========== APPLICATION OF OPERATION ============
                         if let Err(e) = view.backend.[<scalar_apply_$op>](view.buf, value, &view.meta) {
                             panic!("Failed to apply op: {}", e);
                         }
+
+                        // ========== GRADIENT NODE CREATION ============
+                        grad::without_enabled(|$ctx| {
+                            // unwrap when_enabled error
+                            let input = input.expect("Input tensor required for gradient computation but not captured.");
+                            let $scalar = value;
+                            let $input = input;
+                            let $grad_node = view.op();
+                            let $result = view;
+                            let node: Result<GradNode, TensorError> = $grad_fn;
+                            $ctx.attach(&$result, node.expect("Failed to create gradient node."))
+                        });
                     }
                 }
 
@@ -106,38 +129,6 @@ macro_rules! specify_binary_scalar_op_template {
                     }
                 )+
             }
-
-            pub trait ScalarGradOp<T: WeightValue, B: Backend> {
-                $(
-                    fn $op(&self, value: T) -> GradTensor<T, B>
-                    where
-                    $(
-                        T: $first $(+ $extra)*
-                    )?;
-                )+
-            }
-
-            // impl for GradTensor<T, B> and where T: WeightValue
-            impl<T: TensorValue + WeightValue, B: Backend> ScalarGradOp<T, B> for GradTensor<T, B> {
-                $(
-                    #[grad::when_enabled($ctx)]
-                    fn $op(&self, value: T) -> GradTensor<T, B>
-                    where
-                    $(
-                        T: $first $(+ $extra)*
-                    )?
-                    {
-                        #[allow(unused_variables)]
-                        let _temp = self.borrow();
-                        let $input = &_temp.tensor;
-                        let $scalar = value;
-                        let $result = $input.$op(value);
-                        let $grad_node = self.node;
-                        let node: Result<GradNode<T, B>, TensorError> = $grad_fn;
-                        GradTensor::from_op($result, node.expect("Failed to apply gradient operation"))
-                    }
-                )+
-            }
            
         }
         
@@ -145,13 +136,14 @@ macro_rules! specify_binary_scalar_op_template {
 }
 
 specify_binary_scalar_op_template!(
-    (LogOp) log where T: WeightValue; |_input, _result, _ctx, _grad_node, _scalar| {
+    (LogOp) log where T: WeightValue; |false, _input, _result, _ctx, _grad_node, _scalar| {
         Err(TensorError::UnsupportedOperation("Gradient for log not yet implemented.".into()))
     },
-    (Log1POp) log1p where T: WeightValue; |_input, _result, _ctx, _grad_node, _scalar| {
+    (Log1POp) log1p where T: WeightValue; |false, _input, _result, _ctx, _grad_node, _scalar| {
         Err(TensorError::UnsupportedOperation("Gradient for log1p not yet implemented.".into()))
     },
-    (LeakyReluOp) leaky_relu; |input, _result, _ctx, grad_node, scalar| {
+    (LeakyReluOp) leaky_relu; |true, input, _result, _ctx, grad_node, scalar| {
+        let input = input.unwrap();
         let mut grad_map = TensorBase::<T, B>::zeros(input.shape());
         for coord in input.iter_coords() {
             let val = input.get(&coord).unwrap();
@@ -164,11 +156,11 @@ specify_binary_scalar_op_template!(
 
         let node = GradNode::ReLU {
             input: grad_node,
-            grad_map,
+            grad_map: grad_map.as_untyped(),
         };
         Ok(node)    
     },
-    (EluOp) elu where T: WeightValue; |_input, _result, _ctx, _grad_node, _scalar| {
+    (EluOp) elu where T: WeightValue; |false, _input, _result, _ctx, _grad_node, _scalar| {
         Err(TensorError::UnsupportedOperation("Gradient for elu not yet implemented.".into()))
     },
 );

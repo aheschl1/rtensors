@@ -220,7 +220,12 @@ where
         // temp_conv_slowpath()
         let out_strides = shape_to_stride(&out_shape);
         let out_meta = MetaTensor::new(out_shape, out_strides, 0);
-        let mut out_tensor = TensorBase::<T, B>::from_parts(out_backend, out_buffer, out_meta);
+        let mut out_tensor = TensorBase::<T, B>::from_parts(
+            out_backend, 
+            out_buffer, 
+            out_meta, 
+            None
+        );
         temp_conv2d_fallback(
             self_view,
             kernel_view,
@@ -292,7 +297,7 @@ where
         // temp_conv_slowpath()
         let out_strides = shape_to_stride(&out_shape);
         let out_meta = MetaTensor::new(out_shape, out_strides, 0);
-        let mut out_tensor = TensorBase::<T, B>::from_parts(out_backend, out_buffer, out_meta);
+        let mut out_tensor = TensorBase::<T, B>::from_parts(out_backend, out_buffer, out_meta, None);
         temp_conv3d_fallback(
             self_view,
             kernel_view,

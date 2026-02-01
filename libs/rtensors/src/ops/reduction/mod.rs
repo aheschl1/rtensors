@@ -477,7 +477,7 @@ fn materialize_output<T: TensorValue, B: Backend>(input: &MetaTensor, backend: B
     let buf = backend.alloc(output_meta.size());
 
    
-    Ok(TensorBase::from_parts(backend, buf?, output_meta))
+    Ok(TensorBase::from_parts(backend, buf?, output_meta, None))
 }
 
 #[inline]

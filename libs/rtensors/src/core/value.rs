@@ -487,7 +487,7 @@ impl_absolute_ident!(
 #[cfg(feature = "remote")]
 use serde::{Deserialize, Serialize};
 
-use crate::core::value::types::boolean;
+use crate::core::{tensor::seal, value::types::boolean};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "remote", derive(Serialize, Deserialize))]
@@ -506,6 +506,63 @@ pub enum DType {
     F32 = 10,
     F64 = 11,
     BOOL = 12,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Value {
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    U128(u128),
+    I32(i32),
+    U64(u64),
+    I64(i64),
+    I128(i128),
+    F32(f32),
+    F64(f64),
+    BOOL(boolean),
+}
+
+impl Value {
+    pub (crate) fn convert<T: TensorValue>(self) -> T{
+        match self {
+            Value::U8(v) => v.convert::<T>(),
+            Value::I8(v) => v.convert::<T>(),
+            Value::U16(v) => v.convert::<T>(),
+            Value::I16(v) => v.convert::<T>(),
+            Value::U32(v) => v.convert::<T>(),
+            Value::U128(v) => v.convert::<T>(),
+            Value::I32(v) => v.convert::<T>(),
+            Value::U64(v) => v.convert::<T>(),
+            Value::I64(v) => v.convert::<T>(),
+            Value::I128(v) => v.convert::<T>(),
+            Value::F32(v) => v.convert::<T>(),
+            Value::F64(v) => v.convert::<T>(),
+            Value::BOOL(v) => v.convert::<T>(),
+        }
+    }
+}
+
+impl<T> From<T> for Value where T: TensorValue {
+    fn from(value: T) -> Self {
+        match T::DTYPE {
+            DType::U8 => Value::U8(value.to_u8()),
+            DType::I8 => Value::I8(value.to_i8()),
+            DType::U16 => Value::U16(value.to_u16()),
+            DType::I16 => Value::I16(value.to_i16()),
+            DType::U32 => Value::U32(value.to_u32()),
+            DType::U128 => Value::U128(value.to_u128()),
+            DType::I32 => Value::I32(value.to_i32()),
+            DType::U64 => Value::U64(value.to_u64()),
+            DType::I64 => Value::I64(value.to_i64()),
+            DType::I128 => Value::I128(value.to_i128()),
+            DType::F32 => Value::F32(value.to_f32()),
+            DType::F64 => Value::F64(value.to_f64()),
+            DType::BOOL => Value::BOOL(value.to_bool()),
+        }
+    }
 }
 
 #[allow(non_camel_case_types)]

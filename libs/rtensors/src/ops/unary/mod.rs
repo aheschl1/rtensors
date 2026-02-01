@@ -5,14 +5,15 @@ use crate::{
         primitives::TensorBase, primops::{Exp, InvExp, SquareRoot}, tensor::{AsTensor, AsViewMut, TensorAccess, TensorAccessMut, TensorError}, value::{TensorValue, WeightValue}, MetaTensorView, TensorView, TensorViewMut
     }, grad::GradNode,
 };
-use crate::grad::primitives::GradTensor;
 use crate::core::tensor::seal;
 use crate::grad;
+use crate::core::primitives::OpTensor;
+use crate::core::untyped::AsUntypedTensor;
 
 macro_rules! specify_unary_op_template {
     (
         $(
-            ($name:ident) $op:ident $(where T: $first:path $(, $extra:path)*)?; |$input:ident, $result:ident, $ctx:ident, $grad_node:ident| $grad_fn:block
+            ($name:ident) $op:ident $(where T: $first:path $(, $extra:path)*)?; |$requires_input:literal, $input:ident, $result:ident, $ctx:ident, $grad_node:ident| $grad_fn:block
         ),+ $(,)?
     ) => {
 
@@ -59,10 +60,30 @@ macro_rules! specify_unary_op_template {
                         T: $first $(+ $extra)*
                     )?
                     {
-                        let view = self.view_mut();
-                        if let Err(e) = view.backend.[<apply_ $op>](view.buf, &view.meta) {
+                        let $result = self.view_mut();
+                        //  ========== GRAPH BUILDING ============
+                        let requires_input: bool = $requires_input;
+                        let input = grad::when_enabled(|_| {
+                            if requires_input { 
+                                Some($result.owned()) // TODO extra memory copy here, optimize later
+                            } else {
+                                None
+                            }
+                        });
+                        // ========== APPLICATION OF OPERATION ============
+                        if let Err(e) = $result.backend.[<apply_ $op>]($result.buf, &$result.meta) {
                             panic!("Failed to apply abs: {}", e);
                         }
+                        // ========== GRAD NODE CREATION ============
+                        grad::without_enabled(|$ctx| {
+                            // unwrap when_enabled error
+                            let $input = input.expect("Input tensor required for gradient computation but not captured.");
+                            let $grad_node = $result.op();
+                            let _ = (&$grad_node, &$input); // to remove warning if not used
+
+                            let node: Result<GradNode, TensorError> = $grad_fn;
+                            $ctx.attach(&$result, node.expect("Failed to create gradient node."))
+                        });
                     }
                 }
 
@@ -100,37 +121,6 @@ macro_rules! specify_unary_op_template {
                     }
                 )+
             }
-            
-            pub trait UnaryGradOp<T: WeightValue, B: Backend> {
-                $(
-                    fn $op(&self) -> GradTensor<T, B>
-                    where
-                    $(
-                        T: $first $(+ $extra)*
-                    )?;
-                )+
-            }
-
-            // impl for GradTensor<T, B> and where T: WeightValue
-            impl<T: TensorValue + WeightValue, B: Backend> UnaryGradOp<T, B> for GradTensor<T, B> {
-                $(
-                    #[grad::when_enabled($ctx)]
-                    fn $op(&self) -> GradTensor<T, B>
-                    where
-                    $(
-                        T: $first $(+ $extra)*
-                    )?
-                    {
-                        #[allow(unused_variables)]
-                        let _temp = self.borrow();
-                        let $input = &_temp.tensor;
-                        let $result = $input.$op();
-                        let $grad_node = self.node;
-                        let node: Result<GradNode<T, B>, TensorError> = $grad_fn;
-                        GradTensor::from_op($result, node.expect("Failed to apply gradient operation"))
-                    }
-                )+
-            }
 
         }
         
@@ -138,86 +128,87 @@ macro_rules! specify_unary_op_template {
 }
 
 specify_unary_op_template! {
-    (Sin) sin where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Sin) sin where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Sin {
             input: grad_node,
-            input_tensor: input.clone(),
+            input_tensor: input.unwrap().as_untyped(),
         })
     },
-    (Cos) cos where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Cos) cos where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Cos {
             input: grad_node,
-            input_tensor: input.clone(),
+            input_tensor: input.unwrap().as_untyped(),
         })
     },
-    (Tan) tan where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Tan) tan where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Tan {
             input: grad_node,
-            input_tensor: input.clone(),
+            input_tensor: input.unwrap().as_untyped(),
         })
     },
-    (Asin) asin where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Asin) asin where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Err(TensorError::UnsupportedOperation("Gradient for tanh not yet implemented.".into()))
     },
-    (Acos) acos where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Acos) acos where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Err(TensorError::UnsupportedOperation("Gradient for tanh not yet implemented.".into()))
     },
-    (Atan) atan where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Atan) atan where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Err(TensorError::UnsupportedOperation("Gradient for tanh not yet implemented.".into()))
     },
-    (Sinh) sinh where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Sinh) sinh where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Sinh {
             input: grad_node,
-            input_tensor: input.clone(),
+            input_tensor: input.unwrap().as_untyped(),
         })
     },
-    (Cosh) cosh where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Cosh) cosh where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Cosh {
             input: grad_node,
-            input_tensor: input.clone(),
+            input_tensor: input.unwrap().as_untyped(),
         })
     },
-    (Asinh) asinh where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Asinh) asinh where T: WeightValue; |false, _input, _result, _ctx, _grad_node| {
         Err(TensorError::UnsupportedOperation("Gradient for tanh not yet implemented.".into()))
     },
-    (Acosh) acosh where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Acosh) acosh where T: WeightValue; |false, _input, _result, _ctx, _grad_node| {
         Err(TensorError::UnsupportedOperation("Gradient for tanh not yet implemented.".into()))
     },
-    (Atanh) atanh where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Atanh) atanh where T: WeightValue; |false, _input, _result, _ctx, _grad_node| {
         Err(TensorError::UnsupportedOperation("Gradient for tanh not yet implemented.".into()))
     },
-    (Rsqrt) rsqrt where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Rsqrt) rsqrt where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Ok(GradNode::Rsqrt {
             input: grad_node,
-            result: result.clone(),
+            result: result.owned().as_untyped(),
         })
     },
-    (Reciprocal) reciprocal where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Reciprocal) reciprocal where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Ok(GradNode::Reciprocal {
             input: grad_node,
-            result: result.clone(),
+            result: result.owned().as_untyped(),
         })
     },
-    (Square) square where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Square) square where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Square {
             input: grad_node,
-            input_tensor: input.clone(),
+            input_tensor: input.unwrap().as_untyped(),
         })
     },
-    (Cube) cube where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Cube) cube where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Cube {
             input: grad_node,
-            input_tensor: input.clone(),
+            input_tensor: input.unwrap().as_untyped(),
         })
     },
-    (ExpV) exp where T: WeightValue; |input, result, _ctx, grad_node| {
+    (ExpV) exp where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Exp {
             input: grad_node,
-            result: result.clone(),
+            result: result.owned().as_untyped(),
         })
     },
-    (Abs) abs; |input, result, _ctx, grad_node| {
+    (Abs) abs where T: WeightValue; |true, input, result, _ctx, grad_node| {
         // TODO: Make a kernel for this
+        let input = input.unwrap();
         let mut grad_map = TensorBase::<T, B>::zeros(input.shape());
         for coord in input.iter_coords() {
             let val = input.get(&coord).unwrap();
@@ -228,13 +219,16 @@ specify_unary_op_template! {
             }
         }
 
+        // let grad_map = input.unwrap().sign();
+
         let node = GradNode::Abs {
             input: grad_node,
-            grad_map,
+            grad_map: grad_map.as_untyped(),
         };
         Ok(node)   
     },
-    (Relu) relu; |input, result, _ctx, grad_node| {
+    (Relu) relu; |true, input, result, _ctx, grad_node| {
+        let input = input.unwrap();
         let mut grad_map = TensorBase::<T, B>::zeros(input.shape());
         // TODO: Make a kernel for this
         for coord in input.iter_coords() {
@@ -248,67 +242,67 @@ specify_unary_op_template! {
 
         let node = GradNode::ReLU {
             input: grad_node,
-            grad_map,
+            grad_map: grad_map.as_untyped(),
         };
         Ok(node)    
     },
-    (Sigmoid) sigmoid where T: InvExp; |input, result, _ctx, grad_node| {
+    (Sigmoid) sigmoid where T: InvExp; |false, _input, result, _ctx, grad_node| {
         Ok(GradNode::Sigmoid {
             input: grad_node,
-            result: result.clone()
+            result: result.owned().as_untyped(),
         })
     },
-    (Silu) silu where T: InvExp; |input, result, _ctx, grad_node| {
+    (Silu) silu where T: InvExp; |true, input, result, _ctx, grad_node| {
         Err(TensorError::UnsupportedOperation("Gradient for silu not yet implemented.".into()))
     },
-    (Tanh) tanh where T: Exp, InvExp; |input, result, _ctx, grad_node| {
+    (Tanh) tanh where T: Exp, InvExp; |false, _input, result, _ctx, grad_node| {
         Ok(GradNode::Tanh {
             input: grad_node,
-            result: result.clone(),
+            result: result.owned().as_untyped(),
         })
     },
-    (Sqrt) sqrt where T: SquareRoot; |input, result, _ctx, grad_node| {
+    (Sqrt) sqrt where T: SquareRoot; |false, _input, result, _ctx, grad_node| {
         Ok(GradNode::Sqrt {
             input: grad_node,
-            output: result.clone(),
+            output: result.owned().as_untyped(),
         })
     },
-    (Negate) neg where T: std::ops::Neg<Output = T>; |input, result, ctx, grad_node| {
+    (Negate) neg where T: std::ops::Neg<Output = T>; |false, _input, result, ctx, grad_node| {
         Ok(GradNode::Negate {
             input: grad_node,
         })
     },
-    (NatLog) ln where T: WeightValue; |input, result, _ctx, grad_node| {
+    (NatLog) ln where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Ln {
             input: grad_node,
-            x_reciprocal: input.reciprocal(),
+            x_reciprocal: input.unwrap().reciprocal().as_untyped(),
         })
     },
-    (ExpM1) expm1 where T: Exp; |input, result, _ctx, grad_node| {
+    (ExpM1) expm1 where T: Exp; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::ExpM1 {
             input: grad_node,
-            input_tensor: input.clone(),
+            input_tensor: input.unwrap().as_untyped(),
         })
     },
-    (Ln1p) ln1p where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Ln1p) ln1p where T: WeightValue; |true, input, result, _ctx, grad_node| {
         Ok(GradNode::Ln1p {
             input: grad_node,
-            input_tensor: input.clone(),
+            input_tensor: input.unwrap().as_untyped(),
         })
     },
-    (Floor) floor where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Floor) floor where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Err(TensorError::UnsupportedOperation("Floor is not differentiable.".into()))
     },
-    (Ceil) ceil where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Ceil) ceil where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Err(TensorError::UnsupportedOperation("Ceiling is not differentiable.".into()))
     },
-    (Round) round where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Round) round where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Err(TensorError::UnsupportedOperation("Rounding is not differentiable.".into()))
     },
-    (Trunc) trunc where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Trunc) trunc where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Err(TensorError::UnsupportedOperation("Truncating is not differentiable.".into()))
     },
-    (Sign) sign where T: WeightValue; |input, result, _ctx, grad_node| {
+    (Sign) sign where T: WeightValue; |false, _input, result, _ctx, grad_node| {
         Err(TensorError::UnsupportedOperation("Sign is not differentiable.".into()))
     },
 }
@@ -396,31 +390,6 @@ where
         result
     }
 }
-
-impl<T, B> std::ops::Neg for GradTensor<T, B>
-where
-    T: WeightValue,
-    B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    fn neg(self) -> Self::Output {
-        UnaryGradOp::neg(&self)
-    }
-}
-
-impl<T, B> std::ops::Neg for &GradTensor<T, B>
-where
-    T: WeightValue,
-    B: Backend,
-{
-    type Output = GradTensor<T, B>;
-
-    fn neg(self) -> Self::Output {
-        UnaryGradOp::neg(self)
-    }
-}
-
 
 #[cfg(test)]
 mod tests {

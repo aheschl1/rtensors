@@ -18,7 +18,7 @@ use crate::core::Dim;
 /// // Single value
 /// let idx: Idx = 5.into();
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Idx {
     /// Multi-dimensional coordinates
     Coord(Vec<Dim>),
