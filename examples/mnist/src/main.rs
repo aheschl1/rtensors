@@ -169,38 +169,39 @@ fn main () {
 fn main() {
     use rtensors::backend::cpu::Cpu;
 
-    grad::with::<f32, Cpu>(|ctx| {
     let train_dset = MnistDataset::load(PathBuf::from("../data/mnist/training"));
     println!("Loaded {} training samples", train_dset.images.len());
-    let size = train_dset.images[0].borrow().size();
-    let model = DenseModel::new(size, 15, 10, 2);
+    let size = train_dset.images[0].size();
+    let mut model = DenseModel::new(size, 15, 10, 3);
     let mut optim = SGD::<f32, Cpu>::new(0.01);
-    model.register(&mut optim);
+    grad::with(|ctx| {
+        model.register(&mut optim);
 
-    // no batching yet so accumulate loss over multiple samples
-    let mut nsamples = 0;
-    let virtual_batch = 32;
-    let epochs = 100;
-    for _epoch in 0..epochs {
-        let iterator = MnistIter::new(&train_dset);
-        let mut total_loss = 0.0;
-        let mut loss_samples = 0;
-        for (x, y) in iterator.into_iter() {
-            let input = x.grad();
-            let target = y.grad();
+        // no batching yet so accumulate loss over multiple samples
+        let mut nsamples = 0;
+        let virtual_batch = 32;
+        let epochs = 100;
+        for _epoch in 0..epochs {
+            let iterator = MnistIter::new(&train_dset);
+            let mut total_loss = 0.0;
+            let mut loss_samples = 0;
+            for (x, y) in iterator.into_iter() {
 
-            let out = model.forward(input);
-            let loss = mean_l1_loss(&out, &target);
-            total_loss += loss.borrow().item().expect("Failed to get loss item");
-            loss_samples += 1;
-            ctx.backwards(&loss).expect("Backwards failed");
-            nsamples += 1;
-            if nsamples >= virtual_batch {
-                optim.step().expect("Optimizer step failed");
-                nsamples = 0;
+                let input = x;
+                let target = y;
+    
+                let out = model.forward(input.clone());
+                let loss = mean_l1_loss(&out, &target);
+                total_loss += loss.item().expect("Failed to get loss item");
+                loss_samples += 1;
+                ctx.backwards::<f32, Cpu>(&loss).expect("Backwards failed");
+                nsamples += 1;
+                if nsamples >= virtual_batch {
+                    optim.step().expect("Optimizer step failed");
+                    nsamples = 0;
+                }
             }
+            println!("Epoch {}: Average Loss = {}", _epoch + 1, total_loss / loss_samples as f32);
         }
-        println!("Epoch {}: Average Loss = {}", _epoch + 1, total_loss / loss_samples as f32);
-    }
     });
 }
