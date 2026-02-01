@@ -202,32 +202,40 @@ let result = a.dot(&b).unwrap();  // scalar: 15.0
 
 ## Autograd
 
-See the below example of training a dense neural network with multiple layers.
+The autograd system supports automatic differentiation for training neural networks. Use `TensorBase` for parameters and activate gradient tracking within a `grad::with` context.
 
 ```rust
-struct Layer<T: WeightValue, B: Backend> {
-    pub weight: GradTensor<T, B>,
-    pub bias: GradTensor<T, B>,
+use rtensors::{
+    backend::cpu::Cpu,
+    core::{primitives::TensorBase, tensor::RandomTensor, value::WeightValue},
+    grad::{self, optim::{Optim, SGD}},
+    ops::broadcast::l1::mean_l1_loss,
+};
+
+struct Layer<T: WeightValue, B: BackendMatMul<T>> {
+    pub weight: TensorBase<T, B>,
+    pub bias: TensorBase<T, B>,
 }
 
-struct DenseModel<T: WeightValue, B: Backend> {
+struct DenseModel<T: WeightValue, B: BackendMatMul<T>> {
     pub layers: Vec<Layer<T, B>>,
 }
 
-impl DenseModel<f32, Cpu> {
+impl<B: BackendMatMul<f32>> DenseModel<f32, B> {
     fn new(input_size: usize, hidden_size: usize, output_size: usize, num_layers: usize) -> Self {
         let mut layers = Vec::new();
         for i in 0..num_layers {
             let in_size = if i == 0 { input_size } else { hidden_size };
             let out_size = if i == num_layers - 1 { output_size } else { hidden_size };
-            let weight = Tensor::<f32>::uniform((in_size, out_size)).param();
-            let bias = Tensor::<f32>::zeros((1, out_size)).param();
+            let weight = TensorBase::<f32, B>::uniform((in_size, out_size))
+                .expect("Failed to create uniform tensor");
+            let bias = TensorBase::<f32, B>::zeros((1, out_size));
             layers.push(Layer { weight, bias });
         }
         Self { layers }
     }
 
-    fn forward(&self, mut x: GradTensor<f32, Cpu>) -> GradTensor<f32, Cpu> {
+    fn forward(&self, mut x: TensorBase<f32, B>) -> TensorBase<f32, B> {
         for (i, layer) in self.layers.iter().enumerate() {
             x = x.matmul(&layer.weight).unwrap() + &layer.bias;
             if i != self.layers.len() - 1 {
@@ -237,31 +245,37 @@ impl DenseModel<f32, Cpu> {
         x.sigmoid()
     }
 
-    fn register(&self, optim: &mut SGD<f32, Cpu>) {
-        for layer in &self.layers {
-            optim.register_parameter(&layer.weight).unwrap();
-            optim.register_parameter(&layer.bias).unwrap();
+    fn register(&mut self, optim: &mut SGD<f32, B>) {
+        for layer in &mut self.layers {
+            optim.register_parameter(&mut layer.weight).unwrap();
+            optim.register_parameter(&mut layer.bias).unwrap();
         }
     }
 }
 
-grad::with::<f32, Cpu>(|ctx| {
-    let model = DenseModel::new(5, 10, 2, 10);
+// Training loop
+let input_data = TensorBase::<f32, Cpu>::ones((32, 5));
+let target_data = TensorBase::<f32, Cpu>::uniform((32, 2)).unwrap();
 
-    let input = Tensor::<f32>::ones((1, 5)).grad();
-    let target = Tensor::<f32>::uniform((1, 2)).grad();
-    
-    let mut optim = SGD::<f32, Cpu>::new(0.01);
+let mut model = DenseModel::new(5, 10, 2, 3);
+let mut optim = SGD::<f32, Cpu>::new(0.01);
+
+grad::with(|ctx| {
     model.register(&mut optim);
-    for _ in 0..10 {
+    
+    for epoch in 0..100 {
+        let input = &input_data;
+        let target = &target_data;
+        
         let output = model.forward(input.clone());
-        let loss = l1_loss(&output, &target);
-        println!("Loss: {:?}", loss.borrow().tensor.item());
-        ctx.backwards(&loss).unwrap();
+        let loss = mean_l1_loss(&output, &target);
+        
+        println!("Epoch {}: Loss = {}", epoch, loss.item().unwrap());
+        
+        ctx.backwards::<f32, Cpu>(&loss).unwrap();
         optim.step().unwrap();
     }
 });
-
 ```
 
 ## Remote Backend

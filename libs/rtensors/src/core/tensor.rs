@@ -56,7 +56,6 @@ pub(crate) mod seal {
     use crate::{backend::Backend, core::{primitives::{TensorBase}, value::TensorValue, TensorView, TensorViewMut}};
 
     pub(crate) trait Sealed {}
-    // impl<T: WeightValue, B: Backend> Sealed for GradTensor<T, B> {}
     impl<T: TensorValue, B: Backend> Sealed for TensorBase<T, B> {}
     impl<T: TensorValue, B: Backend> Sealed for &TensorBase<T, B> {}
     impl<T: TensorValue, B: Backend> Sealed for TensorView<'_, T, B> {}
