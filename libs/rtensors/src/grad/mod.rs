@@ -267,6 +267,9 @@ impl GradContext {
     }
 
     #[inline]
+    /// Attach a gradient node to the computation graph.
+    /// If the op contains parents that are all None or the sentinel none_node,
+    /// the node is not tracked (no_grad case).
     pub(crate) fn attach(
         &self,
         inner: &impl OpTensor,
@@ -274,6 +277,7 @@ impl GradContext {
     ) {
         let parents = op.parents();
         // if all of them are None, or the sentinal, we do not need to track this node
+        // this ia a no_grad case. for example, working with a dataset before a forward pass.
         if parents.len() > 0 && parents.iter().all(|p| p.is_none() || *p == Some(self.none_node)) {
             return;
         }
