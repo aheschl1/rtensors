@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::fmt::Debug;
 #[cfg(feature = "remote")]
 use std::net::IpAddr;
@@ -248,7 +247,7 @@ pub trait OpTensor {
 impl<T: TensorValue, B: Backend> OpTensor for TensorBase<T, B> {
     #[inline]
     fn op(&self) -> Option<NodeKey> {
-        self.op.read().unwrap().clone()
+        *self.op.read().unwrap()
     }
 
     fn set_op(&self, op: NodeKey) {
@@ -259,7 +258,7 @@ impl<T: TensorValue, B: Backend> OpTensor for TensorBase<T, B> {
 impl<T: TensorValue, B: Backend> OpTensor for &TensorBase<T, B> {
     #[inline]
     fn op(&self) -> Option<NodeKey> {
-        self.op.read().unwrap().clone()
+        *self.op.read().unwrap()
     }
 
     fn set_op(&self, op: NodeKey) {
@@ -270,7 +269,7 @@ impl<T: TensorValue, B: Backend> OpTensor for &TensorBase<T, B> {
 impl<'a, T: TensorValue, B: Backend> OpTensor for TensorView<'a, T, B> {
     #[inline]
     fn op(&self) -> Option<NodeKey> {
-        self.op.read().unwrap().clone()
+        *self.op.read().unwrap()
     }
 
     fn set_op(&self, op: NodeKey) {
@@ -281,7 +280,7 @@ impl<'a, T: TensorValue, B: Backend> OpTensor for TensorView<'a, T, B> {
 impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorView<'a, T, B> {
     #[inline]
     fn op(&self) -> Option<NodeKey> {
-        self.op.read().unwrap().clone()
+        *self.op.read().unwrap()
     }
 
     fn set_op(&self, op: NodeKey) {
@@ -293,7 +292,7 @@ impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorView<'a, T, B> {
 impl<'a, T: TensorValue, B: Backend> OpTensor for TensorViewMut<'a, T, B> {
     #[inline]
     fn op(&self) -> Option<NodeKey> {
-        self.op.read().unwrap().clone()
+        *self.op.read().unwrap()
     }
 
     fn set_op(&self, op: NodeKey) {
@@ -304,7 +303,7 @@ impl<'a, T: TensorValue, B: Backend> OpTensor for TensorViewMut<'a, T, B> {
 impl<'a, T: TensorValue, B: Backend> OpTensor for &TensorViewMut<'a, T, B> {
     #[inline]
     fn op(&self) -> Option<NodeKey> {
-        self.op.read().unwrap().clone()
+        *self.op.read().unwrap()
     }
 
     fn set_op(&self, op: NodeKey) {

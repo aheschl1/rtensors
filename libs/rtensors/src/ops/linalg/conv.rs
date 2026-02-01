@@ -200,8 +200,8 @@ where
         }
 
         let out_shape = compute_output_convolution_shape_2d(
-            &self_view.shape(),
-            &kernel_view.shape(),
+            self_view.shape(),
+            kernel_view.shape(),
             &config.stride,
             &config.padding,
         );
@@ -277,8 +277,8 @@ where
         }
 
         let out_shape = compute_output_convolution_shape_3d(
-            &self_view.shape(),
-            &kernel_view.shape(),
+            self_view.shape(),
+            kernel_view.shape(),
             &config.stride,
             &config.padding,
         );
@@ -372,9 +372,9 @@ fn temp_conv2d_fallback<T: WeightValue, B: BackendMatMul<T>>(
             println!("Kernel flat shape: {:?}", kernel_flat.shape());
             let dot = input_flat.dot(&kernel_flat)?;
             output.set(
-                output_coord.clone(), 
+                output_coord, 
                 dot.item()?
-            ).expect(format!("Failed to set output value at coord {:?}", output_coord).as_str());
+            ).unwrap_or_else(|_| panic!("Failed to set output value at coord {:?}", output_coord));
         }
     }
 
@@ -448,9 +448,9 @@ fn temp_conv3d_fallback<T: WeightValue, B: BackendMatMul<T>>(
             let kernel_flat = kernel_oc.reshape((in_shape,))?;
             let dot = input_flat.dot(&kernel_flat)?;
             output.set(
-                output_coord.clone(), 
+                output_coord, 
                 dot.item()?
-            ).expect(format!("Failed to set output value at coord {:?}", output_coord).as_str());
+            ).unwrap_or_else(|_| panic!("Failed to set output value at coord {:?}", output_coord));
         }
     }
 

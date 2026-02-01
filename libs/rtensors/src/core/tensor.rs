@@ -388,7 +388,7 @@ fn pad_inner<T: TensorValue, B: Backend>(
         let output_coord: Vec<Dim> = input_coord.iter().zip(padding.iter()).map(|(c, p)| c + p).collect();
         let input_offset = tensor.meta.idx_to_offset(&input_coord);
         let output_offset = output_tensor.meta.idx_to_offset(&output_coord);
-        tensor.backend.copy_range_within(&mut output_tensor.buf, &tensor.buf, output_offset, input_offset, 1)?;
+        tensor.backend.copy_range_within(&mut output_tensor.buf, tensor.buf, output_offset, input_offset, 1)?;
     }
 
     // // we need to copy each contiguous region from input to output at the correct offset

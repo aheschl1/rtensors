@@ -10,13 +10,13 @@ pub fn no_grad(_attr: TokenStream, item: TokenStream) -> TokenStream {
     match item {
         Item::Fn(mut func_block) => {
             let original_block = &func_block.block;
-            func_block.block = Box::new(syn::parse_quote! {
+            *func_block.block = syn::parse_quote! {
                 {
                     grad::no_grad(|| {
                         #original_block
                     })
                 }
-            });
+            };
             quote!(#func_block).into()
         },
         Item::Impl(mut impl_block) => {
@@ -99,15 +99,7 @@ fn make_wrapped_block(
     block: &Block,
     args: &GradArgs,
     expect: bool 
-    // has_t: bool,
-    // has_b: bool,
 ) -> syn::Result<Block> {
-    // if !has_t || !has_b {
-    //     return Err(syn::Error::new_spanned(
-    //         &sig.generics,
-    //         "#[requires_grad] functions must have generic parameters T and B.",
-    //     ));
-    // }
 
     let ctx_ident = &args.ctx;
     let default_failure = format!(
@@ -138,12 +130,9 @@ fn requires_grad_func(
     mut func: syn::ItemFn,
     expect: bool 
 ) -> TokenStream {
-    // let has_t = inherited_t || generics.type_params().any(|tp| tp.ident == "T");
-    // let has_b = inherited_b || generics.type_params().any(|tp| tp.ident == "B");
-
     match make_wrapped_block(&func.sig, &func.block, args, expect) {
         Ok(new_block) => {
-            func.block = Box::new(new_block);
+            *func.block = new_block;
             quote!(#func).into()
         }
         Err(e) => e.to_compile_error().into(),
@@ -164,8 +153,6 @@ fn requires_grad_impl(
                 &method.block,
                 args,
                 expect,
-                // has_t,
-                // has_b,
             ) {
                 Ok(new_block) => {
                     method.block = new_block;

@@ -487,7 +487,7 @@ impl_absolute_ident!(
 #[cfg(feature = "remote")]
 use serde::{Deserialize, Serialize};
 
-use crate::core::{tensor::seal, value::types::boolean};
+use crate::core::value::types::boolean;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "remote", derive(Serialize, Deserialize))]
@@ -686,7 +686,7 @@ pub mod types {
 
     impl std::ops::Div for boolean {
         type Output = Self;
-        fn div(self, rhs: Self) -> Self::Output {
+        fn div(self, _rhs: Self) -> Self::Output {
             todo!()
         }
     }

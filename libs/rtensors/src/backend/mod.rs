@@ -91,7 +91,6 @@ macro_rules! elementwise_unary_dispatch {
 }
 
 use paste::paste;
-use rand::distr::weighted::Weight;
 
 
 macro_rules! specify_trait_unary_cabal {

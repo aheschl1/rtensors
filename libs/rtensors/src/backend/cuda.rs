@@ -1537,10 +1537,10 @@ impl Backend for Cuda {
     
     fn apply_conv_2d<T: WeightValue>(
         &self, 
-        input: (&Self::Buf<T>, &MetaTensor), 
-        kernel: (&Self::Buf<T>, &MetaTensor),
-        output: &mut Self::Buf<T>,
-        config: &crate::ops::linalg::ConvConfig2D
+        _input: (&Self::Buf<T>, &MetaTensor), 
+        _kernel: (&Self::Buf<T>, &MetaTensor),
+        _output: &mut Self::Buf<T>,
+        _config: &crate::ops::linalg::ConvConfig2D
     ) -> Result<(), TensorError> {
         todo!()
     }

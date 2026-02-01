@@ -123,9 +123,9 @@ impl From<()> for Idx {
     }
 }
 
-impl Into<Vec<Dim>> for Idx {
-    fn into(self) -> Vec<Dim> {
-        match self {
+impl From<Idx> for Vec<Dim> {
+    fn from(val: Idx) -> Self {
+        match val {
             Idx::Coord(coords) => coords,
             Idx::At(i) => vec![i],
             Idx::Item => vec![],

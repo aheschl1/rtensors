@@ -1,6 +1,6 @@
 use slotmap::{new_key_type, SecondaryMap};
 
-use crate::{backend::{Backend, BackendMatMul, cpu::Cpu}, core::{MetaTensorView, Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, untyped::UntypedTensor, value::{TensorValue, Value, WeightValue}}, grad};
+use crate::{backend::{Backend, BackendMatMul}, core::{Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, untyped::UntypedTensor, value::{Value, WeightValue}}, grad};
 use std::{cell::RefCell};
 use std::collections::HashMap;
 
@@ -22,9 +22,11 @@ pub type MaybeNodeKey = Option<NodeKey>;
 
 /// Each variant of a node holds parents and any tensors that need to be saved for backward.
 #[derive(Debug)]
+#[derive(Default)]
 pub(crate) enum GradNode {
     // LEAF NODES
     Leaf( Grad ),
+    #[default]
     None,
     // OPS
     BroadcastAdd { 
@@ -107,15 +109,10 @@ pub(crate) enum GradNode {
     },
 }
 
-impl Default for GradNode {
-    fn default() -> Self {
-        GradNode::None
-    }
-}
 
-impl Into<String> for &GradNode {
-    fn into(self) -> String {
-        match self {
+impl From<&GradNode> for String {
+    fn from(val: &GradNode) -> Self {
+        match val {
             GradNode::Leaf(_) => "{Leaf|requires_grad=true}".to_string(),
             GradNode::None => "{None}".to_string(),
             GradNode::BroadcastAdd { .. } => "{BroadcastAdd}".to_string(),
@@ -341,7 +338,7 @@ impl GradContext {
                 }
             }
             // Fallback: replace invalid characters
-            node_key_str.replace('(', "_").replace(')', "_")
+            node_key_str.replace(['(', ')'], "_")
         }
         let node_order = self.graph_toposort(root)?;
 
@@ -359,7 +356,7 @@ impl GradContext {
             }
         }
 
-        dot.push_str("\n");
+        dot.push('\n');
 
         // Create edges (parent -> child)
         let none_node_id = sanitize_node_id(&format!("{:?}", self.none_node));
@@ -458,8 +455,8 @@ impl std::fmt::Debug for GradContext {
 }
 
 thread_local! {
-    static GRAD_CONTEXT: std::cell::RefCell<Option<GradContext>> = std::cell::RefCell::new(None);
-    static GRAD_DISABLED: std::cell::RefCell<bool> = std::cell::RefCell::new(false);
+    static GRAD_CONTEXT: std::cell::RefCell<Option<GradContext>> = const { std::cell::RefCell::new(None) };
+    static GRAD_DISABLED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
 }
 
 /// Runs the provided closure with gradient tracking disabled.
@@ -484,12 +481,11 @@ pub fn with(
     }
     GRAD_CONTEXT.with(|ctx_cell| {
         let mut ctx_map = ctx_cell.borrow_mut();
-        ctx_map.get_or_insert_with(|| GradContext::new());
+        ctx_map.get_or_insert_with(GradContext::new);
         drop(ctx_map);
         let ctx = ctx_cell.borrow();
         f(ctx.as_ref().unwrap());
     });
-    return;
 }
 
 #[inline]
