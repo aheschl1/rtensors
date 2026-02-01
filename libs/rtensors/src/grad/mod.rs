@@ -196,6 +196,7 @@ impl GradNode {
         }
     }
 
+    /// computes dL/dX by computing dY/dX * dL/dY
     fn backwards<T, B>(&self, upstream: &TensorBase<T, B>, _ctx: &GradContext) -> Result<Vec<TensorBase<T, B>>, TensorError> 
     where
         T: WeightValue,
@@ -644,12 +645,12 @@ mod tests {
 
         grad::with(|ctx| {
             
-            let a = Tensor::<f32>::scalar(1.);
+            let mut a = Tensor::<f32>::scalar(1.);
             let mut b = Tensor::<f32>::ones((2, 2));
             let target = Tensor::<f32>::zeros((2, 2));
 
             let mut optim = SGD::<f32, Cpu>::new(1.);
-            // optim.register_parameter(&a).unwrap();
+            optim.register_parameter(&mut a).unwrap();
             optim.register_parameters(vec![&mut b]).unwrap();
             
             let initial_loss = model(&a, &b, &target).item().unwrap();
@@ -732,7 +733,7 @@ mod tests {
             let target = Tensor::<f32>::zeros((3, 2));
             optim.register_parameter(&mut input).unwrap();
             let initial_loss = modelv5(&input, &target).item().unwrap();
-            for _ in 0..12 {
+            for _ in 0..10 {
                 let loss = modelv5(&input, &target);
                 println!("Loss: {:?}", loss.item());
                 ctx.backwards::<f32, Cpu>(&loss).unwrap();
@@ -740,8 +741,8 @@ mod tests {
             }
             let final_loss = modelv5(&input, &target).item().unwrap();
             // visualize
-            let graphdot = ctx.visualize(&modelv5(&input, &target)).unwrap();
-            std::fs::write("grad_graph_final.dot", graphdot).unwrap();
+            // let graphdot = ctx.visualize(&modelv5(&input, &target)).unwrap();
+            // std::fs::write("grad_graph_final.dot", graphdot).unwrap();
             assert!(initial_loss - final_loss > 0.5, 
                 "Loss should reduce by at least 0.5, initial: {}, final: {}", initial_loss, final_loss);
 
@@ -959,7 +960,7 @@ mod tests {
             let input = Tensor::<f32>::ones((1, 5));
             let target = Tensor::<f32>::uniform((1, 2)).unwrap();
             
-            let mut optim = SGD::<f32, Cpu>::new(0.01);
+            let mut optim = SGD::<f32, Cpu>::new(0.1);
             model.register(&mut optim);
             
             let initial_loss = {

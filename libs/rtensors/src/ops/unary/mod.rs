@@ -391,31 +391,6 @@ where
     }
 }
 
-// impl<T, B> std::ops::Neg for GradTensor<T, B>
-// where
-//     T: WeightValue,
-//     B: Backend,
-// {
-//     type Output = GradTensor<T, B>;
-
-//     fn neg(self) -> Self::Output {
-//         UnaryGradOp::neg(&self)
-//     }
-// }
-
-// impl<T, B> std::ops::Neg for &GradTensor<T, B>
-// where
-//     T: WeightValue,
-//     B: Backend,
-// {
-//     type Output = GradTensor<T, B>;
-
-//     fn neg(self) -> Self::Output {
-//         UnaryGradOp::neg(self)
-//     }
-// }
-
-
 #[cfg(test)]
 mod tests {
     use crate::{

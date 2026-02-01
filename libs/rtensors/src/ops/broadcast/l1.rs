@@ -1,5 +1,5 @@
 
-use crate::{backend::Backend, core::{MetaTensorView, primitives::{OpTensor, TensorBase}, tensor::{AsView, TensorAccess, TensorAccessMut}, untyped::AsUntypedTensor, value::WeightValue}, grad::{self, GradNode}, ops::{reduction::{self, TotalReductionOp}, unary::UnaryOp}};
+use crate::{backend::Backend, core::{MetaTensorView, primitives::{OpTensor, TensorBase}, tensor::{AsView, TensorAccess, TensorAccessMut}, untyped::AsUntypedTensor, value::WeightValue}, grad::{self, GradNode}, ops::{reduction::{self, TotalReductionOp}, unary::{Abs, UnaryOp}}};
 
 
 
@@ -49,22 +49,25 @@ impl<T: WeightValue, B: Backend, V: AsView<T, B>> L1<T, B> for V {
     fn l1(&self, target: &impl AsView<T, B>, reduction: ReductionType) -> TensorBase<T, B> {
         let lhs = self.view();
         let target = target.view();
-        let diff = grad::no_grad(|| (&lhs - &target).abs());
+        let mut diff = grad::no_grad(|| &lhs - &target);
         
         let gmap = grad::without_enabled(|_| {
             diff.sign()
         });
 
-        let result = grad::no_grad(|| match reduction {
-            ReductionType::Mean => {
-                diff.mean().expect("Failed to reduce")
-            },
-            ReductionType::Sum => {
-                diff.sum().expect("Failed to reduce")
-            },
-            ReductionType::None => {
-                diff
-            },
+        let result = grad::no_grad(|| {
+            diff.abs_inplace();
+            match reduction {
+                ReductionType::Mean => {
+                    diff.mean().expect("Failed to reduce")
+                },
+                ReductionType::Sum => {
+                    diff.sum().expect("Failed to reduce")
+                },
+                ReductionType::None => {
+                    diff
+                },
+            }
         });
 
         attach_l1_grad(&lhs, &target, &result, &gmap, reduction);
