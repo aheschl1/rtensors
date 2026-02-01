@@ -90,7 +90,11 @@ macro_rules! specify_binary_scalar_op_template {
                             let $grad_node = view.op();
                             let $result = view;
                             let node: Result<GradNode, TensorError> = $grad_fn;
-                            $ctx.attach(&$result, node.expect("Failed to create gradient node."))
+                            if let Err(e) = &node {
+                                eprintln!("Warning: Failed to create gradient node for scalar op {}: {}", stringify!($op), e);
+                            } else {
+                                $ctx.attach(&$result, node.expect("Failed to create gradient node."))
+                            }
                         });
                     }
                 }

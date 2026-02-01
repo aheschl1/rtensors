@@ -701,12 +701,44 @@ where V: AsViewMut<T, B> + seal::Sealed
 
 }
 
+fn scaled_uniform<T: WeightValue>(
+    size: usize,
+    scale: f32,
+) -> Vec<T> {
+    let mut rng = rand::rng();
+    let mut v = Vec::with_capacity(size);
+
+    for _ in 0..size {
+        let x: f32 = rand::Rng::random_range(&mut rng, -scale..scale);
+        v.push(T::from_f32(x));
+    }
+
+    v
+}
+
+fn fan_in_out(shape: &Shape) -> (usize, usize) {
+    let slice = shape.as_slice();
+    match slice {
+        [fan_out, fan_in] => (*fan_in, *fan_out),
+        _ => {
+            // fallback: treat last dim as fan_in
+            let fan_in = *slice.last().unwrap();
+            let fan_out = shape.size() / fan_in;
+            (fan_in, fan_out)
+        }
+    }
+}
+
+
 pub trait RandomTensor<T: TensorValue + rand::distr::uniform::SampleUniform, B: Backend> {
-    fn uniform(shape: impl Into<Shape>) -> Result<TensorBase<T, B>, TensorError>;
+    fn uniform(shape: impl Into<Shape>) -> TensorBase<T, B>;
+    fn xavier_uniform(shape: impl Into<Shape>) -> TensorBase<T, B>;
+    fn kaiming_uniform(shape: impl Into<Shape>) -> TensorBase<T, B>;
+    fn lecun_uniform(shape: impl Into<Shape>) -> TensorBase<T, B>;
 }
 
 impl<T: WeightValue, B: Backend> RandomTensor<T, B> for TensorBase<T, B> {
-    fn uniform(shape: impl Into<Shape>) -> Result<TensorBase<T, B>, TensorError> {
+    fn uniform(shape: impl Into<Shape>) -> TensorBase<T, B> {
         let shape = shape.into();
         // random vector of size shape.size(), fill with uniform random values
         let size = shape.size();
@@ -714,19 +746,68 @@ impl<T: WeightValue, B: Backend> RandomTensor<T, B> for TensorBase<T, B> {
 
         // fill with random values
         let mut rng = rand::rng();
-        for v in &mut raw.iter_mut() {
+        for v in raw.iter_mut() {
             *v = rand::Rng::random_range(&mut rng, T::from_f32(-1.0)..T::from_f32(1.0));
         }
 
         let backend = B::new();
-        let buf = backend.alloc_from_slice(raw.into_boxed_slice())?;
+        let buf = backend.alloc_from_slice(raw.into_boxed_slice()).expect("Allocation failed");
         let stride = super::shape_to_stride(&shape);
-        Ok(TensorBase::from_parts(backend, buf, MetaTensor::new(
+        TensorBase::from_parts(backend, buf, MetaTensor::new(
             shape,
             stride,
             0
-        ), None))
+        ), None)
     }
+
+    fn xavier_uniform(shape: impl Into<Shape>) -> TensorBase<T, B> {
+        let shape = shape.into();
+        let (fan_in, fan_out) = fan_in_out(&shape);
+        let limit = (6.0f32 / (fan_in + fan_out) as f32).sqrt();
+        let v = scaled_uniform(shape.size(), limit);
+        let backend = B::new();
+        let buf = backend.alloc_from_slice(v.into_boxed_slice()).expect("Allocation failed");
+        let stride = super::shape_to_stride(&shape);
+        TensorBase::from_parts(backend, buf, MetaTensor::new(
+            shape.clone(),
+            stride,
+            0
+        ), None)
+    }
+
+    fn kaiming_uniform(shape: impl Into<Shape>) -> TensorBase<T, B> {
+        let shape = shape.into();
+        let (fan_in, _) = fan_in_out(&shape);
+        let limit = (6.0f32 / fan_in as f32).sqrt();
+
+        let v = scaled_uniform(shape.size(), limit);
+        
+        let backend = B::new();
+        let buf = backend.alloc_from_slice(v.into_boxed_slice()).expect("Allocation failed");
+        let stride = super::shape_to_stride(&shape);
+        TensorBase::from_parts(backend, buf, MetaTensor::new(
+            shape.clone(),
+            stride,
+            0
+        ), None)
+    }
+
+    fn lecun_uniform(shape: impl Into<Shape>) -> TensorBase<T, B> {
+        let shape = shape.into();
+
+        let (fan_in, _) = fan_in_out(&shape);
+        let limit = (3.0f32 / fan_in as f32).sqrt();
+        let v = scaled_uniform(shape.size(), limit);
+        let backend = B::new();
+        let buf = backend.alloc_from_slice(v.into_boxed_slice()).expect("Allocation failed");
+        let stride = super::shape_to_stride(&shape);
+        TensorBase::from_parts(backend, buf, MetaTensor::new(
+            shape.clone(),
+            stride,
+            0
+        ), None)
+    }
+
 }
 
 /// Converts a logical index (coordinate, single position, or scalar) into a

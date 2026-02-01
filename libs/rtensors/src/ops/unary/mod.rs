@@ -82,7 +82,11 @@ macro_rules! specify_unary_op_template {
                             let _ = (&$grad_node, &$input); // to remove warning if not used
 
                             let node: Result<GradNode, TensorError> = $grad_fn;
-                            $ctx.attach(&$result, node.expect("Failed to create gradient node."))
+                            if let Err(e) = &node {
+                                eprintln!("Warning: Failed to create gradient node for unary op {}: {}", stringify!($op), e);
+                            } else {
+                                $ctx.attach(&$result, node.expect("Failed to create gradient node."))
+                            }
                         });
                     }
                 }

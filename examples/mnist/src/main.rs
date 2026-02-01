@@ -20,8 +20,7 @@ impl<B: BackendMatMul<f32>> DenseModel<f32, B> {
         for i in 0..num_layers {
             let in_size = if i == 0 { input_size } else { hidden_size };
             let out_size = if i == num_layers - 1 { output_size } else { hidden_size };
-            let weight = TensorBase::<f32, B>::uniform((in_size, out_size))
-                .expect("Failed to create uniform tensor");
+            let weight = TensorBase::<f32, B>::xavier_uniform((in_size, out_size));
             let bias = TensorBase::<f32, B>::zeros((1, out_size));
             layers.push(Layer { weight, bias });
         }
