@@ -272,6 +272,11 @@ impl GradContext {
         inner: &impl OpTensor,
         op: GradNode,
     ) {
+        let parents = op.parents();
+        // if all of them are None, or the sentinal, we do not need to track this node
+        if parents.len() > 0 && parents.iter().all(|p| p.is_none() || *p == Some(self.none_node)) {
+            return;
+        }
         let node_id = self.nodes.borrow_mut().insert(op);
         inner.set_op(node_id);
     }
@@ -940,8 +945,7 @@ mod tests {
                 for i in 0..num_layers {
                     let in_size = if i == 0 { input_size } else { hidden_size };
                     let out_size = if i == num_layers - 1 { output_size } else { hidden_size };
-                    let weight = Tensor::<f32>::uniform((in_size, out_size))
-                        .expect("Failed to create uniform tensor");
+                    let weight = Tensor::<f32>::xavier_uniform((in_size, out_size));
                     let bias = Tensor::<f32>::zeros((1, out_size));
                     layers.push(Layer { weight, bias });
                 }
@@ -970,16 +974,16 @@ mod tests {
             let mut model = DenseModel::new(5, 10, 2, 10);
 
             let input = Tensor::<f32>::ones((1, 5));
-            let target = Tensor::<f32>::uniform((1, 2)).unwrap();
+            let target = Tensor::<f32>::xavier_uniform((1, 2));
             
-            let mut optim = SGD::<f32, Cpu>::new(0.1);
+            let mut optim = SGD::<f32, Cpu>::new(0.2);
             model.register(&mut optim);
             
             let initial_loss = {
                 let output = model.forward(input.clone());
                 mean_l1_loss(&output, &target).item().unwrap()
             };
-            for _ in 0..100 {
+            for _ in 0..10 {
                 let output = model.forward(input.clone());
                 let loss = mean_l1_loss(&output, &target);
                 println!("Loss: {:?}", loss.item());
