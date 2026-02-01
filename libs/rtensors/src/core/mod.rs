@@ -15,8 +15,6 @@ pub use slice::Slice;
 
 #[cfg(test)]
 mod tests {
-    use rand::rand_core::le;
-
     use crate::{backend::Backend, coord, core::{idx::Idx, tensor::{AsTensor, AsView, AsViewMut, TensorAccess, TensorAccessMut, TensorError}, value::TensorValue, MetaTensor, MetaTensorView, Shape, Slice, Strides, Tensor}, get, ops::linalg::PaddingType};
 
     fn make_tensor<T: TensorValue>(buf: Vec<T>, shape: impl Into<Shape>) -> Tensor<T> {

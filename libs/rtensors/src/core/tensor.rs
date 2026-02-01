@@ -112,11 +112,12 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for TensorBase<T, B> {
             self.meta.clone(),
             None
         );
-        v.op = self.op.clone();
+        v.op = self.op.clone(); // keeps the same operation node
         v
     }
     
     /// Logical reinterpretation of a contiguous memory layout.
+    #[grad::incomplete]
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
         view_as_inner(self, shape.into())
     }
@@ -133,7 +134,8 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for &TensorBase<T, B> {
         v.op = self.op.clone();
         v
     }
-    
+
+    #[grad::incomplete]
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
         view_as_inner(self, shape.into())
     }
@@ -150,7 +152,8 @@ impl<T: TensorValue, B: Backend> AsViewMut<T, B> for TensorBase<T, B> {
         v.op = self.op.clone();
         v
     }
-    
+
+    #[grad::incomplete]
     fn view_as_mut(&'_ mut self, shape: impl Into<Shape>) -> Result<TensorViewMut<'_, T, B>, TensorError> {
         view_as_mut_inner(self, shape.into())
     }
@@ -168,7 +171,8 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for TensorView<'_, T, B>
         v.op = self.op.clone();
         v
     }
-    
+
+    #[grad::incomplete]
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
         view_as_inner(self, shape.into())
     }
@@ -187,7 +191,8 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for TensorViewMut<'_, T, B>
         v.op = self.op.clone();
         v
     }
-    
+
+    #[grad::incomplete]
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
         view_as_inner(self, shape.into())
     }
@@ -205,7 +210,8 @@ impl<T: TensorValue, B: Backend> AsViewMut<T, B> for TensorViewMut<'_, T, B>
         v.op = self.op.clone();
         v
     }
-    
+
+    #[grad::incomplete]
     fn view_as_mut(&'_ mut self, shape: impl Into<Shape>) -> Result<TensorViewMut<'_, T, B>, TensorError> {
         view_as_mut_inner(self, shape.into())
     }
@@ -225,7 +231,8 @@ impl <T: TensorValue, B: Backend> AsTensor<T, B> for TensorBase<T, B> {
             view_to_contiguous(&self.meta, &self.buf, &self.backend, self.op()).unwrap()
         }
     }
-    
+
+    #[grad::incomplete]
     fn pad(&self, padding: impl Into<Shape>, padding_type: &PaddingType) -> Result<TensorBase<T, B>, TensorError> {
         pad_inner(
             self,
@@ -233,7 +240,8 @@ impl <T: TensorValue, B: Backend> AsTensor<T, B> for TensorBase<T, B> {
             padding_type
         )
     }
-    
+
+    #[grad::incomplete]
     fn reshape(&self, shape: impl Into<Shape>) -> Result<TensorBase<T, B>, TensorError> {
         let mut contiguous = self.contiguous();
         let contig_view = contiguous.view_as(shape)?;
@@ -250,7 +258,8 @@ impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorView<'a, T, B> {
     fn contiguous(&self) -> TensorBase<T, B> {
         self.owned()
     }
-    
+
+    #[grad::incomplete]
     fn pad(&self, padding: impl Into<Shape>, padding_type: &PaddingType) -> Result<TensorBase<T, B>, TensorError> {
         pad_inner(
             self,
@@ -258,7 +267,8 @@ impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorView<'a, T, B> {
             padding_type
         )
     }
-    
+
+    #[grad::incomplete]
     fn reshape(&self, shape: impl Into<Shape>) -> Result<TensorBase<T, B>, TensorError> {
         let mut contiguous = self.contiguous();
         let contig_view = contiguous.view_as(shape)?;
@@ -275,7 +285,8 @@ impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorViewMut<'a, T, B> 
     fn contiguous(&self) -> TensorBase<T, B> {
         self.owned()
     }
-    
+
+    #[grad::incomplete]
     fn pad(&self, padding: impl Into<Shape>, padding_type: &PaddingType) -> Result<TensorBase<T, B>, TensorError> {
         pad_inner(
             self,
@@ -283,7 +294,8 @@ impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorViewMut<'a, T, B> 
             padding_type
         )
     }
-    
+
+    #[grad::incomplete]
     fn reshape(&self, shape: impl Into<Shape>) -> Result<TensorBase<T, B>, TensorError> {
         let mut contiguous = self.contiguous();
         let contig_view = contiguous.view_as(shape)?;
@@ -364,6 +376,7 @@ fn view_as_mut_inner<T: TensorValue, B: Backend>(
 }
 
 #[inline]
+// TODO optimize padding operation
 fn pad_inner<T: TensorValue, B: Backend>(
     tensor: &impl AsView<T, B>,
     padding: impl Into<Shape>,
@@ -390,24 +403,6 @@ fn pad_inner<T: TensorValue, B: Backend>(
         let output_offset = output_tensor.meta.idx_to_offset(&output_coord);
         tensor.backend.copy_range_within(&mut output_tensor.buf, tensor.buf, output_offset, input_offset, 1)?;
     }
-
-    // // we need to copy each contiguous region from input to output at the correct offset
-    // for region in tensor.meta.iter_contiguous_ranges() {
-    //     let len = region.end - region.start;
-
-    //     let coordinate_start: Vec<usize> = tensor.meta.offset_to_idx(region.start).into();
-    //     let out_coordinate_start = coordinate_start
-    //         .iter()
-    //         .zip(padding.iter())
-    //         .map(|(coord, pad)| coord + pad)
-    //         .collect::<Vec<Dim>>();
-    //     let out_offset = output_tensor.meta.idx_to_offset(&out_coordinate_start);
-    //     debug_assert!(
-    //         tensor.meta.idx_to_offset(&tensor.meta.offset_to_idx(region.start)) == region.start
-    //     );
-    //     println!("Copying region {:?} to output offset {}", region, out_offset);
-    //     tensor.backend.copy_range_within(&mut output_tensor.buf, &tensor.buf, out_offset, region.start, len)?;
-    // }
 
     Ok(output_tensor)   
 }
@@ -533,6 +528,7 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
     /// Errors
     /// - `InvalidDim` if `dim` is out of range.
     /// - `IdxOutOfBounds` if `idx` exceeds the size of `dim`.
+    #[grad::incomplete]
     fn slice<S: Into<Slice>>(&self, dim: Dim, idx: S) -> Result<TensorView<'_, T, B>, TensorError> where Self: Sized {
         let view = self.view();
         let (new_shape, new_stride, offset) = compute_sliced_parameters(
@@ -551,7 +547,7 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
         );
         Ok(v)
     }
-    
+
     fn permute(&self, dims: impl Into<Idx>) -> Result<TensorView<'_, T, B>, TensorError> {
         let dims = dims.into();
         let input_op = self.view().op();
@@ -566,7 +562,6 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
         view.meta.strides = new_stride;
         
         attach_permute_grad::<T, B>(&view, input_op, &dims);
-
         Ok(view)
     }
     
@@ -577,6 +572,7 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
         unsafe { self.permute(dims).unwrap_unchecked() }
     }
 
+    #[grad::incomplete]
     fn unsqueeze_at(&self, dim: Dim) -> Result<TensorView<'_, T, B>, TensorError> {
         let view = self.view();
         let (new_shape, new_strides) = compute_unsqueezed_parameters(
@@ -595,6 +591,7 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
     }
     
     /// removes dimension at given dim, if its size is 1
+    #[grad::incomplete]
     fn squeeze_at(&self, dim: Dim) -> Result<TensorView<'_, T, B>, TensorError> {
         let mut view = self.view();
         let (new_shape, new_stride) = compute_squeezed_parameters(view.shape(), view.strides(), Some(dim))?;
@@ -602,7 +599,8 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
         view.meta.strides = new_stride;
         Ok(view)
     }
-    
+
+    #[grad::incomplete]
     fn squeeze(&self) -> TensorView<'_, T, B> {
         let mut res = self.view();
         let (new_shape, new_strides) = unsafe { compute_squeezed_parameters(res.shape(), res.strides(), None).unwrap_unchecked() };
@@ -623,6 +621,7 @@ where V: AsViewMut<T, B> + seal::Sealed
     /// Errors
     /// - `InvalidDim` if `dim` is out of range.
     /// - `IdxOutOfBounds` if `idx` exceeds the size of `dim`.
+    #[grad::incomplete]
     fn slice_mut<S: Into<Slice>>(&mut self, dim: Dim, idx: S) -> Result<TensorViewMut<'_, T, B>, TensorError> {
         let view = self.view_mut();
         let (new_shape, new_stride, offset) =
@@ -636,6 +635,7 @@ where V: AsViewMut<T, B> + seal::Sealed
         ))// TODO this should be a special slice op
     }
     
+    #[grad::incomplete]
     fn set<I: Into<Idx>>(&mut self, idx: I, value: T) -> Result<(), TensorError> {
         let view = self.view_mut();
         let idx = idx.into();
@@ -667,6 +667,7 @@ where V: AsViewMut<T, B> + seal::Sealed
         unsafe { self.permute_mut(dims).unwrap_unchecked() }
     }
 
+    #[grad::incomplete]
     fn unsqueeze_at_mut(&mut self, dim: Dim) -> Result<TensorViewMut<'_, T, B>, TensorError> {
         let mut view = self.view_mut();
         let (new_shape, new_strides) = compute_unsqueezed_parameters(
@@ -679,7 +680,8 @@ where V: AsViewMut<T, B> + seal::Sealed
         view.meta.strides = new_strides;
         Ok(view)
     }
-    
+
+    #[grad::incomplete]
     fn squeeze_at_mut(&mut self, dim: Dim) -> Result<TensorViewMut<'_, T, B>, TensorError> {
         let mut view = self.view_mut();
         let (new_shape, new_stride) = compute_squeezed_parameters(view.shape(), view.strides(), Some(dim))?;
@@ -687,7 +689,8 @@ where V: AsViewMut<T, B> + seal::Sealed
         view.meta.strides = new_stride;
         Ok(view)
     }
-    
+
+    #[grad::incomplete]
     fn squeeze_mut(&mut self) -> TensorViewMut<'_, T, B> {
         let mut res = self.view_mut();
         let (new_shape, new_strides) = unsafe { compute_squeezed_parameters(res.shape(), res.strides(), None).unwrap_unchecked() };

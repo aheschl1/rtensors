@@ -140,6 +140,7 @@ fn main () {
         let mut nsamples = 0;
         let virtual_batch = 32;
         let epochs = 100;
+        let mut viz = true;
         for _epoch in 0..epochs {
             let iterator = MnistIter::new(&train_dset);
             let mut total_loss = 0.0;
@@ -151,6 +152,13 @@ fn main () {
     
                 let out = model.forward(input.clone());
                 let loss = mean_l1_loss(&out, &target);
+                if viz {
+                    let vis = ctx.graphviz(&loss).unwrap();
+                    viz = false;
+                    // save dot string to file
+                    std::fs::write("mnist_loss_graph.dot", vis).expect("Failed to write graph");
+                }
+
                 total_loss += loss.item().expect("Failed to get loss item");
                 loss_samples += 1;
                 ctx.backwards::<f32, Cuda>(&loss).expect("Backwards failed");

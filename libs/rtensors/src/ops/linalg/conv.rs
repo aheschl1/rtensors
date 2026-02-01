@@ -1,4 +1,4 @@
-use crate::{backend::{BackendMatMul}, core::{primitives::TensorBase, shape_to_stride, tensor::{AsTensor, AsView, AsViewMut, TensorAccess, TensorAccessMut}, value::WeightValue, MetaTensor, MetaTensorView, Shape, TensorView, TensorViewMut}, ops::linalg::{Conv, MatMul}};
+use crate::{backend::BackendMatMul, core::{MetaTensor, MetaTensorView, Shape, TensorView, TensorViewMut, primitives::TensorBase, shape_to_stride, tensor::{AsTensor, AsView, AsViewMut, TensorAccess, TensorAccessMut}, value::WeightValue}, grad, ops::linalg::{Conv, MatMul}};
 
 #[derive(Clone, Copy, Debug)]
 pub enum PaddingType {
@@ -158,6 +158,7 @@ where
 {
     type Output = TensorBase<T, B>;
 
+    #[grad::incomplete]
     fn conv2d(&self, kernel: &K, config: &ConvConfig2D) -> Result<Self::Output, crate::core::tensor::TensorError> {
         let kernel_view = kernel.view();
         let mut self_view = self.view();
@@ -234,7 +235,8 @@ where
         )?;
         Ok(out_tensor)
     }
-    
+
+    #[grad::incomplete]
     fn conv3d(&self, kernel: &K, config: &ConvConfig3D) -> Result<Self::Output, crate::core::tensor::TensorError> {
         let kernel_view = kernel.view();
         let mut self_view = self.view();
