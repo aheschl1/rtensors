@@ -1,6 +1,6 @@
 use std::{ops::{Div, DivAssign}};
 
-use crate::{backend::Backend, core::{TensorView, TensorViewMut, primitives::{NodeOp, OpTensor, TensorBase}, tensor::AsTensor, value::{TensorValue, WeightValue}}, grad::{self, GradNode, NodeKey}};
+use crate::{backend::Backend, core::{TensorView, TensorViewMut, primitives::{OpTensor, TensorBase}, tensor::AsTensor, value::TensorValue}, grad::{self, GradNode}};
 
 #[inline]
 fn attach_div_grad<T, B>(

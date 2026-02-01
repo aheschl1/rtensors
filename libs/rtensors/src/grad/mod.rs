@@ -1,6 +1,6 @@
 use slotmap::{new_key_type, SecondaryMap};
 
-use crate::{backend::{Backend, BackendMatMul, cpu::Cpu}, core::{MetaTensorView, Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, untyped::UntypedTensor, value::{TensorValue, Value, WeightValue}}, grad};
+use crate::{backend::{Backend, BackendMatMul}, core::{Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, untyped::UntypedTensor, value::{Value, WeightValue}}, grad};
 use std::{cell::RefCell};
 use std::collections::HashMap;
 
@@ -11,6 +11,7 @@ pub mod optim;
 pub use proc::when_enabled;
 pub use proc::if_enabled;
 pub use proc::no_grad;
+pub use proc::incomplete;
 
 // struct NodeKey;
 
@@ -22,9 +23,11 @@ pub type MaybeNodeKey = Option<NodeKey>;
 
 /// Each variant of a node holds parents and any tensors that need to be saved for backward.
 #[derive(Debug)]
+#[derive(Default)]
 pub(crate) enum GradNode {
     // LEAF NODES
     Leaf( Grad ),
+    #[default]
     None,
     // OPS
     BroadcastAdd { 
@@ -107,17 +110,12 @@ pub(crate) enum GradNode {
     },
 }
 
-impl Default for GradNode {
-    fn default() -> Self {
-        GradNode::None
-    }
-}
 
-impl Into<String> for &GradNode {
-    fn into(self) -> String {
-        match self {
+impl From<&GradNode> for String {
+    fn from(val: &GradNode) -> Self {
+        match val {
             GradNode::Leaf(_) => "{Leaf|requires_grad=true}".to_string(),
-            GradNode::None => "{None}".to_string(),
+            GradNode::None => "{Leaf|requires_grad=false}".to_string(),
             GradNode::BroadcastAdd { .. } => "{BroadcastAdd}".to_string(),
             GradNode::BroadcastSub { .. } => "{BroadcastSub}".to_string(),
             GradNode::BroadcastMul { .. } => "{BroadcastMul}".to_string(),
@@ -331,7 +329,7 @@ impl GradContext {
     }
 
     #[grad::no_grad]
-    pub fn visualize(&self, root: &impl OpTensor) -> Result<String, TensorError> {
+    pub fn graphviz(&self, root: &impl OpTensor) -> Result<String, TensorError> {
         fn sanitize_node_id(node_key_str: &str) -> String {
             // Extract content from NodeKey(...) format
             // e.g., "NodeKey(1v1)" -> "node_1v1"
@@ -341,7 +339,7 @@ impl GradContext {
                 }
             }
             // Fallback: replace invalid characters
-            node_key_str.replace('(', "_").replace(')', "_")
+            node_key_str.replace(['(', ')'], "_")
         }
         let node_order = self.graph_toposort(root)?;
 
@@ -350,8 +348,15 @@ impl GradContext {
 
         let nodes = self.nodes.borrow();
         
-        // Create nodes
+        // Track unique None nodes for visualization
+        let mut none_counter = 0;
+        let mut none_nodes = std::collections::HashMap::new();
+        
+        // Create nodes (skip the sentinel none_node)
         for &node_key in &node_order {
+            if node_key == self.none_node {
+                continue; // Skip the sentinel node
+            }
             if let Some(node) = nodes.get(node_key) {
                 let node_id = sanitize_node_id(&format!("{:?}", node_key));
                 let node_label: String = node.into();
@@ -359,22 +364,30 @@ impl GradContext {
             }
         }
 
-        dot.push_str("\n");
+        dot.push('\n');
 
         // Create edges (parent -> child)
-        let none_node_id = sanitize_node_id(&format!("{:?}", self.none_node));
         for &node_key in &node_order {
             if let Some(node) = nodes.get(node_key) {
                 let child_id = sanitize_node_id(&format!("{:?}", node_key));
                 let parents = node.parents();
                 
-                for parent in parents {
+                for (parent_idx, parent) in parents.iter().enumerate() {
                     if let Some(parent_key) = parent {
                         let parent_id = sanitize_node_id(&format!("{:?}", parent_key));
                         dot.push_str(&format!("    {} -> {};\n", parent_id, child_id));
                     } else {
-                        // Visualize None parents as edges from the sentinel node
-                        dot.push_str(&format!("    {} -> {} [style=dashed color=gray];\n", none_node_id, child_id));
+                        // Create a unique None node for each None parent reference
+                        let none_key = (node_key, parent_idx);
+                        let none_id = none_nodes.entry(none_key).or_insert_with(|| {
+                            let id = format!("none_{}", none_counter);
+                            none_counter += 1;
+                            // Create the None node
+                            dot.push_str(&format!("    {} [label=\"{{Leaf|requires_grad=false}}\" style=filled fillcolor=lightgray];\n", id));
+                            id
+                        });
+                        // Visualize None parents as edges from unique None nodes
+                        dot.push_str(&format!("    {} -> {} [style=dashed color=gray];\n", none_id, child_id));
                     }
                 }
             }
@@ -458,8 +471,8 @@ impl std::fmt::Debug for GradContext {
 }
 
 thread_local! {
-    static GRAD_CONTEXT: std::cell::RefCell<Option<GradContext>> = std::cell::RefCell::new(None);
-    static GRAD_DISABLED: std::cell::RefCell<bool> = std::cell::RefCell::new(false);
+    static GRAD_CONTEXT: std::cell::RefCell<Option<GradContext>> = const { std::cell::RefCell::new(None) };
+    static GRAD_DISABLED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
 }
 
 /// Runs the provided closure with gradient tracking disabled.
@@ -484,12 +497,11 @@ pub fn with(
     }
     GRAD_CONTEXT.with(|ctx_cell| {
         let mut ctx_map = ctx_cell.borrow_mut();
-        ctx_map.get_or_insert_with(|| GradContext::new());
+        ctx_map.get_or_insert_with(GradContext::new);
         drop(ctx_map);
         let ctx = ctx_cell.borrow();
         f(ctx.as_ref().unwrap());
     });
-    return;
 }
 
 #[inline]

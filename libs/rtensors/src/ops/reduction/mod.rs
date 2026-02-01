@@ -1,4 +1,4 @@
-use crate::{backend::Backend, core::{idx::Idx, primitives::TensorBase, shape_to_stride, tensor::{AsTensor, AsView, TensorError}, value::{TensorValue, WeightValue}, MetaTensor, MetaTensorView, Shape}};
+use crate::{backend::Backend, core::{MetaTensor, MetaTensorView, Shape, idx::Idx, primitives::TensorBase, shape_to_stride, tensor::{AsTensor, AsView, TensorError}, value::{TensorValue, WeightValue}}, grad};
 
 pub trait Accumulator<T: WeightValue> {
     fn initialize() -> Self;
@@ -212,6 +212,7 @@ pub trait TotalReductionOp<T: TensorValue, B: Backend>: Sized + ReductionOp<T, B
     fn std(&self, unbiased: bool) -> Result<TensorBase<T, B>, TensorError>{self.std_at(Idx::Item, unbiased)}
     fn norm(&self, norm: NormType) -> Result<TensorBase<T, B>, TensorError>{self.norm_at(Idx::Item, norm)}
     fn logsumexp(&self) -> Result<TensorBase<T, B>, TensorError>{self.logsumexp_at(Idx::Item)}
+    
     fn l1_norm(&self) -> Result<TensorBase<T, B>, TensorError> {
         self.norm_at(Idx::Item, NormType::L1)
     }
@@ -338,6 +339,7 @@ impl<T: WeightValue, B: Backend, V> ReductionOp<T, B> for V
 where
     V: AsView<T, B>,
 {
+    #[grad::incomplete]
     fn sum_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let t = self.view();
@@ -349,6 +351,7 @@ where
         }
     }
 
+    #[grad::incomplete]
     fn prod_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let t = self.view();
@@ -360,6 +363,7 @@ where
         }
     }
 
+    #[grad::incomplete]
     fn max_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let t = self.view();
@@ -371,6 +375,7 @@ where
         }
     }
 
+    #[grad::incomplete]
     fn min_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let t = self.view();
@@ -382,6 +387,7 @@ where
         }
     }
 
+    #[grad::incomplete]
     fn mean_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let t = self.view();
@@ -392,6 +398,8 @@ where
             do_reduce(ReductionOpTypes::Mean, &axes, &t)
         }
     }
+
+    #[grad::incomplete]
     fn var_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let code = ReductionOpTypes::Variance { unbiased: true };
@@ -403,6 +411,8 @@ where
             do_reduce(code, &axes, &t)
         }
     }
+
+    #[grad::incomplete]
     fn pop_var_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let code = ReductionOpTypes::Variance { unbiased: false };
@@ -414,6 +424,8 @@ where
             do_reduce(code, &axes, &t)
         }
     }
+
+    #[grad::incomplete]
     fn std_at(&self, axes: impl Into<Idx>, unbiased: bool) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let code = ReductionOpTypes::Stdev { unbiased };
@@ -425,6 +437,8 @@ where
             do_reduce(code, &axes, &t)
         }
     }
+
+    #[grad::incomplete]
     fn logsumexp_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let t = self.view();
@@ -435,6 +449,8 @@ where
             do_reduce(ReductionOpTypes::LogSumExp, &axes, &t)
         }
     }
+
+    #[grad::incomplete]
     fn norm_at(&self, axes: impl Into<Idx>, norm: NormType) -> Result<TensorBase<T, B>, TensorError> {
         let axes = axes.into();
         let code = ReductionOpTypes::Norm(norm);
@@ -446,6 +462,8 @@ where
             do_reduce(code, &axes, &t)
         }
     }
+
+    #[grad::incomplete]
     fn argmax_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<u64, B>, TensorError> {
         let axes = axes.into();
         let code = ReductionOpTypes::ArgMax;
@@ -457,6 +475,8 @@ where
             do_argmax(code, &axes, &t)
         }
     }
+
+    #[grad::incomplete]
     fn argmin_at(&self, axes: impl Into<Idx>) -> Result<TensorBase<u64, B>, TensorError> {
         let axes = axes.into();
         let code = ReductionOpTypes::ArgMin;

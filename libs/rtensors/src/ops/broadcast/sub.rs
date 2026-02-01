@@ -1,6 +1,6 @@
 use std::ops::{Sub, SubAssign};
 
-use crate::{backend::Backend, core::{MetaTensor, MetaTensorView, Shape, Strides, TensorView, TensorViewMut, primitives::{OpTensor, TensorBase}, value::{TensorValue, WeightValue}}, grad::{self, GradNode}, ops::broadcast::compute_broadcasted_params};
+use crate::{backend::Backend, core::{MetaTensor, MetaTensorView, Shape, Strides, TensorView, TensorViewMut, primitives::{OpTensor, TensorBase}, value::TensorValue}, grad::{self, GradNode}, ops::broadcast::compute_broadcasted_params};
 use crate::ops::base::BinaryOpType;
 
 /// Macro to implement SubAssign for mutable tensor types (TensorBase and TensorViewMut)

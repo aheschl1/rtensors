@@ -1,6 +1,6 @@
 use std::{ops::{Mul, MulAssign}};
 
-use crate::{backend::Backend, core::{TensorView, TensorViewMut, primitives::{OpTensor, TensorBase}, tensor::AsTensor, value::{TensorValue, WeightValue}}, grad::{self, GradNode}};
+use crate::{backend::Backend, core::{TensorView, TensorViewMut, primitives::{OpTensor, TensorBase}, tensor::AsTensor, value::TensorValue}, grad::{self, GradNode}};
 
 
 #[inline]

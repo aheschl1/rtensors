@@ -10,13 +10,13 @@ pub fn no_grad(_attr: TokenStream, item: TokenStream) -> TokenStream {
     match item {
         Item::Fn(mut func_block) => {
             let original_block = &func_block.block;
-            func_block.block = Box::new(syn::parse_quote! {
+            *func_block.block = syn::parse_quote! {
                 {
                     grad::no_grad(|| {
                         #original_block
                     })
                 }
-            });
+            };
             quote!(#func_block).into()
         },
         Item::Impl(mut impl_block) => {
@@ -49,12 +49,44 @@ pub fn when_enabled(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as GradArgs);
     let item = parse_macro_input!(item as Item);
 
+    let method_ident = syn::Ident::new("when_enabled", proc_macro2::Span::call_site());
+
     match item {
         Item::Fn(func_block) => {
-            requires_grad_func(&args, func_block, true)
+            requires_grad_func(&args, func_block, method_ident.clone(), true)
         },
         Item::Impl(impl_block) => {
-            requires_grad_impl(&args, impl_block, true)
+            requires_grad_impl(&args, impl_block, method_ident.clone(), true)
+        },
+        _ => {
+            syn::Error::new_spanned(
+                item,
+                "#[requires_grad] can only be applied to functions or impl blocks.",
+            ).to_compile_error().into()
+        }
+    }
+}
+
+/// this is the inner function of the proc macro
+pub fn without_enabled(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as GradArgs);
+    let item = parse_macro_input!(item as Item);
+
+    if args.message.is_some() {
+        return syn::Error::new_spanned(
+            item,
+            "#[without_enabled] does not support a custom message argument.",
+        ).to_compile_error().into();
+    }
+
+    let method_ident = syn::Ident::new("without_enabled", proc_macro2::Span::call_site());
+
+    match item {
+        Item::Fn(func_block) => {
+            requires_grad_func(&args, func_block, method_ident.clone(), false)
+        },
+        Item::Impl(impl_block) => {
+            requires_grad_impl(&args, impl_block, method_ident.clone(), false)
         },
         _ => {
             syn::Error::new_spanned(
@@ -78,12 +110,14 @@ pub fn if_enabled(attr: TokenStream, item: TokenStream) -> TokenStream {
         ).to_compile_error().into();
     }
 
+    let method_ident = syn::Ident::new("when_enabled", proc_macro2::Span::call_site());
+
     match item {
         Item::Fn(func_block) => {
-            requires_grad_func(&args, func_block, false)
+            requires_grad_func(&args, func_block, method_ident.clone(), false)
         },
         Item::Impl(impl_block) => {
-            requires_grad_impl(&args, impl_block, false)
+            requires_grad_impl(&args, impl_block, method_ident.clone(), false)
         },
         _ => {
             syn::Error::new_spanned(
@@ -94,20 +128,45 @@ pub fn if_enabled(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+
+// adds to the function body a clear warning that the function does
+// not support required gradients yet. Allows running, but just provides std out warning during runtime
+// this warning only occurs when grad::is_enabled() is true
+pub fn grad_incomplete(item: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(item as Item);
+
+    match item {
+        Item::Fn(mut func_block) => {
+            let original_block = &func_block.block;
+            *func_block.block = syn::parse_quote! {
+                {
+                    if std::env::var("GRAD_INCOMPLETE_WARN").unwrap_or_else(|_| "1".to_string()) != "0" && grad::is_enabled() {
+                        eprintln!("
+                            Warning: Function '{}' is marked as dangerous for grad. Graph may break.
+                            To disable this warning, set GRAD_INCOMPLETE_WARN=0 in the environment.
+                        ", stringify!(#func_block.ident));
+                    }
+                    #original_block
+                }
+            };
+            quote!(#func_block).into()
+        },
+        _ => {
+            syn::Error::new_spanned(
+                item,
+                "#[grad_incomplete] can only be applied to functions.",
+            ).to_compile_error().into()
+        }
+    }
+}
+
 fn make_wrapped_block(
     sig: &Signature,
     block: &Block,
     args: &GradArgs,
+    grad_method: Ident,
     expect: bool 
-    // has_t: bool,
-    // has_b: bool,
 ) -> syn::Result<Block> {
-    // if !has_t || !has_b {
-    //     return Err(syn::Error::new_spanned(
-    //         &sig.generics,
-    //         "#[requires_grad] functions must have generic parameters T and B.",
-    //     ));
-    // }
 
     let ctx_ident = &args.ctx;
     let default_failure = format!(
@@ -124,7 +183,7 @@ fn make_wrapped_block(
 
     Ok(syn::parse_quote! {
         {
-            grad::when_enabled::<_>(|#ctx_ident| {
+            grad::#grad_method::<_>(|#ctx_ident| {
                 #block
             })
             #expectation
@@ -136,24 +195,22 @@ fn make_wrapped_block(
 fn requires_grad_func(
     args: &GradArgs,
     mut func: syn::ItemFn,
+    grad_method: Ident,
     expect: bool 
 ) -> TokenStream {
-    // let has_t = inherited_t || generics.type_params().any(|tp| tp.ident == "T");
-    // let has_b = inherited_b || generics.type_params().any(|tp| tp.ident == "B");
-
-    match make_wrapped_block(&func.sig, &func.block, args, expect) {
+    match make_wrapped_block(&func.sig, &func.block, args, grad_method, expect) {
         Ok(new_block) => {
-            func.block = Box::new(new_block);
+            *func.block = new_block;
             quote!(#func).into()
         }
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-
 fn requires_grad_impl(
     args: &GradArgs,
     mut impl_block: syn::ItemImpl,
+    grad_method: Ident,
     expect: bool 
 ) -> TokenStream {
     
@@ -163,9 +220,8 @@ fn requires_grad_impl(
                 &method.sig,
                 &method.block,
                 args,
+                grad_method.clone(),
                 expect,
-                // has_t,
-                // has_b,
             ) {
                 Ok(new_block) => {
                     method.block = new_block;

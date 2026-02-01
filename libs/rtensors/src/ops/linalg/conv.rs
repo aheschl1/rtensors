@@ -1,4 +1,4 @@
-use crate::{backend::{BackendMatMul}, core::{primitives::TensorBase, shape_to_stride, tensor::{AsTensor, AsView, AsViewMut, TensorAccess, TensorAccessMut}, value::WeightValue, MetaTensor, MetaTensorView, Shape, TensorView, TensorViewMut}, ops::linalg::{Conv, MatMul}};
+use crate::{backend::BackendMatMul, core::{MetaTensor, MetaTensorView, Shape, TensorView, TensorViewMut, primitives::TensorBase, shape_to_stride, tensor::{AsTensor, AsView, AsViewMut, TensorAccess, TensorAccessMut}, value::WeightValue}, grad, ops::linalg::{Conv, MatMul}};
 
 #[derive(Clone, Copy, Debug)]
 pub enum PaddingType {
@@ -158,6 +158,7 @@ where
 {
     type Output = TensorBase<T, B>;
 
+    #[grad::incomplete]
     fn conv2d(&self, kernel: &K, config: &ConvConfig2D) -> Result<Self::Output, crate::core::tensor::TensorError> {
         let kernel_view = kernel.view();
         let mut self_view = self.view();
@@ -200,8 +201,8 @@ where
         }
 
         let out_shape = compute_output_convolution_shape_2d(
-            &self_view.shape(),
-            &kernel_view.shape(),
+            self_view.shape(),
+            kernel_view.shape(),
             &config.stride,
             &config.padding,
         );
@@ -234,7 +235,8 @@ where
         )?;
         Ok(out_tensor)
     }
-    
+
+    #[grad::incomplete]
     fn conv3d(&self, kernel: &K, config: &ConvConfig3D) -> Result<Self::Output, crate::core::tensor::TensorError> {
         let kernel_view = kernel.view();
         let mut self_view = self.view();
@@ -277,8 +279,8 @@ where
         }
 
         let out_shape = compute_output_convolution_shape_3d(
-            &self_view.shape(),
-            &kernel_view.shape(),
+            self_view.shape(),
+            kernel_view.shape(),
             &config.stride,
             &config.padding,
         );
@@ -372,9 +374,9 @@ fn temp_conv2d_fallback<T: WeightValue, B: BackendMatMul<T>>(
             println!("Kernel flat shape: {:?}", kernel_flat.shape());
             let dot = input_flat.dot(&kernel_flat)?;
             output.set(
-                output_coord.clone(), 
+                output_coord, 
                 dot.item()?
-            ).expect(format!("Failed to set output value at coord {:?}", output_coord).as_str());
+            ).unwrap_or_else(|_| panic!("Failed to set output value at coord {:?}", output_coord));
         }
     }
 
@@ -448,9 +450,9 @@ fn temp_conv3d_fallback<T: WeightValue, B: BackendMatMul<T>>(
             let kernel_flat = kernel_oc.reshape((in_shape,))?;
             let dot = input_flat.dot(&kernel_flat)?;
             output.set(
-                output_coord.clone(), 
+                output_coord, 
                 dot.item()?
-            ).expect(format!("Failed to set output value at coord {:?}", output_coord).as_str());
+            ).unwrap_or_else(|_| panic!("Failed to set output value at coord {:?}", output_coord));
         }
     }
 

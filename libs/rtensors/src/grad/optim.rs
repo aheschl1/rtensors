@@ -1,4 +1,4 @@
-use crate::{backend::Backend, core::{primitives::{Grad, OpTensor, TensorBase}, tensor::{AsViewMut, TensorError}, value::WeightValue}, grad};
+use crate::{backend::Backend, core::{primitives::{OpTensor, TensorBase}, tensor::{AsViewMut, TensorError}, value::WeightValue}, grad};
 
 pub trait Optim<T: WeightValue, B: Backend> {
     fn step(&mut self) -> Result<(), TensorError>;

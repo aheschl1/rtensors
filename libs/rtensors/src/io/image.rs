@@ -1,4 +1,3 @@
-use std::{ops::Deref, os::linux::raw};
 
 use image::{DynamicImage, ImageBuffer, Rgb};
 

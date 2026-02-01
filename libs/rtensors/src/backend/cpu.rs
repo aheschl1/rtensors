@@ -372,7 +372,7 @@ impl Backend for Cpu {
         op: crate::ops::reduction::ReductionOpTypes
     ) -> Result<(), TensorError> {
         let (in_d, in_meta) = src;
-        let (out_d, out_meta) = dst;
+        let (out_d, _out_meta) = dst;
 
         let inner = in_meta.inner_dimensions(dim);
         let outer = in_meta.outer_dimensions(dim);
@@ -405,31 +405,31 @@ impl Backend for Cpu {
 
     fn apply_argmax_contiguous_flat<T: WeightValue>(
             &self, 
-            src: &Self::Buf<T>, 
-            dst: &mut Self::Buf<u64>, 
-            start: usize, 
-            len: usize, 
-            op: crate::ops::reduction::ReductionOpTypes
+            _src: &Self::Buf<T>, 
+            _dst: &mut Self::Buf<u64>, 
+            _start: usize, 
+            _len: usize, 
+            _op: crate::ops::reduction::ReductionOpTypes
         ) -> Result<(), TensorError> {
         todo!()
     }    
 
     fn apply_argmax_contiguous_nd<T: WeightValue>(
             &self, 
-            src: (&Self::Buf<T>, &MetaTensor), 
-            dst: (&mut Self::Buf<u64>, &MetaTensor), 
-            dim: crate::core::Dim,
-            op: crate::ops::reduction::ReductionOpTypes
+            _src: (&Self::Buf<T>, &MetaTensor), 
+            _dst: (&mut Self::Buf<u64>, &MetaTensor), 
+            _dim: crate::core::Dim,
+            _op: crate::ops::reduction::ReductionOpTypes
         ) -> Result<(), TensorError> {
         todo!()
     }
     
     fn apply_conv_2d<T: WeightValue>(
         &self, 
-        input: (&Self::Buf<T>, &MetaTensor), 
-        kernel: (&Self::Buf<T>, &MetaTensor),
-        output: &mut Self::Buf<T>,
-        config: &crate::ops::linalg::ConvConfig2D,
+        _input: (&Self::Buf<T>, &MetaTensor), 
+        _kernel: (&Self::Buf<T>, &MetaTensor),
+        _output: &mut Self::Buf<T>,
+        _config: &crate::ops::linalg::ConvConfig2D,
     ) -> Result<(), TensorError> {
         todo!()
     }
