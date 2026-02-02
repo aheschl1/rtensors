@@ -138,13 +138,15 @@ pub fn grad_incomplete(item: TokenStream) -> TokenStream {
     match item {
         Item::Fn(mut func_block) => {
             let original_block = &func_block.block;
+            let name = func_block.sig.ident.to_string();
             *func_block.block = syn::parse_quote! {
                 {
+                    // warn with fun name
                     if std::env::var("GRAD_INCOMPLETE_WARN").unwrap_or_else(|_| "1".to_string()) != "0" && grad::is_enabled() {
                         eprintln!("
                             Warning: Function '{}' is marked as dangerous for grad. Graph may break.
                             To disable this warning, set GRAD_INCOMPLETE_WARN=0 in the environment.
-                        ", stringify!(#func_block.ident));
+                        ", #name);
                     }
                     #original_block
                 }

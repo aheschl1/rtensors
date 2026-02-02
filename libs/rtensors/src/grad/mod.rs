@@ -1,6 +1,6 @@
 use slotmap::{new_key_type, SecondaryMap};
 
-use crate::{backend::{Backend, BackendMatMul}, core::{Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, untyped::UntypedTensor, value::{Value, WeightValue}}, grad};
+use crate::{backend::{Backend, BackendMatMul}, core::{Dim, Shape, Strides, idx::Idx, primitives::{Grad, OpTensor, TensorBase}, tensor::TensorError, untyped::UntypedTensor, value::{Value, WeightValue}}, grad};
 use std::{cell::RefCell};
 use std::collections::HashMap;
 
@@ -99,6 +99,18 @@ pub(crate) enum GradNode {
         input: MaybeNodeKey,
         dims: Idx
     },
+    Unsqueeze {
+        input: MaybeNodeKey,
+        dim: Dim,
+    },
+    Squeeze {
+        input: MaybeNodeKey,
+        original_shape: Shape,
+    },
+    Reshape {
+        input: MaybeNodeKey,
+        original_shape: Shape,
+    },
     // LOSSES
     L1 { 
         input: MaybeNodeKey, 
@@ -144,7 +156,11 @@ impl From<&GradNode> for String {
             GradNode::Ln1p { .. } => "{Ln1p}".to_string(),
             GradNode::MatMul { .. } => "{MatMul}".to_string(),
             GradNode::Permute { .. } => "{Permute}".to_string(),
+            GradNode::Unsqueeze { .. } => "{Unsqueeze}".to_string(),
+            GradNode::Squeeze { .. } => "{Squeeze}".to_string(),
+            GradNode::Reshape { .. } => "{Reshape}".to_string(),
             GradNode::L1 { .. } => "{L1Loss}".to_string(),
+
         }
     }
 }
@@ -191,6 +207,9 @@ impl GradNode {
             GradNode::ExpM1 { input, .. } => vec![*input],
             GradNode::Ln1p { input, .. } => vec![*input],
             GradNode::MatMul { left, right, .. } => vec![*left, *right],
+            GradNode::Unsqueeze { input, .. } => vec![*input],
+            GradNode::Squeeze { input, .. } => vec![*input],
+            GradNode::Reshape { input, .. } => vec![*input],
         }
     }
 
@@ -232,6 +251,9 @@ impl GradNode {
             GradNode::ExpM1 { .. } => backwards::backwards_expm1::<T, B>(self, upstream),
             GradNode::Ln1p { .. } => backwards::backwards_ln1p::<T, B>(self, upstream),
             GradNode::MatMul { .. } => backwards::backwards_matmul::<T, B>(self, upstream),
+            GradNode::Unsqueeze { .. } => backwards::backwards_unsqueeze::<T, B>(self, upstream),
+            GradNode::Squeeze { .. } => backwards::backwards_squeeze::<T, B>(self, upstream),
+            GradNode::Reshape { .. } => backwards::backwards_reshape::<T, B>(self, upstream),
             GradNode::None => Ok(vec![]),
             // _ => Err(TensorError::UnsupportedOperation("Backward not implemented for this node type.".into())),
         }
@@ -579,7 +601,7 @@ pub fn enabled_or_warn(
 #[cfg(test)]
 mod tests {
     use crate::{backend::{Backend, cpu::Cpu}, core::{
-        Tensor, primitives::TensorBase, tensor::{RandomTensor, TensorAccess}, value::WeightValue}, 
+        Tensor, primitives::TensorBase, tensor::{AsTensor, AsView, RandomTensor, TensorAccess}, value::WeightValue}, 
         grad::{self, optim::{Optim, SGD}}, ops::{broadcast::l1::mean_l1_loss, linalg::MatMul, scalar::ScalarOp, unary::UnaryOp}};
 
     #[test]
@@ -1303,6 +1325,263 @@ mod tests {
                 "All ops loss should reduce by at least 1.0, initial: {}, final: {}", initial_loss, final_loss);
             
             println!("Final w: {:?}", w);
+        });
+    }
+
+    #[test]
+    fn test_squeeze_unsqueeze_backwards() {
+        // Test squeeze_at backward pass
+        fn model_with_squeeze_at(
+            w: &TensorBase<f32, Cpu>,
+            input: &TensorBase<f32, Cpu>,
+            target: &TensorBase<f32, Cpu>
+        ) -> TensorBase<f32, Cpu> {
+            let x = input + w;
+            // x is [2, 1, 3], squeeze at dim 1 to get [2, 3]
+            let y = x.squeeze_at(1).unwrap();
+            mean_l1_loss(&y, target)
+        }
+
+        // Test squeeze backward pass (removes all size-1 dims)
+        fn model_with_squeeze(
+            w: &TensorBase<f32, Cpu>,
+            input: &TensorBase<f32, Cpu>,
+            target: &TensorBase<f32, Cpu>
+        ) -> TensorBase<f32, Cpu> {
+            let x = input + w;
+            // x is [1, 2, 1, 3, 1], squeeze to get [2, 3]
+            let y = x.squeeze();
+            mean_l1_loss(&y, target)
+        }
+
+        // Test unsqueeze_at backward pass
+        fn model_with_unsqueeze_at(
+            w: &TensorBase<f32, Cpu>,
+            input: &TensorBase<f32, Cpu>,
+            target: &TensorBase<f32, Cpu>
+        ) -> TensorBase<f32, Cpu> {
+            let x = input + w;
+            // x is [2, 3], unsqueeze at dim 1 to get [2, 1, 3]
+            println!("x shape: {:?}", x.op);      
+            let y = x.unsqueeze_at(1).unwrap();
+            println!("y shape: {:?}", y.op);    
+            mean_l1_loss(&y, target)
+        }
+
+        // Test combined squeeze and unsqueeze
+        fn model_combined(
+            w: &TensorBase<f32, Cpu>,
+            input: &TensorBase<f32, Cpu>,
+            target: &TensorBase<f32, Cpu>
+        ) -> TensorBase<f32, Cpu> {
+            let x = input + w;
+            // x is [2, 3], add dims then remove them
+            let y1 = x.unsqueeze_at(0).unwrap();  // [1, 2, 3]
+            let y2 = y1.unsqueeze_at(2).unwrap(); // [1, 2, 1, 3]
+            let y = y2.squeeze();                 // [2, 3]
+            mean_l1_loss(&y, target)
+        }
+
+        grad::with(|ctx| {
+            println!("\n=== Testing squeeze_at Backwards ===");
+            let mut w = Tensor::<f32>::ones((2, 1, 3));
+            let input = Tensor::<f32>::ones((2, 1, 3));
+            let target = Tensor::<f32>::zeros((2, 3));
+            
+            let mut optim = SGD::<f32, Cpu>::new(0.1);
+            optim.register_parameter(&mut w).unwrap();
+            
+            let initial_loss = model_with_squeeze_at(&w, &input, &target).item().unwrap();
+            for i in 0..10 {
+                let loss = model_with_squeeze_at(&w, &input, &target);
+                println!("Iter {}: Loss = {:?}", i, loss.item());
+                ctx.backwards::<f32, Cpu>(&loss).unwrap();
+                optim.step().unwrap();
+            }
+            let final_loss = model_with_squeeze_at(&w, &input, &target).item().unwrap();
+            assert!(initial_loss - final_loss > 0.1, 
+                "squeeze_at loss should reduce by at least 0.1, initial: {}, final: {}", initial_loss, final_loss);
+            println!("Final w after squeeze_at training: {:?}", w);
+
+            println!("\n=== Testing squeeze Backwards ===");
+            let mut w2 = Tensor::<f32>::ones((1, 2, 1, 3, 1));
+            let input2 = Tensor::<f32>::ones((1, 2, 1, 3, 1));
+            optim.register_parameter(&mut w2).unwrap();
+            
+            let initial_loss = model_with_squeeze(&w2, &input2, &target).item().unwrap();
+            for i in 0..10 {
+                let loss = model_with_squeeze(&w2, &input2, &target);
+                println!("Iter {}: Loss = {:?}", i, loss.item());
+                ctx.backwards::<f32, Cpu>(&loss).unwrap();
+                optim.step().unwrap();
+            }
+            let final_loss = model_with_squeeze(&w2, &input2, &target).item().unwrap();
+            assert!(initial_loss - final_loss > 0.1, 
+                "squeeze loss should reduce by at least 0.1, initial: {}, final: {}", initial_loss, final_loss);
+            println!("Final w2 after squeeze training: {:?}", w2);
+
+            println!("\n=== Testing unsqueeze_at Backwards ===");
+            let mut w3 = Tensor::<f32>::ones((2, 3));
+            let input3 = Tensor::<f32>::ones((2, 3));
+            let target3 = Tensor::<f32>::zeros((2, 1, 3));
+            optim.register_parameter(&mut w3).unwrap();
+            
+            let initial_loss = model_with_unsqueeze_at(&w3, &input3, &target3).item().unwrap();
+            for i in 0..10 {
+                let loss = model_with_unsqueeze_at(&w3, &input3, &target3);
+                println!("Iter {}: Loss = {:?}", i, loss.item());
+                ctx.backwards::<f32, Cpu>(&loss).unwrap();
+                optim.step().unwrap();
+            }
+            let final_loss = model_with_unsqueeze_at(&w3, &input3, &target3).item().unwrap();
+            assert!(initial_loss - final_loss > 0.1, 
+                "unsqueeze_at loss should reduce by at least 0.1, initial: {}, final: {}", initial_loss, final_loss);
+            println!("Final w3 after unsqueeze_at training: {:?}", w3);
+
+            println!("\n=== Testing Combined squeeze/unsqueeze Backwards ===");
+            let mut w4 = Tensor::<f32>::ones((2, 3));
+            let input4 = Tensor::<f32>::ones((2, 3));
+            optim.register_parameter(&mut w4).unwrap();
+            
+            let initial_loss = model_combined(&w4, &input4, &target).item().unwrap();
+            for i in 0..10 {
+                let loss = model_combined(&w4, &input4, &target);
+                println!("Iter {}: Loss = {:?}", i, loss.item());
+                ctx.backwards::<f32, Cpu>(&loss).unwrap();
+                optim.step().unwrap();
+            }
+            let final_loss = model_combined(&w4, &input4, &target).item().unwrap();
+            assert!(initial_loss - final_loss > 0.1, 
+                "Combined loss should reduce by at least 0.1, initial: {}, final: {}", initial_loss, final_loss);
+            println!("Final w4: {:?}", w4);
+        });
+    }
+
+    #[test]
+    fn test_view_as_reshape_backwards() {
+        // Test view_as backward pass
+        fn model_with_view_as(
+            w: &TensorBase<f32, Cpu>,
+            input: &TensorBase<f32, Cpu>,
+            target: &TensorBase<f32, Cpu>
+        ) -> TensorBase<f32, Cpu> {
+            let x = input + w;
+            // x is [2, 3], view_as to [6] (flattened)
+            let y = x.view_as((6,)).unwrap();
+            mean_l1_loss(&y, target)
+        }
+
+        // Test reshape backward pass
+        fn model_with_reshape(
+            w: &TensorBase<f32, Cpu>,
+            input: &TensorBase<f32, Cpu>,
+            target: &TensorBase<f32, Cpu>
+        ) -> TensorBase<f32, Cpu> {
+            let x = input + w;
+            // x is [2, 3], reshape to [3, 2]
+            let y = x.reshape((3, 2)).unwrap();
+            mean_l1_loss(&y, target)
+        }
+
+        // Test view_as with multi-dimensional reshape
+        fn model_with_view_as_multidim(
+            w: &TensorBase<f32, Cpu>,
+            input: &TensorBase<f32, Cpu>,
+            target: &TensorBase<f32, Cpu>
+        ) -> TensorBase<f32, Cpu> {
+            let x = input + w;
+            // x is [2, 4], view_as to [1, 8] 
+            let y = x.view_as((1, 8)).unwrap();
+            mean_l1_loss(&y, target)
+        }
+
+        // Test chained view_as and reshape
+        fn model_combined_views(
+            w: &TensorBase<f32, Cpu>,
+            input: &TensorBase<f32, Cpu>,
+            target: &TensorBase<f32, Cpu>
+        ) -> TensorBase<f32, Cpu> {
+            let x = input + w;
+            // x is [2, 6], view_as to [12], then reshape to [3, 4]
+            let y1 = x.view_as((12,)).unwrap();
+            let y2 = y1.reshape((3, 4)).unwrap();
+            mean_l1_loss(&y2, target)
+        }
+
+        grad::with(|ctx| {
+            println!("\n=== Testing view_as Backwards ===");
+            let mut w = Tensor::<f32>::ones((2, 3));
+            let input = Tensor::<f32>::ones((2, 3));
+            let target = Tensor::<f32>::zeros((6,));
+            
+            let mut optim = SGD::<f32, Cpu>::new(0.1);
+            optim.register_parameter(&mut w).unwrap();
+            
+            let initial_loss = model_with_view_as(&w, &input, &target).item().unwrap();
+            for i in 0..10 {
+                let loss = model_with_view_as(&w, &input, &target);
+                println!("Iter {}: Loss = {:?}", i, loss.item());
+                ctx.backwards::<f32, Cpu>(&loss).unwrap();
+                optim.step().unwrap();
+            }
+            let final_loss = model_with_view_as(&w, &input, &target).item().unwrap();
+            assert!(initial_loss - final_loss > 0.1, 
+                "view_as loss should reduce by at least 0.1, initial: {}, final: {}", initial_loss, final_loss);
+            println!("Final w after view_as training: {:?}", w);
+
+            println!("\n=== Testing reshape Backwards ===");
+            let mut w2 = Tensor::<f32>::ones((2, 3));
+            let input2 = Tensor::<f32>::ones((2, 3));
+            let target2 = Tensor::<f32>::zeros((3, 2));
+            optim.register_parameter(&mut w2).unwrap();
+            
+            let initial_loss = model_with_reshape(&w2, &input2, &target2).item().unwrap();
+            for i in 0..10 {
+                let loss = model_with_reshape(&w2, &input2, &target2);
+                println!("Iter {}: Loss = {:?}", i, loss.item());
+                ctx.backwards::<f32, Cpu>(&loss).unwrap();
+                optim.step().unwrap();
+            }
+            let final_loss = model_with_reshape(&w2, &input2, &target2).item().unwrap();
+            assert!(initial_loss - final_loss > 0.1, 
+                "reshape loss should reduce by at least 0.1, initial: {}, final: {}", initial_loss, final_loss);
+            println!("Final w2 after reshape training: {:?}", w2);
+
+            println!("\n=== Testing view_as Multi-dimensional Backwards ===");
+            let mut w3 = Tensor::<f32>::ones((2, 4));
+            let input3 = Tensor::<f32>::ones((2, 4));
+            let target3 = Tensor::<f32>::zeros((1, 8));
+            optim.register_parameter(&mut w3).unwrap();
+            
+            let initial_loss = model_with_view_as_multidim(&w3, &input3, &target3).item().unwrap();
+            for i in 0..10 {
+                let loss = model_with_view_as_multidim(&w3, &input3, &target3);
+                println!("Iter {}: Loss = {:?}", i, loss.item());
+                ctx.backwards::<f32, Cpu>(&loss).unwrap();
+                optim.step().unwrap();
+            }
+            let final_loss = model_with_view_as_multidim(&w3, &input3, &target3).item().unwrap();
+            assert!(initial_loss - final_loss > 0.1, 
+                "view_as multidim loss should reduce by at least 0.1, initial: {}, final: {}", initial_loss, final_loss);
+            println!("Final w3 after view_as multidim training: {:?}", w3);
+
+            println!("\n=== Testing Combined view_as/reshape Backwards ===");
+            let mut w4 = Tensor::<f32>::ones((2, 6));
+            let input4 = Tensor::<f32>::ones((2, 6));
+            let target4 = Tensor::<f32>::zeros((3, 4));
+            optim.register_parameter(&mut w4).unwrap();
+            
+            let initial_loss = model_combined_views(&w4, &input4, &target4).item().unwrap();
+            for i in 0..10 {
+                let loss = model_combined_views(&w4, &input4, &target4);
+                println!("Iter {}: Loss = {:?}", i, loss.item());
+                ctx.backwards::<f32, Cpu>(&loss).unwrap();
+                optim.step().unwrap();
+            }
+            let final_loss = model_combined_views(&w4, &input4, &target4).item().unwrap();
+            assert!(initial_loss - final_loss > 0.1, 
+                "Combined views loss should reduce by at least 0.1, initial: {}, final: {}", initial_loss, final_loss);
+            println!("Final w4 after combined views training: {:?}", w4);
         });
     }
 }

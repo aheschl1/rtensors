@@ -117,7 +117,6 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for TensorBase<T, B> {
     }
     
     /// Logical reinterpretation of a contiguous memory layout.
-    #[grad::incomplete]
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
         view_as_inner(self, shape.into())
     }
@@ -135,7 +134,6 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for &TensorBase<T, B> {
         v
     }
 
-    #[grad::incomplete]
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
         view_as_inner(self, shape.into())
     }
@@ -153,7 +151,6 @@ impl<T: TensorValue, B: Backend> AsViewMut<T, B> for TensorBase<T, B> {
         v
     }
 
-    #[grad::incomplete]
     fn view_as_mut(&'_ mut self, shape: impl Into<Shape>) -> Result<TensorViewMut<'_, T, B>, TensorError> {
         view_as_mut_inner(self, shape.into())
     }
@@ -172,7 +169,6 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for TensorView<'_, T, B>
         v
     }
 
-    #[grad::incomplete]
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
         view_as_inner(self, shape.into())
     }
@@ -192,7 +188,6 @@ impl<T: TensorValue, B: Backend> AsView<T, B> for TensorViewMut<'_, T, B>
         v
     }
 
-    #[grad::incomplete]
     fn view_as(&self, shape: impl Into<Shape>) -> Result<TensorView<'_, T, B>, TensorError> {
         view_as_inner(self, shape.into())
     }
@@ -211,7 +206,6 @@ impl<T: TensorValue, B: Backend> AsViewMut<T, B> for TensorViewMut<'_, T, B>
         v
     }
 
-    #[grad::incomplete]
     fn view_as_mut(&'_ mut self, shape: impl Into<Shape>) -> Result<TensorViewMut<'_, T, B>, TensorError> {
         view_as_mut_inner(self, shape.into())
     }
@@ -241,7 +235,6 @@ impl <T: TensorValue, B: Backend> AsTensor<T, B> for TensorBase<T, B> {
         )
     }
 
-    #[grad::incomplete]
     fn reshape(&self, shape: impl Into<Shape>) -> Result<TensorBase<T, B>, TensorError> {
         let mut contiguous = self.contiguous();
         let contig_view = contiguous.view_as(shape)?;
@@ -268,7 +261,6 @@ impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorView<'a, T, B> {
         )
     }
 
-    #[grad::incomplete]
     fn reshape(&self, shape: impl Into<Shape>) -> Result<TensorBase<T, B>, TensorError> {
         let mut contiguous = self.contiguous();
         let contig_view = contiguous.view_as(shape)?;
@@ -295,7 +287,6 @@ impl<'a, T: TensorValue, B: Backend> AsTensor<T, B> for TensorViewMut<'a, T, B> 
         )
     }
 
-    #[grad::incomplete]
     fn reshape(&self, shape: impl Into<Shape>) -> Result<TensorBase<T, B>, TensorError> {
         let mut contiguous = self.contiguous();
         let contig_view = contiguous.view_as(shape)?;
@@ -346,6 +337,15 @@ fn view_as_inner<T: TensorValue, B: Backend>(
     if shape.size() != tensor.meta.size() {
         return Err(TensorError::InvalidShape(format!("Invalid size {} for initial shape {}", shape.size(), tensor.meta.size())));
     }
+
+    grad::when_enabled(|ctx| {
+        let node = GradNode::Reshape {
+            input: tensor.op(),
+            original_shape: tensor.shape().clone(),
+        };
+        ctx.attach(&tensor, node);
+    });
+
     // correct element count, one subspace.
     // so, we can just create new meta
     let new_stride = super::shape_to_stride(&shape);
@@ -367,6 +367,13 @@ fn view_as_mut_inner<T: TensorValue, B: Backend>(
     if shape.size() != tensor.meta.size() {
         return Err(TensorError::InvalidShape(format!("Invalid size {} for initial shape {}", shape.size(), tensor.meta.size())));
     }
+    grad::when_enabled(|ctx| {
+        let node = GradNode::Reshape {
+            input: tensor.op(),
+            original_shape: tensor.shape().clone(),
+        };
+        ctx.attach(&tensor, node);
+    });
     // correct element count, one subspace.
     // so, we can just create new meta
     let new_stride = super::shape_to_stride(&shape);
@@ -572,7 +579,6 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
         unsafe { self.permute(dims).unwrap_unchecked() }
     }
 
-    #[grad::incomplete]
     fn unsqueeze_at(&self, dim: Dim) -> Result<TensorView<'_, T, B>, TensorError> {
         let view = self.view();
         let (new_shape, new_strides) = compute_unsqueezed_parameters(
@@ -585,27 +591,30 @@ where B: Backend, V: AsView<T, B> + seal::Sealed
             view.buf, 
             view.backend, 
             MetaTensor::new(new_shape, new_strides, view.meta.offset()),
-            view.op() // TODO this should be a special unsqueeze op
+            view.op()
         );
+        attach_unsqueeze_grad(&res, dim);
         Ok(res)
     }
     
     /// removes dimension at given dim, if its size is 1
-    #[grad::incomplete]
     fn squeeze_at(&self, dim: Dim) -> Result<TensorView<'_, T, B>, TensorError> {
         let mut view = self.view();
+        let original_shape = view.shape().clone();
         let (new_shape, new_stride) = compute_squeezed_parameters(view.shape(), view.strides(), Some(dim))?;
         view.meta.shape = new_shape;
         view.meta.strides = new_stride;
+        attach_squeeze_grad(&view, original_shape);
         Ok(view)
     }
 
-    #[grad::incomplete]
     fn squeeze(&self) -> TensorView<'_, T, B> {
         let mut res = self.view();
+        let original_shape = res.shape().clone();
         let (new_shape, new_strides) = unsafe { compute_squeezed_parameters(res.shape(), res.strides(), None).unwrap_unchecked() };
         res.meta.shape = new_shape;
         res.meta.strides = new_strides;
+        attach_squeeze_grad(&res, original_shape);
         res
     }
 
@@ -635,9 +644,19 @@ where V: AsViewMut<T, B> + seal::Sealed
         ))// TODO this should be a special slice op
     }
     
-    #[grad::incomplete]
     fn set<I: Into<Idx>>(&mut self, idx: I, value: T) -> Result<(), TensorError> {
         let view = self.view_mut();
+        grad::when_enabled(|ctx| {
+            if let Some(k) = view.op() {
+                let nodes = ctx.nodes.borrow();
+                let op = nodes.get(k);
+                if let Some(op) = op {
+                    if let GradNode::Leaf(_) = op {
+                        panic!("Cannot set value of a leaf tensor that requires grad");
+                    }
+                }
+            }
+        });
         let idx = idx.into();
         let buf_idx = logical_to_buffer_idx(&idx, view.meta.strides(), view.meta.offset())?;
         view.backend.write(view.buf, buf_idx, value)
@@ -667,7 +686,6 @@ where V: AsViewMut<T, B> + seal::Sealed
         unsafe { self.permute_mut(dims).unwrap_unchecked() }
     }
 
-    #[grad::incomplete]
     fn unsqueeze_at_mut(&mut self, dim: Dim) -> Result<TensorViewMut<'_, T, B>, TensorError> {
         let mut view = self.view_mut();
         let (new_shape, new_strides) = compute_unsqueezed_parameters(
@@ -678,24 +696,27 @@ where V: AsViewMut<T, B> + seal::Sealed
 
         view.meta.shape = new_shape;
         view.meta.strides = new_strides;
+        attach_unsqueeze_grad(&view, dim);
         Ok(view)
     }
 
-    #[grad::incomplete]
     fn squeeze_at_mut(&mut self, dim: Dim) -> Result<TensorViewMut<'_, T, B>, TensorError> {
         let mut view = self.view_mut();
+        let original_shape = view.shape().clone();
         let (new_shape, new_stride) = compute_squeezed_parameters(view.shape(), view.strides(), Some(dim))?;
         view.meta.shape = new_shape;
         view.meta.strides = new_stride;
+        attach_squeeze_grad(&view, original_shape);
         Ok(view)
     }
 
-    #[grad::incomplete]
     fn squeeze_mut(&mut self) -> TensorViewMut<'_, T, B> {
         let mut res = self.view_mut();
+        let original_shape = res.shape().clone();
         let (new_shape, new_strides) = unsafe { compute_squeezed_parameters(res.shape(), res.strides(), None).unwrap_unchecked() };
         res.meta.shape = new_shape;
         res.meta.strides = new_strides;
+        attach_squeeze_grad(&res, original_shape);
         res
     }
 
@@ -892,6 +913,35 @@ fn compute_permuted_parameters(shape: &Shape, stride: &Strides, dims: &Idx) -> R
     }
 
     Ok((new_shape.into(), new_stride.into()))
+}
+
+
+#[inline]
+#[grad::if_enabled(ctx)]
+fn attach_unsqueeze_grad(
+    result: &impl OpTensor,
+    dim: Dim,
+) -> Option<()>{
+    let input_op = result.op();
+    let op = GradNode::Unsqueeze {
+        input: input_op,
+        dim,
+    };
+    ctx.attach(result, op);
+}
+
+#[inline]
+#[grad::if_enabled(ctx)]
+fn attach_squeeze_grad(
+    result: &impl OpTensor,
+    original_shape: Shape,
+) -> Option<()>{
+    let input_op = result.op();
+    let op = GradNode::Squeeze {
+        input: input_op,
+        original_shape,
+    };
+    ctx.attach(result, op);
 }
 
 #[inline]

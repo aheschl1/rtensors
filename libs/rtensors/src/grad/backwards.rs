@@ -1,4 +1,4 @@
-use crate::{backend::{Backend, BackendMatMul}, core::{Shape, Strides, idx::Idx, primitives::TensorBase, tensor::{TensorAccess, TensorError}, untyped::AsUntypedTensor, value::WeightValue}, grad::GradNode, ops::{reduction::ReductionOp, unary::UnaryOp}};
+use crate::{backend::{Backend, BackendMatMul}, core::{Shape, Strides, idx::Idx, primitives::TensorBase, tensor::{AsTensor, TensorAccess, TensorError}, untyped::AsUntypedTensor, value::WeightValue}, grad::GradNode, ops::{reduction::ReductionOp, unary::UnaryOp}};
 use crate::ops::linalg::MatMul;
 
 const MIXED_TYPE_ERROR: &str = "Mixed datatyped training is not supported.";
@@ -182,6 +182,46 @@ pub fn backwards_permute<T: WeightValue, B: Backend>(
     let permuted_grad = upstream.permute(inverse_dims)?;
     let mut grad = upstream.clone();
     grad.meta = permuted_grad.meta;
+    Ok(vec![grad])
+}
+
+#[inline]
+pub fn backwards_unsqueeze<T: WeightValue, B: Backend>(
+    node: &GradNode, 
+    upstream: &TensorBase<T, B>,
+) -> Result<Vec<TensorBase<T, B>>, TensorError>{
+    let GradNode::Unsqueeze { dim, .. } = node else {
+        return Err(TensorError::UnsupportedOperation("Invalid node type passed to Unsqueeze backwards.".into()));
+    };
+    let squeezed_view = upstream.squeeze_at(*dim)?;
+    let grad = squeezed_view.owned();
+    Ok(vec![grad])
+}
+
+#[inline]
+pub fn backwards_squeeze<T: WeightValue, B: Backend>(
+    node: &GradNode, 
+    upstream: &TensorBase<T, B>,
+) -> Result<Vec<TensorBase<T, B>>, TensorError>{
+    let GradNode::Squeeze { original_shape, .. } = node else {
+        return Err(TensorError::UnsupportedOperation("Invalid node type passed to Squeeze backwards.".into()));
+    };
+    // To reverse squeeze, we need to unsqueeze at all dimensions that were removed
+    // We can reshape to the original shape
+    let grad = upstream.reshape(original_shape.clone())?;
+    Ok(vec![grad])
+}
+
+#[inline]
+pub fn backwards_reshape<T: WeightValue, B: Backend>(
+    node: &GradNode, 
+    upstream: &TensorBase<T, B>,
+) -> Result<Vec<TensorBase<T, B>>, TensorError>{
+    let GradNode::Reshape { original_shape, .. } = node else {
+        return Err(TensorError::UnsupportedOperation("Invalid node type passed to Reshape backwards.".into()));
+    };
+    // To reverse reshape, we need to reshape back to the original shape
+    let grad = upstream.reshape(original_shape)?;
     Ok(vec![grad])
 }
 
