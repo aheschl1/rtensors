@@ -607,7 +607,7 @@ fn format_tensor_data<T: TensorValue, B: Backend>(
         Ok(d) => d,
         Err(_) => {
             // If dump fails, fall back to showing metadata only
-            return write!(f, "Tensor<{:?}>({:?})", std::any::type_name::<T>(), meta.shape());
+            return write!(f, "Tensor<{}>({:?})", std::any::type_name::<T>(), meta.shape());
         }
     };
 
