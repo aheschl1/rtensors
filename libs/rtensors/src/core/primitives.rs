@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 #[cfg(feature = "remote")]
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
@@ -34,7 +34,6 @@ pub type NodeOp = Arc<RwLock<Option<NodeKey>>>;
 /// 
 /// This is the base type for all tensors, parameterized by element type `T` and backend `B`.
 /// Most users will use type aliases like `Tensor<T>` (CPU) or `CudaTensor<T>` (GPU).
-#[derive(Debug)]
 pub struct TensorBase<T: TensorValue, B: Backend> {
     pub(crate) backend: B,
     pub(crate) buf: B::Buf<T>,
@@ -536,5 +535,111 @@ pub enum DeviceType {
         ip: IpAddr,
         port: u16,
         remote_type: Box<DeviceType>
+    }
+}
+
+/// Helper function to format tensor data recursively by dimension.
+/// This creates a PyTorch-like output format.
+fn format_tensor_recursive<T: TensorValue>(
+    data: &[T],
+    shape: &[usize],
+    strides: &[isize],
+    offset: usize,
+    indent: usize,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    if shape.is_empty() {
+        // Scalar (0-dimensional tensor)
+        write!(f, "{:?}", data[offset])?;
+        return Ok(());
+    }
+
+    if shape.len() == 1 {
+        // 1D tensor: [a, b, c, ...]
+        write!(f, "[")?;
+        for i in 0..shape[0] {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            let idx = offset + (i as isize * strides[0]) as usize;
+            write!(f, "{:?}", data[idx])?;
+        }
+        write!(f, "]")?;
+        return Ok(());
+    }
+
+    // Multi-dimensional tensor
+    write!(f, "[")?;
+    for i in 0..shape[0] {
+        if i > 0 {
+            // Add newline and indentation for subsequent elements
+            write!(f, ",\n{}", " ".repeat(indent + 1))?;
+            
+            // Add extra newline between outer dimension elements for 3D+ tensors
+            if shape.len() >= 3 {
+                write!(f, "\n{}", " ".repeat(indent + 1))?;
+            }
+        }
+        
+        let new_offset = offset + (i as isize * strides[0]) as usize;
+        format_tensor_recursive(
+            data,
+            &shape[1..],
+            &strides[1..],
+            new_offset,
+            indent + 1,
+            f,
+        )?;
+    }
+    write!(f, "]")?;
+    Ok(())
+}
+
+/// Format tensor for Debug output in PyTorch style
+fn format_tensor_data<T: TensorValue, B: Backend>(
+    backend: &B,
+    buf: &B::Buf<T>,
+    meta: &MetaTensor,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    // Dump data from backend (handles both CPU and CUDA)
+    let data = match backend.dump(buf) {
+        Ok(d) => d,
+        Err(_) => {
+            // If dump fails, fall back to showing metadata only
+            return write!(f, "Tensor<{:?}>({:?})", std::any::type_name::<T>(), meta.shape());
+        }
+    };
+
+    write!(f, "tensor(")?;
+    
+    format_tensor_recursive(
+        &data,
+        meta.shape().as_slice(),
+        meta.strides().as_slice(),
+        meta.offset(),
+        6, // indent for "tensor("
+        f,
+    )?;
+    
+    write!(f, ")")?;
+    Ok(())
+}
+
+impl<T: TensorValue, B: Backend> Debug for TensorBase<T, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        format_tensor_data(&self.backend, &self.buf, &self.meta, f)
+    }
+}
+
+impl<'a, T: TensorValue, B: Backend> Debug for TensorView<'a, T, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        format_tensor_data(self.backend, self.buf, &self.meta, f)
+    }
+}
+
+impl<'a, T: TensorValue, B: Backend> Debug for TensorViewMut<'a, T, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        format_tensor_data(self.backend, self.buf, &self.meta, f)
     }
 }

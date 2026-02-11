@@ -8,6 +8,9 @@ pub mod slice;
 pub mod untyped;
 pub mod primops;
 
+#[cfg(test)]
+mod print_tests;
+
 pub use meta::{Dim, Shape, Strides, MetaTensor, MetaTensorView, shape_to_stride};
 pub use primitives::{Tensor, TensorView, CpuTensorView, TensorViewMut};
 pub use slice::Slice;
