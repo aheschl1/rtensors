@@ -34,7 +34,6 @@ pub type NodeOp = Arc<RwLock<Option<NodeKey>>>;
 /// 
 /// This is the base type for all tensors, parameterized by element type `T` and backend `B`.
 /// Most users will use type aliases like `Tensor<T>` (CPU) or `CudaTensor<T>` (GPU).
-#[derive(Debug)]
 pub struct TensorBase<T: TensorValue, B: Backend> {
     pub(crate) backend: B,
     pub(crate) buf: B::Buf<T>,
