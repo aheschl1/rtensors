@@ -89,10 +89,23 @@ impl<B: Backend> ImageLoader for TensorBase<u8, B> {
     }
 }
 
+pub trait ImageWriter {
+    fn write_image<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), TensorError>;
+}
+
+impl<B: Backend> ImageWriter for TensorBase<u8, B> {
+    fn write_image<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), TensorError> {
+        let image = self.into_rgb_image()?;
+        image.save(path).map_err(|e| {
+            TensorError::ConversionError(format!("Failed to save image: {}", e))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
-    use crate::{core::Tensor, io::image::{ImageLoader, IntoImage}};
+    use crate::{core::Tensor, io::image::{ImageLoader, ImageWriter, IntoImage}};
 
     #[test]
     fn test_image_cycle() {
