@@ -36,6 +36,22 @@ where
     /// let result = a.dot(&b).unwrap(); // Scalar: 32.0
     /// ```
     fn dot(&self, rhs: &Rhs) -> Result<Self::Output, TensorError>;
+    
+    /// Computes the outer product of two 1-D tensors.
+    /// 
+    /// Given two vectors of size M and N, returns a matrix of size (M, N) where
+    /// each element (i, j) is the product of a[i] * b[j].
+    /// 
+    /// # Examples
+    /// ```ignore
+    /// let a = Tensor::<f32>::from_buf(vec![1.0, 2.0, 3.0], (3,)).unwrap();
+    /// let b = Tensor::<f32>::from_buf(vec![4.0, 5.0], (2,)).unwrap();
+    /// let result = a.outer(&b).unwrap(); // Shape: (3, 2)
+    /// // result = [[4.0, 5.0],
+    /// //           [8.0, 10.0],
+    /// //           [12.0, 15.0]]
+    /// ```
+    fn outer(&self, rhs: &Rhs) -> Result<Self::Output, TensorError>;
 }
 
 pub trait Conv<K, T, B>

@@ -156,6 +156,24 @@ where
         Ok(m1)
     }
 
+    fn outer(&self, rhs: &R) -> Result<TensorBase<T, B>, TensorError>
+    {
+        let lview = self.view();
+        let rview = rhs.view();
+        if lview.rank() != 1 || rview.rank() != 1 {
+            return Err(TensorError::InvalidShape(
+                "Outer product is only defined for 1-D tensors".to_string(),
+            ));
+        }
+
+        // Outer product: a (M,) @ b (N,) -> (M, N)
+        // We reshape a to (M, 1) and b to (1, N), then do matmul
+        let lhs_reshaped = unsafe { lview.unsqueeze_at(1).unwrap_unchecked() };
+        let rhs_reshaped = rview.unsqueeze();
+        
+        lhs_reshaped.matmul(&rhs_reshaped)
+    }
+
 }
 
 #[inline(always)]
