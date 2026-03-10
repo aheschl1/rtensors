@@ -74,10 +74,25 @@ impl<B: Backend> IntoImage for TensorBase<u8, B> {
     }
 }
 
+pub trait ImageLoader {
+    fn load_image<P: AsRef<std::path::Path>>(path: P) -> Result<Self, TensorError>
+    where
+        Self: Sized;
+}
+
+impl<B: Backend> ImageLoader for TensorBase<u8, B> {
+    fn load_image<P: AsRef<std::path::Path>>(path: P) -> Result<Self, TensorError> {
+        let img = image::open(path).map_err(|e| {
+            TensorError::ConversionError(format!("Failed to load image: {}", e))
+        })?;
+        Ok(TensorBase::<u8, B>::from(img))
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
-    use crate::{core::{MetaTensorView, Tensor}, io::image::IntoImage};
+    use crate::{core::Tensor, io::image::{ImageLoader, IntoImage}};
 
     #[test]
     fn test_image_cycle() {
