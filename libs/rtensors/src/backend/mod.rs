@@ -228,6 +228,66 @@ pub trait Backend: Send + Sync + 'static + Clone + Debug {
     fn dump<T: TensorValue>(&self, src: &Self::Buf<T>) -> Result<Box<[T]>, TensorError>;
     fn convert<T: TensorValue, N: TensorValue>(&self, src: &Self::Buf<T>, dst: &mut Self::Buf<N>) -> Result<(), TensorError>;
     fn new() -> Self;
+    
+    /// Fill all elements in a tensor view with a single value.
+    /// This operation is optimized for contiguous and strided memory layouts.
+    fn fill<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, meta: &MetaTensor) -> Result<(), TensorError> {
+        if meta.is_contiguous() {
+            return self.fill_contiguous(
+                buf,
+                value,
+                meta.offset,
+                meta.size(),
+            );
+        }
+
+        let non_singleton_dims = meta.non_singleton_dims();
+        if non_singleton_dims.len() == 1 {
+            let (_, dim_size, dim_stride) = non_singleton_dims[0];
+            return self.fill_1d_strided(
+                buf,
+                value,
+                meta.offset,
+                dim_stride,
+                dim_size,
+            );
+        }
+
+        self.fill_nd(
+            buf,
+            value,
+            meta.offset,
+            meta.shape.as_slice(),
+            meta.strides.as_ref(),
+        )
+    }
+
+    fn fill_nd<T: TensorValue>(
+        &self,
+        buf: &mut Self::Buf<T>,
+        value: T,
+        offset: usize,
+        shape: &[usize],
+        stride: &[isize],
+    ) -> Result<(), TensorError>;
+
+    fn fill_1d_strided<T: TensorValue>(
+        &self, 
+        buf: &mut Self::Buf<T>, 
+        value: T,
+        offset: usize,
+        stride: isize,
+        len: usize
+    ) -> Result<(), TensorError>;
+
+    fn fill_contiguous<T: TensorValue>(
+        &self, 
+        buf: &mut Self::Buf<T>, 
+        value: T,
+        start: usize,
+        len: usize
+    ) -> Result<(), TensorError>;
+
     /// Broadcast two tensors into a destination tensor according to broadcasting rules
     /// 
     /// # Safety

@@ -512,4 +512,103 @@ mod tests {
         assert_eq!(index_tensor(Idx::At(9), &view).unwrap(), 209);
         assert_eq!(index_tensor(Idx::At(12), &view).unwrap(), 212);
     }
+
+    #[test]
+    fn test_cuda_fill_contiguous() {
+        let buf: Vec<i32> = (0..12).collect();
+        let mut tensor = make_cuda_tensor(buf, vec![3, 4]);
+        tensor.view_mut().fill(42).unwrap();
+        
+        // Verify all elements are 42
+        for i in 0..3 {
+            for j in 0..4 {
+                assert_eq!(index_tensor(Idx::Coord(vec![i, j]), &tensor.view()).unwrap(), 42);
+            }
+        }
+    }
+
+    #[test]
+    fn test_cuda_fill_contiguous_slice() {
+        let buf: Vec<i32> = (0..12).collect();
+        let mut tensor = make_cuda_tensor(buf, vec![3, 4]);
+        // Fill row 1
+        tensor.view_mut().slice_mut(0, 1).unwrap().fill(99).unwrap();
+        
+        // Verify row 0 unchanged
+        assert_eq!(index_tensor(Idx::Coord(vec![0, 0]), &tensor.view()).unwrap(), 0);
+        assert_eq!(index_tensor(Idx::Coord(vec![0, 1]), &tensor.view()).unwrap(), 1);
+        assert_eq!(index_tensor(Idx::Coord(vec![0, 2]), &tensor.view()).unwrap(), 2);
+        assert_eq!(index_tensor(Idx::Coord(vec![0, 3]), &tensor.view()).unwrap(), 3);
+        
+        // Verify row 1 filled with 99
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 0]), &tensor.view()).unwrap(), 99);
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 1]), &tensor.view()).unwrap(), 99);
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 2]), &tensor.view()).unwrap(), 99);
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 3]), &tensor.view()).unwrap(), 99);
+        
+        // Verify row 2 unchanged
+        assert_eq!(index_tensor(Idx::Coord(vec![2, 0]), &tensor.view()).unwrap(), 8);
+        assert_eq!(index_tensor(Idx::Coord(vec![2, 1]), &tensor.view()).unwrap(), 9);
+        assert_eq!(index_tensor(Idx::Coord(vec![2, 2]), &tensor.view()).unwrap(), 10);
+        assert_eq!(index_tensor(Idx::Coord(vec![2, 3]), &tensor.view()).unwrap(), 11);
+    }
+
+    #[test]
+    fn test_cuda_fill_strided_column() {
+        let buf: Vec<i32> = (0..12).collect();
+        let mut tensor = make_cuda_tensor(buf, vec![3, 4]);
+        // Fill column 2 (strided access)
+        tensor.view_mut().slice_mut(1, 2).unwrap().fill(7).unwrap();
+        
+        // Check the filled column
+        assert_eq!(index_tensor(Idx::Coord(vec![0, 2]), &tensor.view()).unwrap(), 7);
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 2]), &tensor.view()).unwrap(), 7);
+        assert_eq!(index_tensor(Idx::Coord(vec![2, 2]), &tensor.view()).unwrap(), 7);
+        
+        // Check other columns are unchanged
+        assert_eq!(index_tensor(Idx::Coord(vec![0, 0]), &tensor.view()).unwrap(), 0);
+        assert_eq!(index_tensor(Idx::Coord(vec![0, 1]), &tensor.view()).unwrap(), 1);
+        assert_eq!(index_tensor(Idx::Coord(vec![0, 3]), &tensor.view()).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_cuda_fill_2d_slice() {
+        let buf: Vec<i32> = (0..24).collect();
+        let mut tensor = make_cuda_tensor(buf, vec![4, 6]);
+        // Fill a 2D slice [1:3, 2:5]
+        {
+            let mut view = tensor.view_mut();
+            let mut slice = view.slice_mut(0, 1..3).unwrap();
+            let mut slice2d = slice.slice_mut(1, 2..5).unwrap();
+            slice2d.fill(5).unwrap();
+        }
+        
+        // Verify the filled region
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 2]), &tensor.view()).unwrap(), 5);
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 3]), &tensor.view()).unwrap(), 5);
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 4]), &tensor.view()).unwrap(), 5);
+        assert_eq!(index_tensor(Idx::Coord(vec![2, 2]), &tensor.view()).unwrap(), 5);
+        assert_eq!(index_tensor(Idx::Coord(vec![2, 3]), &tensor.view()).unwrap(), 5);
+        assert_eq!(index_tensor(Idx::Coord(vec![2, 4]), &tensor.view()).unwrap(), 5);
+        
+        // Verify unchanged regions
+        assert_eq!(index_tensor(Idx::Coord(vec![0, 2]), &tensor.view()).unwrap(), 2);
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 1]), &tensor.view()).unwrap(), 7);
+        assert_eq!(index_tensor(Idx::Coord(vec![1, 5]), &tensor.view()).unwrap(), 11);
+        assert_eq!(index_tensor(Idx::Coord(vec![3, 2]), &tensor.view()).unwrap(), 20);
+    }
+
+    #[test]
+    fn test_cuda_fill_f32() {
+        let buf: Vec<f32> = (0..6).map(|x| x as f32).collect();
+        let mut tensor = make_cuda_tensor(buf, vec![2, 3]);
+        tensor.view_mut().fill(3.14).unwrap();
+        
+        for i in 0..2 {
+            for j in 0..3 {
+                let val = index_tensor(Idx::Coord(vec![i, j]), &tensor.view()).unwrap();
+                assert!((val - 3.14).abs() < 1e-6);
+            }
+        }
+    }
 }

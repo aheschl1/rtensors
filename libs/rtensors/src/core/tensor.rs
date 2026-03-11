@@ -486,6 +486,15 @@ pub trait TensorAccessMut<T: TensorValue, B: Backend>: TensorAccess<T, B> {
     /// ```
     fn set<I: Into<Idx>>(&mut self, idx: I, value: T) -> Result<(), TensorError>;
     
+    /// Fill all elements in the tensor view with a single value.
+    /// 
+    /// # Examples
+    /// ```ignore
+    /// tensor.fill(0.0).unwrap();
+    /// tensor.fill(42).unwrap();
+    /// ```
+    fn fill(&mut self, value: T) -> Result<(), TensorError>;
+    
     /// Take a mutable slice at given index.
     fn slice_at_mut(&mut self, dim: Dim, idx: Dim) -> Result<TensorViewMut<'_, T, B>, TensorError> where Self: Sized{
         self.slice_mut(dim, idx)
@@ -660,6 +669,22 @@ where V: AsViewMut<T, B> + seal::Sealed
         let idx = idx.into();
         let buf_idx = logical_to_buffer_idx(&idx, view.meta.strides(), view.meta.offset())?;
         view.backend.write(view.buf, buf_idx, value)
+    }
+
+    fn fill(&mut self, value: T) -> Result<(), TensorError> {
+        let view = self.view_mut();
+        grad::when_enabled(|ctx| {
+            if let Some(k) = view.op() {
+                let nodes = ctx.nodes.borrow();
+                let op = nodes.get(k);
+                if let Some(op) = op {
+                    if let GradNode::Leaf(_) = op {
+                        panic!("Cannot fill a leaf tensor that requires grad");
+                    }
+                }
+            }
+        });
+        view.backend.fill(view.buf, value, &view.meta)
     }
 
     fn permute_mut(&mut self, dims: impl Into<Idx>) -> Result<TensorViewMut<'_, T, B>, TensorError> {

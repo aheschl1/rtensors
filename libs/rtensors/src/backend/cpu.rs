@@ -242,6 +242,52 @@ impl Backend for Cpu {
         Ok(src.clone())
     }
 
+    fn fill_contiguous<T: TensorValue>(
+        &self,
+        buf: &mut Self::Buf<T>,
+        value: T,
+        start: usize,
+        len: usize
+    ) -> Result<(), TensorError> {
+        let bufptr = buf.as_mut();
+        let slice = &mut bufptr[start..start + len];
+        slice.fill(value);
+        Ok(())
+    }
+
+    fn fill_1d_strided<T: TensorValue>(
+        &self,
+        buf: &mut Self::Buf<T>,
+        value: T,
+        offset: usize,
+        stride: isize,
+        len: usize
+    ) -> Result<(), TensorError> {
+        let bufptr = buf.as_mut();
+        let mut idx: isize = offset as isize;
+        for _ in 0..len {
+            bufptr[idx as usize] = value;
+            idx += stride;
+        }
+        Ok(())
+    }
+
+    fn fill_nd<T: TensorValue>(
+        &self,
+        buf: &mut Self::Buf<T>,
+        value: T,
+        offset: usize,
+        shape: &[usize],
+        stride: &[isize],
+    ) -> Result<(), TensorError> {
+        let bufptr = buf.as_mut();
+        let iter = TensorOffsetIterator::new(shape, stride, offset);
+        for idx in iter {
+            bufptr[idx] = value;
+        }
+        Ok(())
+    }
+
 
     fn broadcast<T: TensorValue>(
         &self, 

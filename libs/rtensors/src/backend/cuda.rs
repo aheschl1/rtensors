@@ -835,6 +835,192 @@ impl Backend for Cuda {
         Ok(host_buf.into_boxed_slice())
     }
 
+    fn fill_contiguous<T: TensorValue>(
+        &self,
+        buf: &mut Self::Buf<T>,
+        value: T,
+        start: usize,
+        len: usize,
+    ) -> Result<(), TensorError> {
+        let stream = self.stream();
+
+        macro_rules! launch {
+            ($launch_fn:ident, $t:ty) => {{
+                let concrete_value: $t = unsafe { std::mem::transmute_copy(&value) };
+                let (raw_ptr, _) = buf.ptr.device_ptr(&stream);
+                let data_ptr = raw_ptr as *mut $t;
+                let data_ptr = unsafe { data_ptr.add(start) };
+                unsafe { $launch_fn(data_ptr, len, concrete_value, DEFAULT_BLOCK_SIZE); }
+                self.dirty();
+                Ok(())
+            }};
+        }
+
+        match std::any::TypeId::of::<T>() {
+            id if id == std::any::TypeId::of::<f32>() =>
+                launch!(launch_fill_contiguous_f32, f32),
+            id if id == std::any::TypeId::of::<f64>() =>
+                launch!(launch_fill_contiguous_f64, f64),
+            id if id == std::any::TypeId::of::<u8>() =>
+                launch!(launch_fill_contiguous_u8, u8),
+            id if id == std::any::TypeId::of::<u16>() =>
+                launch!(launch_fill_contiguous_u16, u16),
+            id if id == std::any::TypeId::of::<u32>() =>
+                launch!(launch_fill_contiguous_u32, u32),
+            id if id == std::any::TypeId::of::<u64>() =>
+                launch!(launch_fill_contiguous_u64, u64),
+            id if id == std::any::TypeId::of::<u128>() =>
+                launch!(launch_fill_contiguous_u128, u128),
+            id if id == std::any::TypeId::of::<i8>() =>
+                launch!(launch_fill_contiguous_i8, i8),
+            id if id == std::any::TypeId::of::<i16>() =>
+                launch!(launch_fill_contiguous_i16, i16),
+            id if id == std::any::TypeId::of::<i32>() =>
+                launch!(launch_fill_contiguous_i32, i32),
+            id if id == std::any::TypeId::of::<i64>() =>
+                launch!(launch_fill_contiguous_i64, i64),
+            id if id == std::any::TypeId::of::<i128>() =>
+                launch!(launch_fill_contiguous_i128, i128),
+            id if id == std::any::TypeId::of::<types::boolean>() =>
+                launch!(launch_fill_contiguous_boolean, bool),
+            _ => Err(TensorError::CudaError(format!(
+                "Unsupported type for CUDA fill operation",
+            ))),
+        }
+    }
+
+    fn fill_1d_strided<T: TensorValue>(
+        &self,
+        buf: &mut Self::Buf<T>,
+        value: T,
+        offset: usize,
+        stride: isize,
+        len: usize,
+    ) -> Result<(), TensorError> {
+        let stream = self.stream();
+
+        macro_rules! launch {
+            ($launch_fn:ident, $t:ty) => {{
+                let concrete_value: $t = unsafe { std::mem::transmute_copy(&value) };
+                let (raw_ptr, _) = buf.ptr.device_ptr(&stream);
+                let data_ptr = raw_ptr as *mut $t;
+                unsafe { $launch_fn(data_ptr, offset, stride, len, concrete_value, DEFAULT_BLOCK_SIZE); }
+                self.dirty();
+                Ok(())
+            }};
+        }
+
+        match std::any::TypeId::of::<T>() {
+            id if id == std::any::TypeId::of::<f32>() =>
+                launch!(launch_fill_strided_f32, f32),
+            id if id == std::any::TypeId::of::<f64>() =>
+                launch!(launch_fill_strided_f64, f64),
+            id if id == std::any::TypeId::of::<u8>() =>
+                launch!(launch_fill_strided_u8, u8),
+            id if id == std::any::TypeId::of::<u16>() =>
+                launch!(launch_fill_strided_u16, u16),
+            id if id == std::any::TypeId::of::<u32>() =>
+                launch!(launch_fill_strided_u32, u32),
+            id if id == std::any::TypeId::of::<u64>() =>
+                launch!(launch_fill_strided_u64, u64),
+            id if id == std::any::TypeId::of::<u128>() =>
+                launch!(launch_fill_strided_u128, u128),
+            id if id == std::any::TypeId::of::<i8>() =>
+                launch!(launch_fill_strided_i8, i8),
+            id if id == std::any::TypeId::of::<i16>() =>
+                launch!(launch_fill_strided_i16, i16),
+            id if id == std::any::TypeId::of::<i32>() =>
+                launch!(launch_fill_strided_i32, i32),
+            id if id == std::any::TypeId::of::<i64>() =>
+                launch!(launch_fill_strided_i64, i64),
+            id if id == std::any::TypeId::of::<i128>() =>
+                launch!(launch_fill_strided_i128, i128),
+            id if id == std::any::TypeId::of::<types::boolean>() =>
+                launch!(launch_fill_strided_boolean, bool),
+            _ => Err(TensorError::CudaError(format!(
+                "Unsupported type for CUDA fill operation",
+            ))),
+        }
+    }
+
+    fn fill_nd<T: TensorValue>(
+        &self,
+        buf: &mut Self::Buf<T>,
+        value: T,
+        offset: usize,
+        shape: &[usize],
+        stride: &[isize],
+    ) -> Result<(), TensorError> {
+        let stream = self.stream();
+        let rank = shape.len();
+        let size = shape.iter().product::<usize>();
+
+        // allocate device memory for shape/stride
+        let shape_buf = self.alloc_from_slice(
+            shape.iter().copied().map(|x| x as u64).collect::<Vec<u64>>().into_boxed_slice()
+        )?;
+        let stride_buf = self.alloc_from_slice(
+            stride.iter().copied().map(|x| x as i64).collect::<Vec<i64>>().into_boxed_slice()
+        )?;
+
+        let (stride_ptr, _) = stride_buf.ptr.device_ptr(&stream);
+        let (shape_ptr,  _) = shape_buf.ptr.device_ptr(&stream);
+
+        macro_rules! launch {
+            ($launch_fn:ident, $t:ty) => {{
+                let concrete_value: $t = unsafe { std::mem::transmute_copy(&value) };
+                let (raw_ptr, _) = buf.ptr.device_ptr(&stream);
+                let data_ptr = raw_ptr as *mut $t;
+                unsafe {
+                    $launch_fn(
+                        data_ptr,
+                        offset,
+                        stride_ptr as *const isize,
+                        shape_ptr  as *const usize,
+                        rank,
+                        size,
+                        concrete_value,
+                        DEFAULT_BLOCK_SIZE,
+                    );
+                }
+                self.dirty();
+                Ok(())
+            }};
+        }
+
+        match std::any::TypeId::of::<T>() {
+            id if id == std::any::TypeId::of::<f32>() =>
+                launch!(launch_fill_nd_affine_f32, f32),
+            id if id == std::any::TypeId::of::<f64>() =>
+                launch!(launch_fill_nd_affine_f64, f64),
+            id if id == std::any::TypeId::of::<u8>() =>
+                launch!(launch_fill_nd_affine_u8, u8),
+            id if id == std::any::TypeId::of::<u16>() =>
+                launch!(launch_fill_nd_affine_u16, u16),
+            id if id == std::any::TypeId::of::<u32>() =>
+                launch!(launch_fill_nd_affine_u32, u32),
+            id if id == std::any::TypeId::of::<u64>() =>
+                launch!(launch_fill_nd_affine_u64, u64),
+            id if id == std::any::TypeId::of::<u128>() =>
+                launch!(launch_fill_nd_affine_u128, u128),
+            id if id == std::any::TypeId::of::<i8>() =>
+                launch!(launch_fill_nd_affine_i8, i8),
+            id if id == std::any::TypeId::of::<i16>() =>
+                launch!(launch_fill_nd_affine_i16, i16),
+            id if id == std::any::TypeId::of::<i32>() =>
+                launch!(launch_fill_nd_affine_i32, i32),
+            id if id == std::any::TypeId::of::<i64>() =>
+                launch!(launch_fill_nd_affine_i64, i64),
+            id if id == std::any::TypeId::of::<i128>() =>
+                launch!(launch_fill_nd_affine_i128, i128),
+            id if id == std::any::TypeId::of::<types::boolean>() =>
+                launch!(launch_fill_nd_affine_boolean, bool),
+            _ => Err(TensorError::CudaError(format!(
+                "Unsupported type for CUDA fill operation",
+            ))),
+        }
+    }
+
     fn broadcast<T: TensorValue>(
         &self,
         left: (*const Self::Buf<T>, &MetaTensor),

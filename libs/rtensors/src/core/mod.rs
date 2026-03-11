@@ -1173,6 +1173,87 @@ mod tests {
     }
 
     #[test]
+    fn test_fill_contiguous() {
+        let mut tensor = make_tensor((0..12).collect(), vec![3, 4]);
+        tensor.view_mut().fill(42).unwrap();
+        
+        // Verify all elements are 42
+        for i in 0..3 {
+            for j in 0..4 {
+                assert_eq!(tensor.view().get(vec![i, j]).unwrap(), 42);
+            }
+        }
+    }
+
+    #[test]
+    fn test_fill_contiguous_slice() {
+        let mut tensor = make_tensor((0..12).collect(), vec![3, 4]);
+        // Fill row 1
+        tensor.view_mut().slice_mut(0, 1).unwrap().fill(99).unwrap();
+        
+        // Verify row 0 unchanged
+        assert_eq!(tensor.view().get(vec![0, 0]).unwrap(), 0);
+        assert_eq!(tensor.view().get(vec![0, 1]).unwrap(), 1);
+        assert_eq!(tensor.view().get(vec![0, 2]).unwrap(), 2);
+        assert_eq!(tensor.view().get(vec![0, 3]).unwrap(), 3);
+        
+        // Verify row 1 filled with 99
+        assert_eq!(tensor.view().get(vec![1, 0]).unwrap(), 99);
+        assert_eq!(tensor.view().get(vec![1, 1]).unwrap(), 99);
+        assert_eq!(tensor.view().get(vec![1, 2]).unwrap(), 99);
+        assert_eq!(tensor.view().get(vec![1, 3]).unwrap(), 99);
+        
+        // Verify row 2 unchanged
+        assert_eq!(tensor.view().get(vec![2, 0]).unwrap(), 8);
+        assert_eq!(tensor.view().get(vec![2, 1]).unwrap(), 9);
+        assert_eq!(tensor.view().get(vec![2, 2]).unwrap(), 10);
+        assert_eq!(tensor.view().get(vec![2, 3]).unwrap(), 11);
+    }
+
+    #[test]
+    fn test_fill_strided_column() {
+        let mut tensor = make_tensor((0..12).collect(), vec![3, 4]);
+        // Fill column 2 (strided access)
+        tensor.view_mut().slice_mut(1, 2).unwrap().fill(7).unwrap();
+        
+        // Check the filled column
+        assert_eq!(tensor.view().get(vec![0, 2]).unwrap(), 7);
+        assert_eq!(tensor.view().get(vec![1, 2]).unwrap(), 7);
+        assert_eq!(tensor.view().get(vec![2, 2]).unwrap(), 7);
+        
+        // Check other columns are unchanged
+        assert_eq!(tensor.view().get(vec![0, 0]).unwrap(), 0);
+        assert_eq!(tensor.view().get(vec![0, 1]).unwrap(), 1);
+        assert_eq!(tensor.view().get(vec![0, 3]).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_fill_2d_slice() {
+        let mut tensor = make_tensor((0..24).collect(), vec![4, 6]);
+        // Fill a 2D slice [1:3, 2:5]
+        {
+            let mut view = tensor.view_mut();
+            let mut slice = view.slice_mut(0, 1..3).unwrap();
+            let mut slice2d = slice.slice_mut(1, 2..5).unwrap();
+            slice2d.fill(5).unwrap();
+        }
+        
+        // Verify the filled region
+        assert_eq!(tensor.view().get(vec![1, 2]).unwrap(), 5);
+        assert_eq!(tensor.view().get(vec![1, 3]).unwrap(), 5);
+        assert_eq!(tensor.view().get(vec![1, 4]).unwrap(), 5);
+        assert_eq!(tensor.view().get(vec![2, 2]).unwrap(), 5);
+        assert_eq!(tensor.view().get(vec![2, 3]).unwrap(), 5);
+        assert_eq!(tensor.view().get(vec![2, 4]).unwrap(), 5);
+        
+        // Verify unchanged regions
+        assert_eq!(tensor.view().get(vec![0, 2]).unwrap(), 2);
+        assert_eq!(tensor.view().get(vec![1, 1]).unwrap(), 7);
+        assert_eq!(tensor.view().get(vec![1, 5]).unwrap(), 11);
+        assert_eq!(tensor.view().get(vec![3, 2]).unwrap(), 20);
+    }
+
+    #[test]
     fn test_is_row_and_is_column() {
         let row = Tensor::row(vec![1, 2, 3]);
         let col = Tensor::column(vec![1, 2, 3]);
