@@ -323,7 +323,76 @@ pub trait TypeConstants {
 }
 
 
-macro_rules! impl_tensor_values {
+macro_rules! impl_tensor_values_float {
+    ($(($type:ty, $dtype:expr)),+ $(,)?) => {
+        $(
+            impl TensorValue for $type {
+                const DTYPE: crate::core::value::DType = $dtype;
+            }
+
+            impl DTypeConversion for $type {
+                #[inline(always)]
+                fn to_u8(&self) -> u8 {
+                    (*self).round() as u8
+                }
+                #[inline(always)]
+                fn to_i8(&self) -> i8 {
+                    (*self).round() as i8
+                }
+                #[inline(always)]
+                fn to_u16(&self) -> u16 {
+                    (*self).round() as u16
+                }
+                #[inline(always)]
+                fn to_i16(&self) -> i16 {
+                    (*self).round() as i16
+                }
+                #[inline(always)]
+                fn to_u32(&self) -> u32 {
+                    (*self).round() as u32
+                }
+                #[inline(always)]
+                fn to_i32(&self) -> i32 {
+                    (*self).round() as i32
+                }
+                #[inline(always)]
+                fn to_u64(&self) -> u64 {
+                    (*self).round() as u64
+                }
+                #[inline(always)]
+                fn to_i64(&self) -> i64 {
+                    (*self).round() as i64
+                }
+                #[inline(always)]
+                fn to_u128(&self) -> u128 {
+                    (*self).round() as u128
+                }
+                #[inline(always)]
+                fn to_i128(&self) -> i128 {
+                    (*self).round() as i128
+                }
+                #[inline(always)]
+                fn to_f32(&self) -> f32 {
+                    *self as f32
+                }
+                #[inline(always)]
+                fn to_f64(&self) -> f64 {
+                    *self as f64
+                }
+                #[inline(always)]
+                fn to_bool(&self) -> boolean {
+                    if *self != Self::ZERO {
+                        boolean::TRUE
+                    } else {
+                        boolean::FALSE
+                    }
+                }
+            }
+        )+
+    };
+}
+
+macro_rules! impl_tensor_values_int {
     ($(($type:ty, $dtype:expr)),+ $(,)?) => {
         $(
             impl TensorValue for $type {
@@ -404,9 +473,12 @@ macro_rules! impl_default {
     };
 }
 
-impl_tensor_values!(
+impl_tensor_values_float!(
     (f32, DType::F32), 
     (f64, DType::F64), 
+);
+
+impl_tensor_values_int!(
     (i8, DType::I8), 
     (i16, DType::I16), 
     (i32, DType::I32), 
