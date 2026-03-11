@@ -95,10 +95,64 @@ pub trait ImageWriter {
 
 impl<B: Backend> ImageWriter for TensorBase<u8, B> {
     fn write_image<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), TensorError> {
-        let image = self.into_rgb_image()?;
-        image.save(path).map_err(|e| {
-            TensorError::ConversionError(format!("Failed to save image: {}", e))
-        })
+        let shape = self.shape();
+        let rank = self.rank();
+        
+        // Handle different image formats based on shape
+        match rank {
+            2 => {
+                // [H, W] - grayscale image
+                let height = shape[0];
+                let width = shape[1];
+                let data = self.backend.dump(&self.buf)?.into_vec();
+                
+                let image = image::GrayImage::from_vec(width as u32, height as u32, data)
+                    .ok_or_else(|| {
+                        TensorError::ConversionError("Failed to convert tensor data to GrayImage".to_string())
+                    })?;
+                
+                image.save(path).map_err(|e| {
+                    TensorError::ConversionError(format!("Failed to save image: {}", e))
+                })
+            },
+            3 => {
+                let channels = shape[2];
+                match channels {
+                    1 => {
+                        // [H, W, 1] - grayscale image
+                        let height = shape[0];
+                        let width = shape[1];
+                        let data = self.backend.dump(&self.buf)?.into_vec();
+                        
+                        let image = image::GrayImage::from_vec(width as u32, height as u32, data)
+                            .ok_or_else(|| {
+                                TensorError::ConversionError("Failed to convert tensor data to GrayImage".to_string())
+                            })?;
+                        
+                        image.save(path).map_err(|e| {
+                            TensorError::ConversionError(format!("Failed to save image: {}", e))
+                        })
+                    },
+                    3 => {
+                        // [H, W, 3] - RGB image
+                        let image = self.into_rgb_image()?;
+                        image.save(path).map_err(|e| {
+                            TensorError::ConversionError(format!("Failed to save image: {}", e))
+                        })
+                    },
+                    _ => {
+                        Err(TensorError::InvalidShape(
+                            format!("Tensor must have 1 or 3 channels, got {} channels", channels)
+                        ))
+                    }
+                }
+            },
+            _ => {
+                Err(TensorError::InvalidShape(
+                    "Tensor must have shape [height, width] or [height, width, channels] to save as image".to_string()
+                ))
+            }
+        }
     }
 }
 
