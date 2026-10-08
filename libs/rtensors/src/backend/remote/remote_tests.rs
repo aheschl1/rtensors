@@ -19,7 +19,7 @@ mod tests {
             Tensor,
             value::types,
         },
-        ops::linalg::MatMul,
+        ops::{linalg::MatMul, reduction::ReductionOpTypes},
     };
     
     const SERVER_IP: &str = "127.0.0.1";
@@ -582,7 +582,10 @@ mod tests {
     #[test]
     fn test_remote_unsupported_op_errors() {
         let mut t = make_remote_tensor(vec![1.0f32, 4.0], vec![2]).unwrap();
-        let err = t.backend.fill_contiguous(&mut t.buf, 0.0, 0, 2).unwrap_err();
+        let mut out = t.backend.alloc::<f32>(2).unwrap();
+        let meta = t.meta.clone();
+        let config = crate::ops::linalg::ConvConfig2D::default();
+        let err = t.backend.apply_conv_2d((&t.buf, &meta), (&t.buf, &meta), &mut out, &config).unwrap_err();
         assert!(matches!(err, TensorError::UnsupportedOperation(_)), "{err:?}");
     }
 
@@ -793,6 +796,85 @@ mod tests {
             log_inplace(10.0) on positive, log1p_inplace(10.0) on positive,
             leaky_relu_inplace(0.1) on data, elu_inplace(0.1) on data
         );
+    }
+
+    #[test]
+    fn test_remote_fill_layouts() {
+        use crate::core::tensor::TensorAccessMut;
+        let mut t = make_remote_tensor(vec![0i32; 6], vec![2, 3]).unwrap();
+        t.fill(4).unwrap();
+        assert_eq!(t.cpu().unwrap(), Tensor::<i32>::from_buf(vec![4; 6], vec![2, 3]).unwrap());
+        t.view_mut().slice_mut(1, 1).unwrap().fill(9).unwrap();
+        assert_eq!(t.cpu().unwrap(), Tensor::<i32>::from_buf(vec![4, 9, 4, 4, 9, 4], vec![2, 3]).unwrap());
+        t.transpose_mut().fill(1).unwrap();
+        assert_eq!(t.cpu().unwrap(), Tensor::<i32>::from_buf(vec![1; 6], vec![2, 3]).unwrap());
+    }
+
+    #[test]
+    fn test_remote_convert() {
+        let t = make_remote_tensor(vec![1.7f32, -2.2, 3.0], vec![3]).unwrap();
+        let as_int = t.into_dtype::<i64>().unwrap();
+        let expected = Tensor::<f32>::from_buf(vec![1.7, -2.2, 3.0], vec![3]).unwrap().into_dtype::<i64>().unwrap();
+        assert_eq!(as_int.cpu().unwrap(), expected);
+        let as_bool = t.into_dtype::<types::boolean>().unwrap();
+        let expected = Tensor::<f32>::from_buf(vec![1.7, -2.2, 3.0], vec![3]).unwrap().into_dtype::<types::boolean>().unwrap();
+        assert_eq!(as_bool.cpu().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_remote_reductions_match_cpu() {
+        use crate::ops::reduction::{ReductionOp, TotalReductionOp};
+        let data: Vec<f64> = (0..24).map(|i| (i as f64 * 0.37).sin()).collect();
+        let remote = make_remote_tensor(data.clone(), vec![2, 3, 4]).unwrap();
+        let cpu = Tensor::<f64>::from_buf(data, vec![2, 3, 4]).unwrap();
+        assert_eq!(remote.sum().unwrap().cpu().unwrap(), cpu.sum().unwrap());
+        assert_eq!(remote.prod().unwrap().cpu().unwrap(), cpu.prod().unwrap());
+        assert_eq!(remote.mean().unwrap().cpu().unwrap(), cpu.mean().unwrap());
+        for dim in 0..3 {
+            assert_eq!(remote.sum_at(dim).unwrap().cpu().unwrap(), cpu.sum_at(dim).unwrap(), "sum_at({dim})");
+            assert_eq!(remote.max_at(dim).unwrap().cpu().unwrap(), cpu.max_at(dim).unwrap(), "max_at({dim})");
+            assert_eq!(remote.min_at(dim).unwrap().cpu().unwrap(), cpu.min_at(dim).unwrap(), "min_at({dim})");
+            assert_eq!(remote.mean_at(dim).unwrap().cpu().unwrap(), cpu.mean_at(dim).unwrap(), "mean_at({dim})");
+        }
+    }
+
+    #[test]
+    fn test_remote_unsupported_reductions_error_instead_of_crashing() {
+        // The CPU server backend has no variance accumulator and no argmax; it must say so
+        // rather than hit the panics/todo!()s behind them.
+        let backend = own_backend();
+        let src = backend.alloc_from_slice::<f32>(vec![1.0, 2.0, 3.0].into()).unwrap();
+        let mut dst = backend.alloc::<f32>(1).unwrap();
+        backend.apply_reduce_contiguous_flat(&src, &mut dst, 0, 3, ReductionOpTypes::Variance { unbiased: true }).unwrap();
+        let err = backend.sync().unwrap_err();
+        assert!(matches!(err, TensorError::UnsupportedOperation(_)), "{err:?}");
+        let mut idx = backend.alloc::<u64>(1).unwrap();
+        backend.apply_argmax_contiguous_flat(&src, &mut idx, 0, 3, ReductionOpTypes::ArgMax).unwrap();
+        let err = backend.sync().unwrap_err();
+        assert!(matches!(err, TensorError::UnsupportedOperation(_)), "{err:?}");
+        // Reduction kinds can't be swapped between entry points.
+        backend.apply_reduce_contiguous_flat(&src, &mut dst, 0, 3, ReductionOpTypes::ArgMax).unwrap();
+        assert!(backend.sync().is_err());
+    }
+
+    #[test]
+    fn test_remote_reduction_rejects_bad_extents() {
+        let backend = own_backend();
+        let src = backend.alloc_from_slice::<f32>(vec![1.0; 6].into()).unwrap();
+        let mut dst = backend.alloc::<f32>(1).unwrap();
+        backend.apply_reduce_contiguous_flat(&src, &mut dst, 4, 5, ReductionOpTypes::Sum).unwrap();
+        assert!(matches!(backend.sync().unwrap_err(), TensorError::RemoteError(ref m) if m.contains("invalid request")));
+        // 2x3 summed over dim 1 needs 2 outputs.
+        let meta = MetaTensor::new(vec![2, 3], vec![3, 1], 0);
+        let out_meta = MetaTensor::new(vec![2], vec![1], 0);
+        backend.apply_reduce_contiguous_nd((&src, &meta), (&mut dst, &out_meta), 1, ReductionOpTypes::Sum).unwrap();
+        assert!(matches!(backend.sync().unwrap_err(), TensorError::RemoteError(ref m) if m.contains("invalid request")));
+        // Transposed (non-row-major) source.
+        let mut dst2 = backend.alloc::<f32>(3).unwrap();
+        let transposed = MetaTensor::new(vec![3, 2], vec![1, 3], 0);
+        let out_meta = MetaTensor::new(vec![3], vec![1], 0);
+        backend.apply_reduce_contiguous_nd((&src, &transposed), (&mut dst2, &out_meta), 1, ReductionOpTypes::Sum).unwrap();
+        assert!(backend.sync().is_err());
     }
 
     #[test]

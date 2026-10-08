@@ -11,10 +11,10 @@ use std::io::{Read, Write};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{DType, TensorValue}, MetaTensor}, ops::base::BinaryOpType};
+use crate::{core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{DType, TensorValue}, Dim, MetaTensor}, ops::{base::BinaryOpType, reduction::ReductionOpTypes}};
 
 /// Bumped whenever the wire format changes; client and server must agree.
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 
 /// Upper bound on a single frame. Frames are read incrementally, so this only guards against
 /// nonsensical length prefixes rather than reserving memory up front.
@@ -230,6 +230,17 @@ pub(crate) enum Op {
     },
     Unary { buf: TypelessBuf, op: UnaryOp, layout: Layout },
     Scalar { buf: TypelessBuf, op: ScalarOp, value: Value, layout: Layout },
+    Fill { buf: TypelessBuf, value: Value, layout: Layout },
+    /// Elementwise dtype conversion between two equally sized buffers.
+    Convert { src: TypelessBuf, dst: TypelessBuf },
+    /// Reduces `src[start..start + len]` into `dst[0]`.
+    ReduceFlat { src: TypelessBuf, dst: TypelessBuf, start: usize, len: usize, op: ReductionOpTypes },
+    /// Reduces a contiguous tensor along `dim`.
+    ReduceNd { src: (TypelessBuf, MetaTensor), dst: (TypelessBuf, MetaTensor), dim: Dim, op: ReductionOpTypes },
+    /// Like `ReduceFlat`, writing an index into a `u64` buffer.
+    ArgFlat { src: TypelessBuf, dst: TypelessBuf, start: usize, len: usize, op: ReductionOpTypes },
+    /// Like `ReduceNd`, writing indices into a `u64` buffer.
+    ArgNd { src: (TypelessBuf, MetaTensor), dst: (TypelessBuf, MetaTensor), dim: Dim, op: ReductionOpTypes },
 }
 
 #[derive(Serialize, Deserialize)]
