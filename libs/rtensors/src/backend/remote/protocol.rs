@@ -9,6 +9,16 @@ pub(crate) struct Slice {
     pub(crate) dtype: DType,
 }
 
+/// Rejects byte patterns that are not valid values of `dtype`. Every numeric dtype accepts any
+/// bit pattern, but a `bool` must be exactly 0 or 1, so untrusted bytes are checked first.
+#[inline]
+fn validate_bytes(dtype: DType, data: &[u8]) -> Result<(), TensorError> {
+    if dtype == DType::BOOL && data.iter().any(|&b| b > 1) {
+        return Err(TensorError::BackendError("Invalid boolean byte in payload".to_string()));
+    }
+    Ok(())
+}
+
 impl<T: TensorValue> From<Slice> for Result<Box<[T]>, TensorError> {
     fn from(val: Slice) -> Self {
         val.to_boxed_slice::<T>()
@@ -18,26 +28,22 @@ impl<T: TensorValue> From<Slice> for Result<Box<[T]>, TensorError> {
 impl Slice {
     #[inline(always)]
     pub(crate) fn from_boxed_slice<T: TensorValue>(boxed: Box<[T]>) -> Self {
-        let dtype = T::DTYPE;
-        let data = unsafe {
-            let len = boxed.len() * std::mem::size_of::<T>();
-            let ptr = Box::into_raw(boxed) as *mut u8;
-            Vec::from_raw_parts(ptr, len, len)
-        };
-        Self { data, dtype }
+        // Copy rather than reinterpreting the allocation: a `Box<[T]>` cannot be freed as a
+        // `Vec<u8>` because the allocation layouts (alignment) differ.
+        Self::from_slice(&boxed)
     }
 
     #[inline(always)]
     pub(crate) fn from_slice<T: TensorValue>(slice: &[T]) -> Self {
         let dtype = T::DTYPE;
-        let data = unsafe {
-            let len = std::mem::size_of_val(slice);
-            let ptr = slice.as_ptr() as *const u8;
-            let mut vec = Vec::with_capacity(len);
-            vec.set_len(len);
-            std::ptr::copy_nonoverlapping(ptr, vec.as_mut_ptr(), len);
-            vec
-        };
+        let len = std::mem::size_of_val(slice);
+        let mut data = Vec::<u8>::with_capacity(len);
+        // SAFETY: `TensorValue` types are plain-old-data, `data` has room for `len` bytes,
+        // and u8 has no alignment requirement.
+        unsafe {
+            std::ptr::copy_nonoverlapping(slice.as_ptr() as *const u8, data.as_mut_ptr(), len);
+            data.set_len(len);
+        }
         Self { data, dtype }
     }
 
@@ -49,13 +55,24 @@ impl Slice {
                 T::DTYPE, self.dtype
             )));
         }
-        let boxed = unsafe {
-            let len = self.data.len() / std::mem::size_of::<T>();
-            let ptr = self.data.as_ptr() as *mut T;
-            std::mem::forget(self.data);
-            Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len))
-        };
-        Ok(boxed)
+        let size = std::mem::size_of::<T>();
+        if size == 0 || self.data.len() % size != 0 {
+            return Err(TensorError::BackendError(format!(
+                "Slice of {} bytes is not a whole number of {:?} elements",
+                self.data.len(), T::DTYPE
+            )));
+        }
+        validate_bytes(self.dtype, &self.data)?;
+        let len = self.data.len() / size;
+        let mut out = Vec::<T>::with_capacity(len);
+        // SAFETY: `out` is a properly aligned allocation for `len` elements of `T`, and the
+        // byte buffer holds exactly `len * size_of::<T>()` bytes. The byte buffer may be
+        // unaligned for `T`, which is why we copy instead of reinterpreting it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data.as_ptr(), out.as_mut_ptr() as *mut u8, self.data.len());
+            out.set_len(len);
+        }
+        Ok(out.into_boxed_slice())
     }
 }
 
@@ -89,16 +106,7 @@ impl<T: TensorValue> From<Value> for Result<T, TensorError> {
 impl Value {
     #[inline(always)]
     pub(crate) fn from_value<T: TensorValue>(value: T) -> Self {
-        let dtype = T::DTYPE;
-        let data = unsafe {
-            let size = std::mem::size_of::<T>();
-            let ptr = &value as *const T as *const u8;
-            let mut vec = Vec::with_capacity(size);
-            vec.set_len(size);
-            std::ptr::copy_nonoverlapping(ptr, vec.as_mut_ptr(), size);
-            vec
-        };
-        Self { data, dtype }
+        Slice::from_slice(std::slice::from_ref(&value)).into_value()
     }
 
     #[inline(always)]
@@ -109,11 +117,23 @@ impl Value {
                 T::DTYPE, self.dtype
             )));
         }
-        let value = unsafe {
-            let ptr = self.data.as_ptr() as *const T;
-            std::ptr::read(ptr)
-        };
-        Ok(value)
+        if self.data.len() != std::mem::size_of::<T>() {
+            return Err(TensorError::BackendError(format!(
+                "Value of {} bytes does not match {:?}",
+                self.data.len(), T::DTYPE
+            )));
+        }
+        validate_bytes(self.dtype, &self.data)?;
+        // SAFETY: the length matches `T` exactly and the bit pattern was validated;
+        // the bytes may be unaligned, hence read_unaligned.
+        Ok(unsafe { std::ptr::read_unaligned(self.data.as_ptr() as *const T) })
+    }
+}
+
+impl Slice {
+    #[inline(always)]
+    fn into_value(self) -> Value {
+        Value { data: self.data, dtype: self.dtype }
     }
 }
 
@@ -325,85 +345,24 @@ pub (crate) enum Messages {
     ApplyNegNdResponse (Result<(), TensorError>),
 
     Matmul {
-        lhs: (TypelessBuf, MetaTensor),
-        rhs: (TypelessBuf, MetaTensor),
+        lhs: (TypelessBuf, MetaTensor, ContiguityTypes),
+        rhs: (TypelessBuf, MetaTensor, ContiguityTypes),
         dst: TypelessBuf,
         b: usize,
         m: usize,
         k: usize,
         n: usize,
-        contiguity: ContiguityTypes
     },
     MatmulResponse (Result<(), TensorError>),
 
-    ApplyReluNd {
-        buf: TypelessBuf,
-        offset: usize,
-        shape: Vec<usize>,
-        stride: Vec<isize>
-    },
-    ApplyReluNdResponse(Result<(), TensorError>),
 
-    ApplyRelu1dStrided {
-        buf: TypelessBuf,
-        offset: usize,
-        stride: isize,
-        len: usize,
-    },
-    ApplyRelu1dStridedResponse(Result<(), TensorError>),
 
-    ApplyReluContiguous {
-        buf: TypelessBuf,
-        offset: usize,
-        len: usize,
-    },
-    ApplyReluContiguousResponse(Result<(), TensorError>),
 
-    ApplySigmoidNd {
-        buf: TypelessBuf,
-        offset: usize,
-        shape: Vec<usize>,
-        stride: Vec<isize>
-    },
-    ApplySigmoidNdResponse(Result<(), TensorError>),
 
-    ApplySigmoid1dStrided {
-        buf: TypelessBuf,
-        offset: usize,
-        stride: isize,
-        len: usize,
-    },
-    ApplySigmoid1dStridedResponse(Result<(), TensorError>),
 
-    ApplySigmoidContiguous {
-        buf: TypelessBuf,
-        offset: usize,
-        len: usize,
-    },
-    ApplySigmoidContiguousResponse(Result<(), TensorError>),
 
-    ApplyTanhNd {
-        buf: TypelessBuf,
-        offset: usize,
-        shape: Vec<usize>,
-        stride: Vec<isize>
-    },
-    ApplyTanhNdResponse(Result<(), TensorError>),
 
-    ApplyTanh1dStrided {
-        buf: TypelessBuf,
-        offset: usize,
-        stride: isize,
-        len: usize,
-    },
-    ApplyTanh1dStridedResponse(Result<(), TensorError>),
 
-    ApplyTanhContiguous {
-        buf: TypelessBuf,
-        offset: usize,
-        len: usize,
-    },
-    ApplyTanhContiguousResponse(Result<(), TensorError>),
 
     CopyRangeWithin {
         dst: TypelessBuf,
@@ -441,15 +400,6 @@ impl Messages {
             Messages::ApplyNegNdResponse { .. } |
             Messages::ErrorResponse { .. } |
             Messages::ActionCompleted { .. } |
-            Messages::ApplyReluNdResponse { .. } |
-            Messages::ApplyRelu1dStridedResponse { .. } |
-            Messages::ApplyReluContiguousResponse { .. } |
-            Messages::ApplySigmoidNdResponse { .. } |
-            Messages::ApplySigmoid1dStridedResponse { .. } |
-            Messages::ApplySigmoidContiguousResponse { .. } |
-            Messages::ApplyTanhNdResponse { .. } |
-            Messages::ApplyTanh1dStridedResponse { .. } |
-            Messages::ApplyTanhContiguousResponse { .. } |
             Messages::CopyRangeWithinResponse { .. } => true,
             _ => false,
         }

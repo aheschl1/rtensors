@@ -1890,6 +1890,7 @@ mod remote_tests {
             tensor_backend,
             buffer,
             MetaTensor::new(shape, stride, 0),
+            None,
         ))
     }
 

@@ -376,33 +376,32 @@ pub(crate) fn dispatch_broadcast(
 
 #[inline(always)]
 pub(crate) fn dispatch_matmul(
-    lhs: (TypelessBuf, MetaTensor),
-    rhs: (TypelessBuf, MetaTensor),
+    lhs: (TypelessBuf, MetaTensor, ContiguityTypes),
+    rhs: (TypelessBuf, MetaTensor, ContiguityTypes),
     dst: TypelessBuf,
     b: usize,
     m: usize,
     k: usize,
     n: usize,
-    contiguity: ContiguityTypes,
     connection: &ClientConnection,
 ) -> Result<(), TensorError> {
-    let (lhs_buf, lhs_meta) = lhs;
-    let (rhs_buf, rhs_meta) = rhs;
+    let (lhs_buf, lhs_meta, lhs_contiguity) = lhs;
+    let (rhs_buf, rhs_meta, rhs_contiguity) = rhs;
     
     match lhs_buf.dtype {
-        DType::U8 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, U8, u8, u8_buffers),
-        DType::U16 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, U16, u16, u16_buffers),
-        DType::U32 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, U32, u32, u32_buffers),
-        DType::U64 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, U64, u64, u64_buffers),
-        DType::U128 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, U128, u128, u128_buffers),
-        DType::I8 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, I8, i8, i8_buffers),
-        DType::I16 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, I16, i16, i16_buffers),
-        DType::I32 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, I32, i32, i32_buffers),
-        DType::I64 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, I64, i64, i64_buffers),
-        DType::I128 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, I128, i128, i128_buffers),
-        DType::F32 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, F32, f32, f32_buffers),
-        DType::F64 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, F64, f64, f64_buffers),
-        DType::BOOL => matmul_for_dtype!(lhs_buf.id, &lhs_meta, rhs_buf.id, &rhs_meta, dst.id, b, m, k, n, contiguity, connection, BOOL, types::boolean, bool_buffers),
+        DType::U8 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, U8, u8, u8_buffers),
+        DType::U16 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, U16, u16, u16_buffers),
+        DType::U32 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, U32, u32, u32_buffers),
+        DType::U64 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, U64, u64, u64_buffers),
+        DType::U128 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, U128, u128, u128_buffers),
+        DType::I8 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, I8, i8, i8_buffers),
+        DType::I16 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, I16, i16, i16_buffers),
+        DType::I32 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, I32, i32, i32_buffers),
+        DType::I64 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, I64, i64, i64_buffers),
+        DType::I128 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, I128, i128, i128_buffers),
+        DType::F32 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, F32, f32, f32_buffers),
+        DType::F64 => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, F64, f64, f64_buffers),
+        DType::BOOL => matmul_for_dtype!(lhs_buf.id, &lhs_meta, lhs_contiguity, rhs_buf.id, &rhs_meta, rhs_contiguity, dst.id, b, m, k, n, connection, BOOL, types::boolean, bool_buffers),
     };
     
     Ok(())

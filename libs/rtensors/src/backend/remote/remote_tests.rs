@@ -15,8 +15,11 @@ mod tests {
             MetaTensor, 
             MetaTensorView, 
             Shape, 
-            Slice
-        }
+            Slice,
+            Tensor,
+            value::types,
+        },
+        ops::linalg::MatMul,
     };
     
     const SERVER_IP: &str = "127.0.0.1";
@@ -34,12 +37,20 @@ mod tests {
         });
     }
     
+    /// One connection shared by every test tensor. Buffer ids are scoped to a connection,
+    /// so tensors used together in one op must come from the same backend.
+    fn shared_backend() -> RemoteBackend {
+        static BACKEND: std::sync::OnceLock<RemoteBackend> = std::sync::OnceLock::new();
+        BACKEND.get_or_init(|| {
+            setup_server();
+            let mut backend = RemoteBackend::new_with_address(SERVER_IP.parse().unwrap(), SERVER_PORT).unwrap();
+            backend.connect().unwrap();
+            backend
+        }).clone()
+    }
+
     fn make_remote_tensor<T: TensorValue>(buf: Vec<T>, shape: impl Into<Shape>) -> Result<RemoteTensor<T>, TensorError> {
-        setup_server();
-        let mut backend = RemoteBackend::new_with_address(SERVER_IP.parse().unwrap(), SERVER_PORT)
-            .map_err(|e| TensorError::RemoteError(e.to_string()))?;
-        backend.connect()
-            .map_err(|e| TensorError::RemoteError(e.to_string()))?;
+        let backend = shared_backend();
         
         let shape: Shape = shape.into();
         let buf_len = buf.len();
@@ -55,7 +66,7 @@ mod tests {
         
         let buffer = backend.alloc_from_slice(buf.into())?;
         let stride = crate::core::shape_to_stride(&shape);
-        Ok(TensorBase::from_parts(backend, buffer, MetaTensor::new(shape, stride, 0)))
+        Ok(TensorBase::from_parts(backend, buffer, MetaTensor::new(shape, stride, 0), None))
     }
 
     fn index_tensor<'a, T: TensorValue + PartialEq + std::fmt::Debug>(
@@ -521,5 +532,64 @@ mod tests {
         assert_eq!(index_tensor(Idx::At(7), &view).unwrap(), 7);   // Unchanged
         assert_eq!(index_tensor(Idx::At(9), &view).unwrap(), 209);
         assert_eq!(index_tensor(Idx::At(12), &view).unwrap(), 212);
+    }
+
+    #[test]
+    fn test_remote_matmul_same_operand() {
+        // x @ x used to panic on the server (overlapping keys in get_disjoint_mut)
+        let a = make_remote_tensor(vec![1.0f32, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let result = a.matmul(&a).unwrap();
+        let expected = Tensor::<f32>::from_buf(vec![7.0, 10.0, 15.0, 22.0], vec![2, 2]).unwrap();
+        assert_eq!(result.cpu().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_remote_broadcast_inplace() {
+        // dst aliases left; the server must hand the backend a writable pointer
+        let mut a = make_remote_tensor(vec![1, 2, 3, 4, 5, 6], vec![2, 3]).unwrap();
+        let b = make_remote_tensor(vec![10, 20, 30], vec![3]).unwrap();
+        a += &b;
+        let expected = Tensor::<i32>::from_buf(vec![11, 22, 33, 14, 25, 36], vec![2, 3]).unwrap();
+        assert_eq!(a.cpu().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_remote_scalar_ops_layouts() {
+        // contiguous
+        let mut t = make_remote_tensor(vec![1, 2, 3, 4, 5, 6], vec![2, 3]).unwrap();
+        t += 1;
+        t *= 2;
+        t -= 4;
+        assert_eq!(t.cpu().unwrap(), Tensor::<i32>::from_buf(vec![0, 2, 4, 6, 8, 10], vec![2, 3]).unwrap());
+
+        // 1d strided: a single column of a row-major matrix
+        let mut t = make_remote_tensor(vec![1, 2, 3, 4, 5, 6], vec![2, 3]).unwrap();
+        {
+            let mut col = t.slice_mut(1, 1).unwrap();
+            col += 100;
+        }
+        assert_eq!(t.cpu().unwrap(), Tensor::<i32>::from_buf(vec![1, 102, 3, 4, 105, 6], vec![2, 3]).unwrap());
+
+        // nd strided: transpose
+        let mut t = make_remote_tensor(vec![2.0f64, 4.0, 6.0, 8.0, 10.0, 12.0], vec![2, 3]).unwrap();
+        {
+            let mut tr = t.transpose_mut();
+            tr /= 2.0;
+        }
+        assert_eq!(t.cpu().unwrap(), Tensor::<f64>::from_buf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap());
+    }
+
+    #[test]
+    fn test_remote_unsupported_op_errors() {
+        let t = make_remote_tensor(vec![1.0f32, 4.0], vec![2]).unwrap();
+        let mut buf = t.backend.copy(&t.buf).unwrap();
+        let err = t.backend.apply_sqrt_contiguous(&mut buf, 0, 2).unwrap_err();
+        assert!(matches!(err, TensorError::UnsupportedOperation(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_remote_bool_roundtrip() {
+        let t = make_remote_tensor(vec![types::boolean(true), types::boolean(false)], vec![2]).unwrap();
+        assert_eq!(t.cpu().unwrap(), Tensor::from_buf(vec![types::boolean(true), types::boolean(false)], vec![2]).unwrap());
     }
 }

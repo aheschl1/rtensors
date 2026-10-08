@@ -3418,7 +3418,7 @@ mod remote_tests {
         let tensor_backend = backend.clone();
         drop(backend); // Release the lock
         
-        Ok(TensorBase::from_parts(tensor_backend, buffer, MetaTensor::new(shape, stride, 0)))
+        Ok(TensorBase::from_parts(tensor_backend, buffer, MetaTensor::new(shape, stride, 0), None))
     }
 
     #[test]
