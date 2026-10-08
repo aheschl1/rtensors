@@ -1,7 +1,6 @@
 use proc_macro::TokenStream;
 
 mod grad;
-mod rpc;
 
 #[proc_macro_attribute]
 /// Attribute macro to mark a routine as requiring an active gradient context.
@@ -133,35 +132,16 @@ pub fn incomplete(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 // #[proc_macro_attribute]
-/// Attribute macro to mark the main entry point of a program that uses gradients.
-/// This macro initializes a gradient context and ensures it is available during the execution of the annotated function.
-/// 
-/// # Usage
-/// ```ignore
-/// #[grad::main(f32, MyBackend)]
-/// fn main() {
-///     // Your code here
-/// }
-/// ```
+// Attribute macro to mark the main entry point of a program that uses gradients.
+// This macro initializes a gradient context and ensures it is available during the execution of the annotated function.
+// 
+// # Usage
+// ```ignore
+// #[grad::main(f32, MyBackend)]
+// fn main() {
+//     // Your code here
+// }
+// ```
 // pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 //     grad::main(attr, item)
 // }
-
-#[proc_macro_attribute]
-/// Attribute macro to generate RPC client routines for each method in an impl block.
-///
-/// # Usage
-///
-/// ```ignore
-/// #[routines(MyRpcEnum)]
-/// impl MyClient {
-///     // ...
-/// }
-/// ```
-///
-/// Optionally, methods can be annotated with `#[rpc(skip)]` to skip codegen, or `#[rpc(extra(...))]` to add extra arguments.
-/// By default, the variant for the method is derived from the method name in CamelCase.
-/// To override the variant name, use `#[rpc(variant(VariantName))]`.
-pub fn routines(attr: TokenStream, item: TokenStream) -> TokenStream {
-    rpc::routines(attr, item)
-}

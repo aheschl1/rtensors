@@ -1,8 +1,6 @@
-#[macro_use]
 pub mod server;
 pub mod client;
 pub mod protocol;
-mod enumdispatch;
 #[cfg(test)]
 mod remote_tests;
 

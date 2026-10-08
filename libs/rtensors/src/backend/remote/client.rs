@@ -1,279 +1,83 @@
-use std::{collections::HashMap, fmt::Debug, io::{Read, Write}, net::IpAddr, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc, Condvar, Mutex, RwLock}};
+use std::{collections::HashMap, fmt::Debug, net::{IpAddr, Shutdown, TcpStream}, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock}};
 
-use crate::{backend::{remote::{get_backend_default, protocol::{Messages, Request, Response, TypelessBuf}}, Backend, BackendMatMul}, core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{DType, TensorValue, WeightValue}, Dim, MetaTensor}, ops::{base::BinaryOpType, linalg::ConvConfig2D, reduction::ReductionOpTypes}};
-use flume;
+use crate::{backend::{remote::{get_backend_default, protocol::{read_frame, write_frame, BufId, Layout, Op, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}}, Backend, BackendMatMul}, core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{TensorValue, WeightValue}, Dim, MetaTensor}, ops::{base::BinaryOpType, linalg::ConvConfig2D, reduction::ReductionOpTypes}};
 
+/// Source of process-unique connection ids, used to catch buffers from one connection being
+/// passed to another (buffer ids are only meaningful within their own connection).
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Handle to a buffer living on a remote server.
+#[derive(Debug, PartialEq, Eq)]
 pub struct RemoteBuf<T: TensorValue> {
-    pub(crate) id: u32,
-    pub(crate) dtype: DType,
-    pub (crate) _marker: std::marker::PhantomData<T>,
+    pub(crate) id: BufId,
+    pub(crate) connection: u64,
+    pub(crate) len: usize,
+    pub(crate) _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: TensorValue> RemoteBuf<T> {
-    #[inline(always)]
-    fn to_typeless(&self) -> TypelessBuf {
-        TypelessBuf {
-            id: self.id,
-            dtype: self.dtype,
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn from_typeless(buf: TypelessBuf) -> Self {
-        Self {
-            id: buf.id,
-            dtype: buf.dtype,
-            _marker: std::marker::PhantomData,
-        }
-    }
+/// Connection state shared between callers and the reader thread. One mutex guards all of it,
+/// so registering a waiter can never race with the reader tearing the connection down.
+#[derive(Default)]
+struct State {
+    /// Callers waiting for the response to a request, keyed by request id.
+    pending: HashMap<u64, flume::Sender<Result<Reply, TensorError>>>,
+    /// First error reported for a fire-and-forget request that has not been surfaced yet.
+    deferred: Option<TensorError>,
+    /// Set once the connection is unusable, with the reason.
+    closed: Option<String>,
 }
 
-impl<T: TensorValue> From<&mut RemoteBuf<T>> for TypelessBuf {
-    fn from(buf: &mut RemoteBuf<T>) -> Self {
-        buf.to_typeless()
-    }
-}
-
-impl<T: TensorValue> From<&RemoteBuf<T>> for TypelessBuf {
-    fn from(buf: &RemoteBuf<T>) -> Self {
-        buf.to_typeless()
-    }
-}
-
-impl<T: TensorValue> From<*const RemoteBuf<T>> for TypelessBuf {
-    fn from(buf: *const RemoteBuf<T>) -> Self {
-        unsafe { (&*buf).to_typeless() }
-    }
-}
-
-impl<T: TensorValue> From<*mut RemoteBuf<T>> for TypelessBuf {
-    fn from(buf: *mut RemoteBuf<T>) -> Self {
-        unsafe { (&*buf).to_typeless() }
-    }
-}
-
-#[derive(Debug)]
-struct PendingHandler {
-    count: Arc<AtomicU32>,
-    cv: Condvar,
-    mutex: Mutex<()>,
-}
-
-impl PendingHandler {
-    fn inc(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
-    }
-    fn dec(&self) {
-        let prev = self.count.fetch_sub(1, Ordering::SeqCst);
-        if prev == 1 {
-            // Take the lock so the notify cannot land between a waiter's check and its wait.
-            let _guard = self.mutex.lock().unwrap();
-            self.cv.notify_all();
-        }
-    }
-    fn sync(&self) {
-        let mut guard = self.mutex.lock().unwrap();
-        while self.count.load(Ordering::SeqCst) > 0 {
-            guard = self.cv.wait(guard).unwrap();
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct RemoteBackend {
+struct Inner {
     remote_addr: IpAddr,
     remote_port: u16,
-    message_id: Arc<AtomicU32>,
-    pending: Arc<PendingHandler>,
-    messages_outgoing_sender: flume::Sender<Request>,
-    messages_outgoing_receiver: flume::Receiver<Request>,
-    pending_response: Arc<RwLock<HashMap<u32, flume::Sender<Messages>>>>,
-    poisoned: Arc<AtomicBool>,
+    connection: u64,
+    next_request: AtomicU64,
+    next_buffer: AtomicU64,
+    state: Arc<Mutex<State>>,
+    /// Write half of the socket. Holding the lock while writing keeps request order equal to
+    /// send order, which the server's in-order execution relies on.
+    writer: OnceLock<Mutex<TcpStream>>,
 }
-    
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Wakes the reader thread with EOF and tells the server to drop this session's buffers.
+        if let Some(writer) = self.writer.get() {
+            if let Ok(stream) = writer.lock() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// Backend that executes every operation on a remote [`super::server::RemoteServer`].
+///
+/// Operations that only mutate remote buffers are pipelined: they return as soon as the request
+/// is written, and the server runs requests in order. If one of them fails, the error is
+/// returned by the next call made on this backend (or by [`RemoteBackend::sync`]).
+#[derive(Clone)]
+pub struct RemoteBackend {
+    inner: Arc<Inner>,
+}
+
 impl Debug for RemoteBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteBackend")
-            .field("remote_addr", &self.remote_addr)
-            .field("remote_port", &self.remote_port)
-            .field("message_id", &self.message_id)
-            .field("pending", &self.pending)
-            .field("pending_response", &self.pending_response)
+            .field("remote_addr", &self.inner.remote_addr)
+            .field("remote_port", &self.inner.remote_port)
+            .field("connection", &self.inner.connection)
             .finish()
     }
 }
 
-impl RemoteBackend {
-    pub fn new_with_address(remote_addr: IpAddr, remote_port: u16) -> Result<Self, std::io::Error> {
-        let pending = PendingHandler {
-            count: Arc::new(AtomicU32::new(0)),
-            cv: Condvar::new(),
-            mutex: Mutex::new(()),
-        };
-        let (sender, receiver) = flume::unbounded();
-        let res = Self {
-            remote_addr,
-            remote_port,
-            pending: Arc::new(pending),
-            message_id: Arc::new(AtomicU32::new(0)),
-            messages_outgoing_sender: sender,
-            messages_outgoing_receiver: receiver,
-            pending_response: Arc::new(RwLock::new(HashMap::new())),
-            poisoned: Arc::new(AtomicBool::new(false)),
-        };
-        Ok(res)
-    }
-
-    fn poison(&self) {
-        self.poisoned.store(true, Ordering::SeqCst);
-    }
-
-    pub fn sync(&self) {
-        self.pending.sync();
-    }
-
-    #[inline(always)]
-    fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::SeqCst)
-    }
-
-    fn send_message(&self, msg: Messages) -> flume::Receiver<Messages>{
-        if self.is_poisoned() {
-            panic!("Attempted to send message on poisoned RemoteBackend. Reasons for poison:
-            1. An asynchronous operation reported an error from the remote backend.
-            2. The RemoteBackend is in an inconsistent state and can no longer process messages safely.");
-        }
-        self.pending.inc();
-        let (sender, receiver) = flume::bounded(1);
-        let mid = self.next_message_id();
-        {
-            let mut pending = self.pending_response.write().unwrap();
-            pending.insert(mid, sender);
-        }
-        let req = Request {
-            task_id: mid,
-            message: msg,
-        };
-        self.messages_outgoing_sender.send(req).expect("Failed to send message to outgoing channel");
-        receiver
-    }
-
-    pub(crate) fn connect(&mut self) -> Result<(), std::io::Error> {
-        let stream = std::net::TcpStream::connect((self.remote_addr, self.remote_port))?;
-        stream.set_nodelay(true)?;
-
-        let read_stream = stream.try_clone()?;
-        let write_stream = stream;
-
-        let remote = self.clone();
-        std::thread::spawn(move || {
-            drain_outgoing(remote, write_stream);
-        });
-        let remote = self.clone();
-        std::thread::spawn(move || {
-            read_incoming(remote, read_stream);
-        });
-        Ok(())
-    }
-
-    pub fn address(&self) -> (IpAddr, u16) {
-        (self.remote_addr, self.remote_port)
-    }
-
-    #[inline(always)]
-    fn next_message_id(&self) -> u32 {
-        self.message_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    }
-
+#[inline]
+fn closed_error(reason: &str) -> TensorError {
+    TensorError::RemoteError(format!("remote connection closed: {reason}"))
 }
 
-// macro_rules! send_recv {
-//     ($self:expr, $message:expr, $response_pattern:pat => $result:expr) => {{
-//         let receiver = $self.send_message($message);
-//         let response = receiver.recv()
-//             .map_err(|_| TensorError::BackendError("Failed to receive response".to_string()))?;
-//         match response {
-//             $response_pattern => $result,
-//             _ => Err(TensorError::BackendError("Unexpected response type".to_string())),
-//         }
-//     }};
-// }
-
-/// Generates `contiguous` / `1d_strided` / `nd` stubs for a unary op the remote protocol
-/// does not support yet. They return `UnsupportedOperation` instead of panicking.
-macro_rules! remote_unsupported_unary {
-    ($($name:ident),+ $(,)?) => {
-        paste::paste! {
-            $(
-                fn [<apply_ $name _nd>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _offset: usize, _shape: &[usize], _stride: &[isize]) -> Result<(), TensorError> {
-                    Err(unsupported(stringify!([<apply_ $name>])))
-                }
-                fn [<apply_ $name _1d_strided>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _offset: usize, _stride: isize, _len: usize) -> Result<(), TensorError> {
-                    Err(unsupported(stringify!([<apply_ $name>])))
-                }
-                fn [<apply_ $name _contiguous>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _start: usize, _len: usize) -> Result<(), TensorError> {
-                    Err(unsupported(stringify!([<apply_ $name>])))
-                }
-            )+
-        }
-    };
-}
-
-/// Same as `remote_unsupported_unary`, for scalar ops (`scalar_apply_*`).
-macro_rules! remote_unsupported_scalar {
-    ($($name:ident),+ $(,)?) => {
-        paste::paste! {
-            $(
-                fn [<scalar_apply_ $name _nd>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _shape: &[usize], _stride: &[isize]) -> Result<(), TensorError> {
-                    Err(unsupported(stringify!([<scalar_apply_ $name>])))
-                }
-                fn [<scalar_apply_ $name _1d_strided>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _stride: isize, _len: usize) -> Result<(), TensorError> {
-                    Err(unsupported(stringify!([<scalar_apply_ $name>])))
-                }
-                fn [<scalar_apply_ $name _contiguous>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _start: usize, _len: usize) -> Result<(), TensorError> {
-                    Err(unsupported(stringify!([<scalar_apply_ $name>])))
-                }
-            )+
-        }
-    };
-}
-
-/// Forwards a `scalar_apply_*` op to the server's `ApplyElementwiseBinary*` messages.
-macro_rules! remote_scalar_binary {
-    ($($name:ident => $op:ident),+ $(,)?) => {
-        paste::paste! {
-            $(
-                fn [<scalar_apply_ $name _nd>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, offset: usize, shape: &[usize], stride: &[isize]) -> Result<(), TensorError> {
-                    self.ack(Messages::ApplyElementwiseBinaryNd {
-                        buf: buf.into(),
-                        op: (BinaryOpType::$op, value.into()),
-                        offset,
-                        shape: shape.to_vec(),
-                        stride: stride.to_vec(),
-                    })
-                }
-                fn [<scalar_apply_ $name _1d_strided>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, offset: usize, stride: isize, len: usize) -> Result<(), TensorError> {
-                    self.ack(Messages::ApplyElementwiseBinary1dStrided {
-                        buf: buf.into(),
-                        op: (BinaryOpType::$op, value.into()),
-                        offset,
-                        stride,
-                        len,
-                    })
-                }
-                fn [<scalar_apply_ $name _contiguous>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, start: usize, len: usize) -> Result<(), TensorError> {
-                    self.ack(Messages::ApplyElementwiseBinaryContiguous {
-                        buf: buf.into(),
-                        op: (BinaryOpType::$op, value.into()),
-                        start,
-                        len,
-                    })
-                }
-            )+
-        }
-    };
+#[inline]
+fn unexpected_reply() -> TensorError {
+    TensorError::RemoteError("received an unexpected reply from the remote server".to_string())
 }
 
 #[inline]
@@ -282,143 +86,310 @@ fn unsupported(op: &str) -> TensorError {
 }
 
 impl RemoteBackend {
-    /// Sends a message whose response carries only a `Result<(), TensorError>`.
-    fn ack(&self, message: Messages) -> Result<(), TensorError> {
-        let receiver = self.send_message(message);
-        match receiver.recv() {
-            Ok(Messages::ApplyElementwiseBinaryNdResponse(result))
-            | Ok(Messages::ApplyElementwiseBinary1dStridedResponse(result))
-            | Ok(Messages::ApplyElementwiseBinaryContiguousResponse(result)) => result,
-            Ok(_) => Err(TensorError::BackendError("Received unexpected RPC response message".to_string())),
-            Err(e) => Err(TensorError::BackendError(format!("Failed to receive RPC response: {}", e))),
+    pub fn new_with_address(remote_addr: IpAddr, remote_port: u16) -> Result<Self, std::io::Error> {
+        Ok(Self {
+            inner: Arc::new(Inner {
+                remote_addr,
+                remote_port,
+                connection: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+                next_request: AtomicU64::new(0),
+                next_buffer: AtomicU64::new(0),
+                state: Arc::new(Mutex::new(State::default())),
+                writer: OnceLock::new(),
+            }),
+        })
+    }
+
+    /// Opens the TCP connection, starts the reader thread and performs the version handshake.
+    pub fn connect(&mut self) -> Result<(), std::io::Error> {
+        if self.inner.writer.get().is_some() {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "remote backend is already connected"));
         }
+        let stream = TcpStream::connect((self.inner.remote_addr, self.inner.remote_port))?;
+        stream.set_nodelay(true)?;
+        let read_stream = stream.try_clone()?;
+        self.inner.writer.set(Mutex::new(stream))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "remote backend is already connected"))?;
+
+        let state = self.inner.state.clone();
+        std::thread::spawn(move || read_incoming(state, read_stream));
+
+        match self.call(Op::Hello { version: PROTOCOL_VERSION }) {
+            Ok(Reply::Ack) => Ok(()),
+            Ok(_) => Err(std::io::Error::other("unexpected handshake reply")),
+            Err(e) => Err(std::io::Error::other(e.to_string())),
+        }
+    }
+
+    pub fn address(&self) -> (IpAddr, u16) {
+        (self.inner.remote_addr, self.inner.remote_port)
+    }
+
+    /// Waits until the server has executed every request sent so far, returning the first
+    /// error any of them produced.
+    pub fn sync(&self) -> Result<(), TensorError> {
+        match self.call(Op::Sync)? {
+            Reply::Ack => Ok(()),
+            _ => Err(unexpected_reply()),
+        }
+    }
+
+    /// Fails fast if the connection is gone or an earlier pipelined request failed.
+    fn check_state(state: &mut State) -> Result<(), TensorError> {
+        if let Some(reason) = &state.closed {
+            return Err(closed_error(reason));
+        }
+        if let Some(e) = state.deferred.take() {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn write(&self, request: &Request) -> Result<(), TensorError> {
+        let writer = self.inner.writer.get()
+            .ok_or_else(|| TensorError::RemoteError("remote backend is not connected".to_string()))?;
+        let mut stream = writer.lock().unwrap();
+        write_frame(&mut *stream, request).inspect_err(|e| {
+            let mut state = self.inner.state.lock().unwrap();
+            state.closed.get_or_insert_with(|| e.to_string());
+            state.pending.clear();
+        })
+    }
+
+    /// Sends a request and waits for its reply.
+    fn call(&self, op: Op) -> Result<Reply, TensorError> {
+        let id = self.inner.next_request.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = flume::bounded(1);
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            Self::check_state(&mut state)?;
+            state.pending.insert(id, tx);
+        }
+        if let Err(e) = self.write(&Request { id, reply: true, op }) {
+            self.inner.state.lock().unwrap().pending.remove(&id);
+            return Err(e);
+        }
+        let result = rx.recv().map_err(|_| {
+            let state = self.inner.state.lock().unwrap();
+            closed_error(state.closed.as_deref().unwrap_or("reader stopped"))
+        })?;
+        // The server answers in order, so any failure of an earlier pipelined request has been
+        // recorded by now. Surface it here rather than letting it go unnoticed.
+        if let Some(e) = self.inner.state.lock().unwrap().deferred.take() {
+            return Err(e);
+        }
+        result
+    }
+
+    /// Sends a request without waiting. Failures are reported by a later call.
+    fn submit(&self, op: Op) -> Result<(), TensorError> {
+        let id = self.inner.next_request.fetch_add(1, Ordering::Relaxed);
+        Self::check_state(&mut self.inner.state.lock().unwrap())?;
+        self.write(&Request { id, reply: false, op })
+    }
+
+    /// Converts a buffer handle for the wire, rejecting handles from another connection.
+    #[inline]
+    fn wire<T: TensorValue>(&self, buf: &RemoteBuf<T>) -> Result<TypelessBuf, TensorError> {
+        if buf.connection != self.inner.connection {
+            return Err(TensorError::RemoteError(
+                "buffer belongs to a different remote connection".to_string(),
+            ));
+        }
+        Ok(TypelessBuf { id: buf.id, dtype: T::DTYPE })
+    }
+
+    /// Reserves a new buffer handle. The server creates the buffer when it executes the request.
+    #[inline]
+    fn new_buf<T: TensorValue>(&self, len: usize) -> RemoteBuf<T> {
+        RemoteBuf {
+            id: self.inner.next_buffer.fetch_add(1, Ordering::Relaxed),
+            connection: self.inner.connection,
+            len,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn unary<T: TensorValue>(&self, buf: &RemoteBuf<T>, op: UnaryOp, layout: Layout) -> Result<(), TensorError> {
+        self.submit(Op::Unary { buf: self.wire(buf)?, op, layout })
+    }
+
+    fn scalar<T: TensorValue>(&self, buf: &RemoteBuf<T>, op: ScalarOp, value: T, layout: Layout) -> Result<(), TensorError> {
+        self.submit(Op::Scalar { buf: self.wire(buf)?, op, value: Value::from_value(value), layout })
     }
 }
 
-#[proc::routines(Messages)]
+/// Implements the `contiguous` / `1d_strided` / `nd` methods of each listed unary op by
+/// forwarding them as `Op::Unary`. Trait bounds such as `T: WeightValue` are enforced by the
+/// trait at the call site; the server re-checks the dtype.
+macro_rules! remote_unary {
+    ($($name:ident => $op:ident),+ $(,)?) => {
+        paste::paste! {
+            $(
+                fn [<apply_ $name _nd>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, offset: usize, shape: &[usize], stride: &[isize]) -> Result<(), TensorError> {
+                    self.unary(buf, UnaryOp::$op, Layout::Nd { offset, shape: shape.to_vec(), stride: stride.to_vec() })
+                }
+                fn [<apply_ $name _1d_strided>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, offset: usize, stride: isize, len: usize) -> Result<(), TensorError> {
+                    self.unary(buf, UnaryOp::$op, Layout::Strided1d { offset, stride, len })
+                }
+                fn [<apply_ $name _contiguous>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, start: usize, len: usize) -> Result<(), TensorError> {
+                    self.unary(buf, UnaryOp::$op, Layout::Contiguous { start, len })
+                }
+            )+
+        }
+    };
+}
+
+/// Same as `remote_unary`, for ops with one scalar operand.
+macro_rules! remote_scalar {
+    ($($name:ident => $op:ident),+ $(,)?) => {
+        paste::paste! {
+            $(
+                fn [<scalar_apply_ $name _nd>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, offset: usize, shape: &[usize], stride: &[isize]) -> Result<(), TensorError> {
+                    self.scalar(buf, ScalarOp::$op, value, Layout::Nd { offset, shape: shape.to_vec(), stride: stride.to_vec() })
+                }
+                fn [<scalar_apply_ $name _1d_strided>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, offset: usize, stride: isize, len: usize) -> Result<(), TensorError> {
+                    self.scalar(buf, ScalarOp::$op, value, Layout::Strided1d { offset, stride, len })
+                }
+                fn [<scalar_apply_ $name _contiguous>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, start: usize, len: usize) -> Result<(), TensorError> {
+                    self.scalar(buf, ScalarOp::$op, value, Layout::Contiguous { start, len })
+                }
+            )+
+        }
+    };
+}
+
 impl Backend for RemoteBackend {
     type Buf<T: TensorValue> = RemoteBuf<T>;
-    #[rpc(skip)]
+
     fn new() -> Self {
         get_backend_default().expect("No default remote backend available")
     }
-    #[rpc(skip)]
-    fn device_type() -> crate::core::primitives::DeviceType {
+
+    fn device_type() -> DeviceType {
         DeviceType::Remote {
             ip: "127.0.0.1".parse().unwrap(),
             port: 7878,
             remote_type: DeviceType::Cpu.into(),
         }
     }
-    fn alloc_from_slice<T: TensorValue>(&self, src: Box<[T]>) -> Result<Self::Buf<T>, crate::core::tensor::TensorError>{unreachable!("Macro implmented")}
-    #[rpc(extra(dtype: DType = T::DTYPE))]
-    fn alloc<T: TensorValue>(&self, len: usize) -> Result<Self::Buf<T>, crate::core::tensor::TensorError>{unreachable!("Macro implmented")}
-    
-    #[rpc(sync)]
-    fn copy_from_slice<T: TensorValue>(&self, dst: &mut Self::Buf<T>, src: &[T]) -> Result<(), crate::core::tensor::TensorError> {unreachable!("Macro implmented")}
-    
-    #[rpc(sync)]
-    fn copy_range_within<T: TensorValue>(&self, dst: &mut Self::Buf<T>, src: &Self::Buf<T>, dst_offset: usize, src_offset: usize, len: usize) -> Result<(), TensorError>{unreachable!("Macro implmented")}
-    
-    #[rpc(sync)]
-    fn read<T: TensorValue>(&self, buf: &Self::Buf<T>, offset: usize) -> Result<T, crate::core::tensor::TensorError> {unreachable!("Macro implmented")}
-    
-    #[rpc(sync)]
-    fn write<T: TensorValue>(&self, buf: &mut Self::Buf<T>, offset: usize, value: T) -> Result<(), crate::core::tensor::TensorError> {unreachable!("Macro implmented")}
-    #[rpc(skip)] // skip because the pattern is different when not Result
-    fn len<T: TensorValue>(&self, buf: &Self::Buf<T>) -> usize {
-        let message = Messages::Len {
-            buf: buf.into(),
-        };
-        let receiver = self.send_message(message);
-        match receiver.recv() {
-            Ok(Messages::LenResponse(len)) => {len},
-            _ => panic!("Failed to get buffer length or unexpected response"),
+
+    fn alloc_from_slice<T: TensorValue>(&self, src: Box<[T]>) -> Result<Self::Buf<T>, TensorError> {
+        let buf = self.new_buf(src.len());
+        self.submit(Op::AllocFromSlice { dst: self.wire(&buf)?, src: Slice::from_boxed_slice(src) })?;
+        Ok(buf)
+    }
+
+    fn alloc<T: TensorValue>(&self, len: usize) -> Result<Self::Buf<T>, TensorError> {
+        let buf = self.new_buf(len);
+        self.submit(Op::Alloc { dst: self.wire(&buf)?, len })?;
+        Ok(buf)
+    }
+
+    fn copy_from_slice<T: TensorValue>(&self, dst: &mut Self::Buf<T>, src: &[T]) -> Result<(), TensorError> {
+        if src.len() != dst.len {
+            return Err(TensorError::SizeMismatch(format!(
+                "copy_from_slice: source has {} elements, destination has {}", src.len(), dst.len
+            )));
+        }
+        self.submit(Op::CopyFromSlice { dst: self.wire(dst)?, src: Slice::from_slice(src) })
+    }
+
+    fn copy_range_within<T: TensorValue>(&self, dst: &mut Self::Buf<T>, src: &Self::Buf<T>, dst_offset: usize, src_offset: usize, len: usize) -> Result<(), TensorError> {
+        self.submit(Op::CopyRangeWithin { dst: self.wire(dst)?, src: self.wire(src)?, dst_offset, src_offset, len })
+    }
+
+    fn read<T: TensorValue>(&self, buf: &Self::Buf<T>, offset: usize) -> Result<T, TensorError> {
+        match self.call(Op::Read { buf: self.wire(buf)?, offset })? {
+            Reply::Value(value) => value.to_value::<T>(),
+            _ => Err(unexpected_reply()),
         }
     }
 
-    #[rpc(sync)]
-    fn copy<T: TensorValue>(&self, src: &Self::Buf<T>) -> Result<Self::Buf<T>, crate::core::tensor::TensorError>{unreachable!("Macro implmented")}
-    
-    #[rpc(sync)]
-    fn dump<T: TensorValue>(&self, src: &Self::Buf<T>) -> Result<Box<[T]>, crate::core::tensor::TensorError>{unreachable!("Macro implmented")}
+    fn write<T: TensorValue>(&self, buf: &mut Self::Buf<T>, offset: usize, value: T) -> Result<(), TensorError> {
+        self.submit(Op::Write { buf: self.wire(buf)?, offset, value: Value::from_value(value) })
+    }
 
-    #[rpc(skip)]
+    fn len<T: TensorValue>(&self, buf: &Self::Buf<T>) -> usize {
+        buf.len
+    }
+
+    fn copy<T: TensorValue>(&self, src: &Self::Buf<T>) -> Result<Self::Buf<T>, TensorError> {
+        let dst = self.new_buf(src.len);
+        self.submit(Op::Copy { src: self.wire(src)?, dst: self.wire(&dst)? })?;
+        Ok(dst)
+    }
+
+    fn dump<T: TensorValue>(&self, src: &Self::Buf<T>) -> Result<Box<[T]>, TensorError> {
+        match self.call(Op::Dump { src: self.wire(src)? })? {
+            Reply::Slice(slice) => slice.to_boxed_slice::<T>(),
+            _ => Err(unexpected_reply()),
+        }
+    }
+
     fn convert<T: TensorValue, N: TensorValue>(&self, _src: &Self::Buf<T>, _dst: &mut Self::Buf<N>) -> Result<(), TensorError> {
         Err(unsupported("convert"))
     }
 
-    #[rpc(skip)]
     fn fill_nd<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _shape: &[usize], _stride: &[isize]) -> Result<(), TensorError> {
         Err(unsupported("fill"))
     }
-    #[rpc(skip)]
     fn fill_1d_strided<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _stride: isize, _len: usize) -> Result<(), TensorError> {
         Err(unsupported("fill"))
     }
-    #[rpc(skip)]
     fn fill_contiguous<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _start: usize, _len: usize) -> Result<(), TensorError> {
         Err(unsupported("fill"))
     }
-    
+
     fn broadcast<T: TensorValue>(
         &self,
-        left: (*const Self::Buf<T>, &crate::core::MetaTensor), 
-        right: (*const Self::Buf<T>, &crate::core::MetaTensor),
-        dst: (*mut Self::Buf<T>, &crate::core::MetaTensor),
-        op: crate::ops::base::BinaryOpType
-    ) -> Result<(), crate::core::tensor::TensorError>{unreachable!("Macro implmented")}
-    fn apply_neg_contiguous<T: TensorValue>(
-        &self, buf: &mut Self::Buf<T>, 
-        start: usize,
-        len: usize
-    ) -> Result<(), TensorError>{unreachable!("Macro implmented")}
-    fn apply_neg_1d_strided<T: TensorValue>(
-        &self, buf: &mut Self::Buf<T>, 
-        offset: usize,
-        stride: isize,
-        len: usize
-    ) -> Result<(), TensorError> {unreachable!("Macro implmented")}
-    fn apply_neg_nd<T: TensorValue>(
-        &self,
-        buf: &mut Self::Buf<T>,
-        offset: usize,
-        shape: &[usize],
-        stride: &[isize],
-    ) -> Result<(), TensorError>{unreachable!("Macro implmented")}
+        left: (*const Self::Buf<T>, &MetaTensor),
+        right: (*const Self::Buf<T>, &MetaTensor),
+        dst: (*mut Self::Buf<T>, &MetaTensor),
+        op: BinaryOpType
+    ) -> Result<(), TensorError> {
+        // SAFETY: the trait requires the caller to pass valid buffer pointers. Only the handles
+        // are read here; the data lives on the server.
+        let (left_buf, right_buf, dst_buf) = unsafe { (&*left.0, &*right.0, &*dst.0) };
+        self.submit(Op::Broadcast {
+            left: (self.wire(left_buf)?, left.1.clone()),
+            right: (self.wire(right_buf)?, right.1.clone()),
+            dst: (self.wire(dst_buf)?, dst.1.clone()),
+            op,
+        })
+    }
 
-    remote_scalar_binary!(add => Add, sub => Sub, mul => Mul, div => Div);
-    remote_unsupported_scalar!(log, log1p, leaky_relu, elu);
-
-    remote_unsupported_unary!(
-        relu, sigmoid, silu, tanh, abs, sqrt, ln, expm1, ln1p, floor, ceil, round, trunc,
-        sin, cos, tan, asin, acos, atan, sinh, cosh, asinh, acosh, atanh,
-        rsqrt, reciprocal, square, cube, exp, sign,
+    remote_unary!(
+        neg => Neg, relu => Relu, sigmoid => Sigmoid, silu => Silu, tanh => Tanh, abs => Abs,
+        sqrt => Sqrt, ln => Ln, expm1 => Expm1, ln1p => Ln1p, floor => Floor, ceil => Ceil,
+        round => Round, trunc => Trunc, sin => Sin, cos => Cos, tan => Tan, asin => Asin,
+        acos => Acos, atan => Atan, sinh => Sinh, cosh => Cosh, asinh => Asinh, acosh => Acosh,
+        atanh => Atanh, rsqrt => Rsqrt, reciprocal => Reciprocal, square => Square, cube => Cube,
+        exp => Exp, sign => Sign,
     );
 
-    #[rpc(skip)]
+    remote_scalar!(
+        add => Add, sub => Sub, mul => Mul, div => Div, log => Log, log1p => Log1p,
+        leaky_relu => LeakyRelu, elu => Elu,
+    );
+
     fn apply_reduce_contiguous_flat<T: WeightValue>(&self, _src: &Self::Buf<T>, _dst: &mut Self::Buf<T>, _start: usize, _len: usize, _op: ReductionOpTypes) -> Result<(), TensorError> {
         Err(unsupported("reduce"))
     }
-    #[rpc(skip)]
     fn apply_reduce_contiguous_nd<T: WeightValue>(&self, _src: (&Self::Buf<T>, &MetaTensor), _dst: (&mut Self::Buf<T>, &MetaTensor), _dim: Dim, _op: ReductionOpTypes) -> Result<(), TensorError> {
         Err(unsupported("reduce"))
     }
-    #[rpc(skip)]
     fn apply_argmax_contiguous_flat<T: WeightValue>(&self, _src: &Self::Buf<T>, _dst: &mut Self::Buf<u64>, _start: usize, _len: usize, _op: ReductionOpTypes) -> Result<(), TensorError> {
         Err(unsupported("argmax"))
     }
-    #[rpc(skip)]
     fn apply_argmax_contiguous_nd<T: WeightValue>(&self, _src: (&Self::Buf<T>, &MetaTensor), _dst: (&mut Self::Buf<u64>, &MetaTensor), _dim: Dim, _op: ReductionOpTypes) -> Result<(), TensorError> {
         Err(unsupported("argmax"))
     }
-    #[rpc(skip)]
     fn apply_conv_2d<T: WeightValue>(&self, _input: (&Self::Buf<T>, &MetaTensor), _kernel: (&Self::Buf<T>, &MetaTensor), _output: &mut Self::Buf<T>, _config: &ConvConfig2D) -> Result<(), TensorError> {
         Err(unsupported("conv_2d"))
     }
 }
 
-#[proc::routines(Messages)]
 impl<T: TensorValue> BackendMatMul<T> for RemoteBackend {
     fn matmul(
         &self,
@@ -429,85 +400,40 @@ impl<T: TensorValue> BackendMatMul<T> for RemoteBackend {
         m: usize,
         k: usize,
         n: usize,
-    ) -> Result<(), TensorError> {unreachable!("Macro implmented")}
-}
-
-#[inline]
-fn read_response(stream: &mut std::net::TcpStream, len_buf: &mut  [u8; 4]) -> Result<Response, Box<bincode::ErrorKind>> {
-    stream.read_exact(len_buf).unwrap();
-    let msg_len = u32::from_le_bytes(*len_buf) as usize;
-    let mut msg_buf = vec![0u8; msg_len];
-    stream.read_exact(&mut msg_buf).unwrap();
-    Response::deserialize(&msg_buf)
-}
-
-#[inline]
-fn send_message_to_channel(remote: &RemoteBackend, msg: Response) {
-    let task_id = msg.task_id;
-    let sender = {
-        let mut pending = remote.pending_response.write().unwrap();
-        pending.remove(&task_id)
-    };
-    if let Some(sender) = sender {
-        sender.send(msg.message).unwrap();
+    ) -> Result<(), TensorError> {
+        self.submit(Op::Matmul {
+            lhs: (self.wire(lhs.0)?, lhs.1.clone(), lhs.2),
+            rhs: (self.wire(rhs.0)?, rhs.1.clone(), rhs.2),
+            dst: self.wire(dst)?,
+            b, m, k, n,
+        })
     }
 }
 
-// todo, make this async
-
-/// Thread function to drain outgoing messages and send them over the TCP stream
-/// # Arguments
-/// * `remote` - The RemoteBackend instance
-/// * `stream` - The TCP stream to send messages over
-fn drain_outgoing(remote: RemoteBackend, mut stream: std::net::TcpStream) {
-    let receiver = remote.messages_outgoing_receiver.clone();
-    loop {        
-        if let Ok(req) = receiver.recv() {
-            if remote.is_poisoned() {
-                break;
+/// Reader thread: routes replies to their waiting callers and records failures of
+/// fire-and-forget requests. On disconnect it wakes every waiter with an error.
+fn read_incoming(state: Arc<Mutex<State>>, mut stream: TcpStream) {
+    let reason = loop {
+        match read_frame::<_, Response>(&mut stream) {
+            Ok(Some(response)) => {
+                let mut state = state.lock().unwrap();
+                match state.pending.remove(&response.id) {
+                    // The waiter may have given up; nothing else to do then.
+                    Some(waiter) => { let _ = waiter.send(response.result); }
+                    None => {
+                        if let Err(e) = response.result {
+                            // Keep the first failure; later ones are usually consequences of it.
+                            state.deferred.get_or_insert(e);
+                        }
+                    }
+                }
             }
-            let serialized = req.serialize().unwrap();
-            let n = serialized.len();
-            let n_bytes = (n as u32).to_le_bytes();
-            stream.write_all(&n_bytes).unwrap();
-            stream.write_all(&serialized).unwrap();
-        } else {
-            // Channel closed, exit thread
-            break;
+            Ok(None) => break "server closed the connection".to_string(),
+            Err(e) => break e.to_string(),
         }
-    }
-}
-
-/// Thread function to read incoming messages from the TCP stream
-/// 
-/// Upon receiving a message, if it is marked as not asynchronous, it sends the message to the waiting channel
-/// Otherwise, it handles asynchronous messages accordingly. If the asynchronous message is complete and does not
-/// indicate an error, it simply decrements the pending count. If it indicates an error, it poisons the RemoteBackend to prevent further operations.
-/// If the asynchronous message is not complete, it sends a follow-up message to the waiting channel, and does not decrement the pending count.
-/// 
-/// # Arguments
-/// * `remote` - The RemoteBackend instance
-/// * `stream` - The TCP stream to read messages from
-fn read_incoming(remote: RemoteBackend, mut stream: std::net::TcpStream) {
-    let mut len_buf = [0u8; 4];
-    loop {
-        let msg = read_response(&mut stream, &mut len_buf).unwrap();
-        if !msg.asynchronous {
-            debug_assert!(msg.complete);
-            send_message_to_channel(&remote, msg);
-            remote.pending.dec();
-        }else if msg.complete {
-            // no need to send follow up, just decrement pending. because, there was an incomplete one before
-            // that sent the message. async followup is just a backend notification.
-            // nobody waits on follow up of async
-            if let Some(e) = msg.error {
-                remote.poison();
-                panic!("Inconsistent state detected. Received error in async message: {:?}", e);
-            } 
-            remote.pending.dec();
-        }else{
-            //send initial follow up to receiver, do not decrement pending yet
-            send_message_to_channel(&remote, msg);
-        }
-    }
+    };
+    let mut state = state.lock().unwrap();
+    state.closed.get_or_insert(reason);
+    // Dropping the senders wakes every waiter with a receive error.
+    state.pending.clear();
 }

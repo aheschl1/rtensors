@@ -581,10 +581,127 @@ mod tests {
 
     #[test]
     fn test_remote_unsupported_op_errors() {
-        let t = make_remote_tensor(vec![1.0f32, 4.0], vec![2]).unwrap();
-        let mut buf = t.backend.copy(&t.buf).unwrap();
-        let err = t.backend.apply_sqrt_contiguous(&mut buf, 0, 2).unwrap_err();
+        let mut t = make_remote_tensor(vec![1.0f32, 4.0], vec![2]).unwrap();
+        let err = t.backend.fill_contiguous(&mut t.buf, 0.0, 0, 2).unwrap_err();
         assert!(matches!(err, TensorError::UnsupportedOperation(_)), "{err:?}");
+    }
+
+    /// A fresh connection, for tests that deliberately leave errors behind.
+    fn own_backend() -> RemoteBackend {
+        setup_server();
+        let mut backend = RemoteBackend::new_with_address(SERVER_IP.parse().unwrap(), SERVER_PORT).unwrap();
+        backend.connect().unwrap();
+        backend
+    }
+
+    #[test]
+    fn test_remote_deferred_error_surfaces_on_next_call() {
+        let backend = own_backend();
+        let mut buf = backend.alloc_from_slice::<i32>(vec![1, 2].into()).unwrap();
+        // Pipelined: returns before the server has run it.
+        backend.write(&mut buf, 10, 5).unwrap();
+        let err = backend.read(&buf, 0).unwrap_err();
+        assert!(matches!(err, TensorError::IdxOutOfBounds(_)), "{err:?}");
+        // Reported once; the connection keeps working afterwards.
+        assert_eq!(backend.read(&buf, 1).unwrap(), 2);
+        backend.write(&mut buf, 10, 5).unwrap();
+        assert!(backend.sync().is_err());
+        backend.sync().unwrap();
+    }
+
+    #[test]
+    fn test_remote_server_panic_is_an_error() {
+        let backend = own_backend();
+        let mut buf = backend.alloc_from_slice::<f32>(vec![-1.0, 2.0].into()).unwrap();
+        // Out-of-range layout makes the CPU kernel panic on the server.
+        backend.apply_relu_contiguous(&mut buf, 0, 1000).unwrap();
+        let err = backend.sync().unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("panicked")), "{err:?}");
+        assert_eq!(&*backend.dump(&buf).unwrap(), &[-1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_remote_rejects_buffer_from_other_connection() {
+        let a = own_backend();
+        let b = own_backend();
+        let buf = a.alloc_from_slice::<i32>(vec![1, 2].into()).unwrap();
+        let err = b.read(&buf, 0).unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("different remote connection")), "{err:?}");
+        assert_eq!(a.read(&buf, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_remote_dtype_mismatch_is_rejected() {
+        let backend = own_backend();
+        let buf = backend.alloc_from_slice::<i32>(vec![1, 2].into()).unwrap();
+        // Forge a handle with the same id but another dtype.
+        let forged = crate::backend::remote::client::RemoteBuf::<f32> {
+            id: buf.id,
+            connection: buf.connection,
+            len: buf.len,
+            _marker: std::marker::PhantomData,
+        };
+        assert!(backend.read(&forged, 0).is_err());
+    }
+
+    #[test]
+    fn test_remote_handshake_version_mismatch() {
+        use crate::backend::remote::protocol::{read_frame, write_frame, Op, Request, Response};
+        setup_server();
+        let mut stream = std::net::TcpStream::connect((SERVER_IP, SERVER_PORT)).unwrap();
+        write_frame(&mut stream, &Request { id: 7, reply: true, op: Op::Hello { version: u32::MAX } }).unwrap();
+        let response: Response = read_frame(&mut stream).unwrap().unwrap();
+        assert_eq!(response.id, 7);
+        assert!(response.result.is_err());
+        // The server hangs up after a failed handshake.
+        assert!(read_frame::<_, Response>(&mut stream).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_remote_unary_ops_match_cpu() {
+        use crate::ops::unary::*;
+        let data = vec![-0.9f64, -0.25, 0.0, 0.3, 0.75];
+        macro_rules! check {
+            ($($op:ident),+) => {$(
+                let mut remote = make_remote_tensor(data.clone(), vec![5]).unwrap();
+                let mut cpu = Tensor::<f64>::from_buf(data.clone(), vec![5]).unwrap();
+                remote.$op();
+                cpu.$op();
+                let got = remote.cpu().unwrap();
+                for i in 0..5 {
+                    let (g, e) = (got.get(&Idx::At(i)).unwrap(), cpu.get(&Idx::At(i)).unwrap());
+                    assert!((g.is_nan() && e.is_nan()) || g == e, "{}: index {i}: {g} != {e}", stringify!($op));
+                }
+            )+};
+        }
+        check!(
+            neg_inplace, relu_inplace, sigmoid_inplace, silu_inplace, tanh_inplace, abs_inplace,
+            sqrt_inplace, ln_inplace, expm1_inplace, ln1p_inplace, floor_inplace, ceil_inplace,
+            round_inplace, trunc_inplace, sin_inplace, cos_inplace, tan_inplace, asin_inplace,
+            acos_inplace, atan_inplace, sinh_inplace, cosh_inplace, asinh_inplace, acosh_inplace,
+            atanh_inplace, rsqrt_inplace, reciprocal_inplace, square_inplace, cube_inplace,
+            exp_inplace, sign_inplace
+        );
+    }
+
+    #[test]
+    fn test_remote_scalar_ops_match_cpu() {
+        use crate::ops::scalar::*;
+        let data = vec![-0.9f32, 0.25, 1.5, 3.0];
+        macro_rules! check {
+            ($($op:ident($v:expr) on $d:expr),+) => {$(
+                let mut remote = make_remote_tensor($d.clone(), vec![4]).unwrap();
+                let mut cpu = Tensor::<f32>::from_buf($d.clone(), vec![4]).unwrap();
+                remote.$op($v);
+                cpu.$op($v);
+                assert_eq!(remote.cpu().unwrap(), cpu, "{}", stringify!($op));
+            )+};
+        }
+        let positive: Vec<f32> = data.iter().map(|x| x.abs()).collect();
+        check!(
+            log_inplace(10.0) on positive, log1p_inplace(10.0) on positive,
+            leaky_relu_inplace(0.1) on data, elu_inplace(0.1) on data
+        );
     }
 
     #[test]
