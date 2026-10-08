@@ -126,20 +126,17 @@ impl<T: TensorValue> RemoteTensor<T> {
     pub fn cpu(&self) -> Result<Tensor<T>, TensorError> {
         let cpu_backend = Cpu;
         let cpu_buffer = self.backend.dump(&self.buf)?;
-        let cpu = Tensor::from_parts(cpu_backend, cpu_buffer, self.meta.clone());
+        let cpu = Tensor::from_parts(cpu_backend, cpu_buffer, self.meta.clone(), self.op());
         Ok(cpu)
     }
 
     pub fn with_remote(ip: IpAddr, port: u16) -> Result<Self, TensorError> {
-        let remote_backend = RemoteBackend::new_with_address(ip, port)
+        let mut remote_backend = RemoteBackend::new_with_address(ip, port)
             .map_err(|e| TensorError::RemoteError(format!("Failed to create remote backend: {}", e)))?;
+        remote_backend.connect()
+            .map_err(|e| TensorError::RemoteError(format!("Failed to connect to remote backend: {}", e)))?;
         let buf = remote_backend.alloc::<T>(0)?;
-        Ok(Self {
-            backend: remote_backend,
-            buf,
-            meta: MetaTensor::new(vec![], vec![], 0),
-            _t: PhantomData,
-        })
+        Ok(Self::from_parts(remote_backend, buf, MetaTensor::new(vec![], vec![], 0), None))
     }
 }
 

@@ -1,10 +1,10 @@
 use std::{collections::HashMap, fmt::Debug, io::{Read, Write}, net::IpAddr, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc, Condvar, Mutex, RwLock}};
 
-use crate::{backend::{remote::{get_backend_default, protocol::{Messages, Request, Response, TypelessBuf}}, Backend, BackendMatMul}, core::{primitives::DeviceType, primops::{Exp, InvExp}, tensor::TensorError, value::{DType, TensorValue}}, ops::reduction::ReductionOpTypes};
+use crate::{backend::{remote::{get_backend_default, protocol::{Messages, Request, Response, TypelessBuf}}, Backend, BackendMatMul}, core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{DType, TensorValue, WeightValue}, Dim, MetaTensor}, ops::{base::BinaryOpType, linalg::ConvConfig2D, reduction::ReductionOpTypes}};
 use flume;
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteBuf<T: TensorValue> {
     pub(crate) id: u32,
     pub(crate) dtype: DType,
@@ -68,13 +68,15 @@ impl PendingHandler {
     fn dec(&self) {
         let prev = self.count.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
+            // Take the lock so the notify cannot land between a waiter's check and its wait.
+            let _guard = self.mutex.lock().unwrap();
             self.cv.notify_all();
         }
     }
     fn sync(&self) {
+        let mut guard = self.mutex.lock().unwrap();
         while self.count.load(Ordering::SeqCst) > 0 {
-            let lock = self.mutex.lock().unwrap();
-            let _unused = self.cv.wait(lock).unwrap();
+            guard = self.cv.wait(guard).unwrap();
         }
     }
 }
@@ -199,7 +201,101 @@ impl RemoteBackend {
 //     }};
 // }
 
-#[rpc_proc::routines(Messages)]
+/// Generates `contiguous` / `1d_strided` / `nd` stubs for a unary op the remote protocol
+/// does not support yet. They return `UnsupportedOperation` instead of panicking.
+macro_rules! remote_unsupported_unary {
+    ($($name:ident),+ $(,)?) => {
+        paste::paste! {
+            $(
+                fn [<apply_ $name _nd>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _offset: usize, _shape: &[usize], _stride: &[isize]) -> Result<(), TensorError> {
+                    Err(unsupported(stringify!([<apply_ $name>])))
+                }
+                fn [<apply_ $name _1d_strided>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _offset: usize, _stride: isize, _len: usize) -> Result<(), TensorError> {
+                    Err(unsupported(stringify!([<apply_ $name>])))
+                }
+                fn [<apply_ $name _contiguous>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _start: usize, _len: usize) -> Result<(), TensorError> {
+                    Err(unsupported(stringify!([<apply_ $name>])))
+                }
+            )+
+        }
+    };
+}
+
+/// Same as `remote_unsupported_unary`, for scalar ops (`scalar_apply_*`).
+macro_rules! remote_unsupported_scalar {
+    ($($name:ident),+ $(,)?) => {
+        paste::paste! {
+            $(
+                fn [<scalar_apply_ $name _nd>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _shape: &[usize], _stride: &[isize]) -> Result<(), TensorError> {
+                    Err(unsupported(stringify!([<scalar_apply_ $name>])))
+                }
+                fn [<scalar_apply_ $name _1d_strided>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _stride: isize, _len: usize) -> Result<(), TensorError> {
+                    Err(unsupported(stringify!([<scalar_apply_ $name>])))
+                }
+                fn [<scalar_apply_ $name _contiguous>]<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _start: usize, _len: usize) -> Result<(), TensorError> {
+                    Err(unsupported(stringify!([<scalar_apply_ $name>])))
+                }
+            )+
+        }
+    };
+}
+
+/// Forwards a `scalar_apply_*` op to the server's `ApplyElementwiseBinary*` messages.
+macro_rules! remote_scalar_binary {
+    ($($name:ident => $op:ident),+ $(,)?) => {
+        paste::paste! {
+            $(
+                fn [<scalar_apply_ $name _nd>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, offset: usize, shape: &[usize], stride: &[isize]) -> Result<(), TensorError> {
+                    self.ack(Messages::ApplyElementwiseBinaryNd {
+                        buf: buf.into(),
+                        op: (BinaryOpType::$op, value.into()),
+                        offset,
+                        shape: shape.to_vec(),
+                        stride: stride.to_vec(),
+                    })
+                }
+                fn [<scalar_apply_ $name _1d_strided>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, offset: usize, stride: isize, len: usize) -> Result<(), TensorError> {
+                    self.ack(Messages::ApplyElementwiseBinary1dStrided {
+                        buf: buf.into(),
+                        op: (BinaryOpType::$op, value.into()),
+                        offset,
+                        stride,
+                        len,
+                    })
+                }
+                fn [<scalar_apply_ $name _contiguous>]<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, start: usize, len: usize) -> Result<(), TensorError> {
+                    self.ack(Messages::ApplyElementwiseBinaryContiguous {
+                        buf: buf.into(),
+                        op: (BinaryOpType::$op, value.into()),
+                        start,
+                        len,
+                    })
+                }
+            )+
+        }
+    };
+}
+
+#[inline]
+fn unsupported(op: &str) -> TensorError {
+    TensorError::UnsupportedOperation(format!("{op} is not supported by the remote backend yet"))
+}
+
+impl RemoteBackend {
+    /// Sends a message whose response carries only a `Result<(), TensorError>`.
+    fn ack(&self, message: Messages) -> Result<(), TensorError> {
+        let receiver = self.send_message(message);
+        match receiver.recv() {
+            Ok(Messages::ApplyElementwiseBinaryNdResponse(result))
+            | Ok(Messages::ApplyElementwiseBinary1dStridedResponse(result))
+            | Ok(Messages::ApplyElementwiseBinaryContiguousResponse(result)) => result,
+            Ok(_) => Err(TensorError::BackendError("Received unexpected RPC response message".to_string())),
+            Err(e) => Err(TensorError::BackendError(format!("Failed to receive RPC response: {}", e))),
+        }
+    }
+}
+
+#[proc::routines(Messages)]
 impl Backend for RemoteBackend {
     type Buf<T: TensorValue> = RemoteBuf<T>;
     #[rpc(skip)]
@@ -208,13 +304,6 @@ impl Backend for RemoteBackend {
     }
     #[rpc(skip)]
     fn device_type() -> crate::core::primitives::DeviceType {
-        // let message = Messages::DeviceType;
-        // let receiver = self.send_message(message);
-        // let response = receiver.recv().unwrap();
-        // match response {
-        //     Messages::DeviceTypeResponse { device_type } => device_type,
-        //     _ => panic!("Unexpected response type"),
-        // }
         DeviceType::Remote {
             ip: "127.0.0.1".parse().unwrap(),
             port: 7878,
@@ -253,6 +342,24 @@ impl Backend for RemoteBackend {
     
     #[rpc(sync)]
     fn dump<T: TensorValue>(&self, src: &Self::Buf<T>) -> Result<Box<[T]>, crate::core::tensor::TensorError>{unreachable!("Macro implmented")}
+
+    #[rpc(skip)]
+    fn convert<T: TensorValue, N: TensorValue>(&self, _src: &Self::Buf<T>, _dst: &mut Self::Buf<N>) -> Result<(), TensorError> {
+        Err(unsupported("convert"))
+    }
+
+    #[rpc(skip)]
+    fn fill_nd<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _shape: &[usize], _stride: &[isize]) -> Result<(), TensorError> {
+        Err(unsupported("fill"))
+    }
+    #[rpc(skip)]
+    fn fill_1d_strided<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _stride: isize, _len: usize) -> Result<(), TensorError> {
+        Err(unsupported("fill"))
+    }
+    #[rpc(skip)]
+    fn fill_contiguous<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _start: usize, _len: usize) -> Result<(), TensorError> {
+        Err(unsupported("fill"))
+    }
     
     fn broadcast<T: TensorValue>(
         &self,
@@ -261,28 +368,6 @@ impl Backend for RemoteBackend {
         dst: (*mut Self::Buf<T>, &crate::core::MetaTensor),
         op: crate::ops::base::BinaryOpType
     ) -> Result<(), crate::core::tensor::TensorError>{unreachable!("Macro implmented")}
-    fn apply_elementwise_binary_contiguous<T: TensorValue>(
-        &self, 
-        buf: &mut Self::Buf<T>, 
-        op: (crate::ops::base::BinaryOpType, T), 
-        start: usize,
-        len: usize
-    ) -> Result<(), crate::core::tensor::TensorError>{unreachable!("Macro implmented")}
-    fn apply_elementwise_binary_1d_strided<T: TensorValue>(
-        &self, buf: &mut Self::Buf<T>, 
-        op: (crate::ops::base::BinaryOpType, T), 
-        offset: usize,
-        stride: isize,
-        len: usize
-    ) -> Result<(), crate::core::tensor::TensorError>{unreachable!("Macro implmented")}
-    fn apply_elementwise_binary_nd<T: TensorValue>(
-        &self,
-        buf: &mut Self::Buf<T>,
-        op: (crate::ops::base::BinaryOpType, T),
-        offset: usize,
-        shape: &[usize],
-        stride: &[isize],
-    ) -> Result<(), TensorError>{unreachable!("Macro implmented")}
     fn apply_neg_contiguous<T: TensorValue>(
         &self, buf: &mut Self::Buf<T>, 
         start: usize,
@@ -301,39 +386,49 @@ impl Backend for RemoteBackend {
         shape: &[usize],
         stride: &[isize],
     ) -> Result<(), TensorError>{unreachable!("Macro implmented")}
-    fn apply_relu_nd<T:TensorValue>(&self,buf: &mut Self::Buf<T>,offset:usize,shape: &[usize],stride: &[isize],) -> Result<(),TensorError> {unreachable!("Macro implmented")}
-    fn apply_relu_1d_strided<T:TensorValue>(&self,buf: &mut Self::Buf<T>,offset:usize,stride:isize,len:usize) -> Result<(),TensorError>{unreachable!("Macro implmented")}
-    fn apply_relu_contiguous<T:TensorValue>(&self,buf: &mut Self::Buf<T>,offset:usize,len:usize) -> Result<(),TensorError> {unreachable!("Macro implmented")}
-    fn apply_sigmoid_nd<T:TensorValue>(&self,buf: &mut Self::Buf<T>,offset:usize,shape: &[usize],stride: &[isize],) -> Result<(),TensorError>where T:InvExp {unreachable!("Macro implmented")}
-    fn apply_sigmoid_1d_strided<T:TensorValue>(&self,buf: &mut Self::Buf<T>,offset:usize,stride:isize,len:usize) -> Result<(),TensorError>where T:InvExp {unreachable!("Macro implmented")}
-    fn apply_sigmoid_contiguous<T:TensorValue>(&self,buf: &mut Self::Buf<T>, offset:usize, len:usize) -> Result<(),TensorError>where T:InvExp {unreachable!("Macro implmented")}
-    fn apply_tanh_nd<T:TensorValue>(&self,buf: &mut Self::Buf<T>,offset:usize,shape: &[usize],stride: &[isize],) -> Result<(),TensorError>where T:Exp {unreachable!("Macro implmented")}
-    fn apply_tanh_1d_strided<T:TensorValue>(&self,buf: &mut Self::Buf<T>,offset:usize,stride:isize,len:usize) -> Result<(),TensorError>where T:Exp {unreachable!("Macro implmented")}
-    fn apply_tanh_contiguous<T:TensorValue>(&self,buf: &mut Self::Buf<T>,offset:usize,len:usize) -> Result<(),TensorError>where T:Exp {unreachable!("Macro implmented")}
 
-    fn apply_reduce_contiguous_flat<T: TensorValue>(
-        &self, 
-        src: &Self::Buf<T>, 
-        dst: &mut Self::Buf<T>, 
-        start: usize, 
-        len: usize, 
-        op: ReductionOpTypes
-    ) -> Result<(), TensorError>{unreachable!("Macro implmented")}
+    remote_scalar_binary!(add => Add, sub => Sub, mul => Mul, div => Div);
+    remote_unsupported_scalar!(log, log1p, leaky_relu, elu);
 
+    remote_unsupported_unary!(
+        relu, sigmoid, silu, tanh, abs, sqrt, ln, expm1, ln1p, floor, ceil, round, trunc,
+        sin, cos, tan, asin, acos, atan, sinh, cosh, asinh, acosh, atanh,
+        rsqrt, reciprocal, square, cube, exp, sign,
+    );
+
+    #[rpc(skip)]
+    fn apply_reduce_contiguous_flat<T: WeightValue>(&self, _src: &Self::Buf<T>, _dst: &mut Self::Buf<T>, _start: usize, _len: usize, _op: ReductionOpTypes) -> Result<(), TensorError> {
+        Err(unsupported("reduce"))
+    }
+    #[rpc(skip)]
+    fn apply_reduce_contiguous_nd<T: WeightValue>(&self, _src: (&Self::Buf<T>, &MetaTensor), _dst: (&mut Self::Buf<T>, &MetaTensor), _dim: Dim, _op: ReductionOpTypes) -> Result<(), TensorError> {
+        Err(unsupported("reduce"))
+    }
+    #[rpc(skip)]
+    fn apply_argmax_contiguous_flat<T: WeightValue>(&self, _src: &Self::Buf<T>, _dst: &mut Self::Buf<u64>, _start: usize, _len: usize, _op: ReductionOpTypes) -> Result<(), TensorError> {
+        Err(unsupported("argmax"))
+    }
+    #[rpc(skip)]
+    fn apply_argmax_contiguous_nd<T: WeightValue>(&self, _src: (&Self::Buf<T>, &MetaTensor), _dst: (&mut Self::Buf<u64>, &MetaTensor), _dim: Dim, _op: ReductionOpTypes) -> Result<(), TensorError> {
+        Err(unsupported("argmax"))
+    }
+    #[rpc(skip)]
+    fn apply_conv_2d<T: WeightValue>(&self, _input: (&Self::Buf<T>, &MetaTensor), _kernel: (&Self::Buf<T>, &MetaTensor), _output: &mut Self::Buf<T>, _config: &ConvConfig2D) -> Result<(), TensorError> {
+        Err(unsupported("conv_2d"))
+    }
 }
 
-#[rpc_proc::routines(Messages)]
+#[proc::routines(Messages)]
 impl<T: TensorValue> BackendMatMul<T> for RemoteBackend {
     fn matmul(
         &self,
-        lhs: (&Self::Buf<T>, &crate::core::MetaTensor),
-        rhs: (&Self::Buf<T>, &crate::core::MetaTensor),
+        lhs: (&Self::Buf<T>, &MetaTensor, ContiguityTypes),
+        rhs: (&Self::Buf<T>, &MetaTensor, ContiguityTypes),
         dst: &mut Self::Buf<T>,
         b: usize,
         m: usize,
         k: usize,
         n: usize,
-        contiguity: crate::core::meta::ContiguityTypes,
     ) -> Result<(), TensorError> {unreachable!("Macro implmented")}
 }
 

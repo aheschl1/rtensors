@@ -84,6 +84,32 @@ impl dyn UntypedTensor {
             (DType::F64, DeviceType::Cuda(_)) => UnknownTensor::F64Cuda(self.typed::<f64, crate::backend::cuda::Cuda>().unwrap()),
             #[cfg(feature = "cuda")]
             (DType::BOOL, DeviceType::Cuda(_)) => UnknownTensor::BOOLCuda(self.typed::<types::boolean, crate::backend::cuda::Cuda>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U8, DeviceType::Remote { .. }) => UnknownTensor::U8Remote(self.typed::<u8, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U16, DeviceType::Remote { .. }) => UnknownTensor::U16Remote(self.typed::<u16, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U32, DeviceType::Remote { .. }) => UnknownTensor::U32Remote(self.typed::<u32, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U64, DeviceType::Remote { .. }) => UnknownTensor::U64Remote(self.typed::<u64, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U128, DeviceType::Remote { .. }) => UnknownTensor::U128Remote(self.typed::<u128, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I8, DeviceType::Remote { .. }) => UnknownTensor::I8Remote(self.typed::<i8, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I16, DeviceType::Remote { .. }) => UnknownTensor::I16Remote(self.typed::<i16, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I32, DeviceType::Remote { .. }) => UnknownTensor::I32Remote(self.typed::<i32, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I64, DeviceType::Remote { .. }) => UnknownTensor::I64Remote(self.typed::<i64, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I128, DeviceType::Remote { .. }) => UnknownTensor::I128Remote(self.typed::<i128, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::F32, DeviceType::Remote { .. }) => UnknownTensor::F32Remote(self.typed::<f32, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::F64, DeviceType::Remote { .. }) => UnknownTensor::F64Remote(self.typed::<f64, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::BOOL, DeviceType::Remote { .. }) => UnknownTensor::BOOLRemote(self.typed::<types::boolean, crate::backend::remote::client::RemoteBackend>().unwrap()),
         }
     }
 
@@ -128,6 +154,32 @@ impl dyn UntypedTensor {
             (DType::F64, DeviceType::Cuda(_)) => UnknownTensorMut::F64Cuda(self.typed_mut::<f64, crate::backend::cuda::Cuda>().unwrap()),
             #[cfg(feature = "cuda")]
             (DType::BOOL, DeviceType::Cuda(_)) => UnknownTensorMut::BOOLCuda(self.typed_mut::<types::boolean, crate::backend::cuda::Cuda>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U8, DeviceType::Remote { .. }) => UnknownTensorMut::U8Remote(self.typed_mut::<u8, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U16, DeviceType::Remote { .. }) => UnknownTensorMut::U16Remote(self.typed_mut::<u16, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U32, DeviceType::Remote { .. }) => UnknownTensorMut::U32Remote(self.typed_mut::<u32, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U64, DeviceType::Remote { .. }) => UnknownTensorMut::U64Remote(self.typed_mut::<u64, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::U128, DeviceType::Remote { .. }) => UnknownTensorMut::U128Remote(self.typed_mut::<u128, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I8, DeviceType::Remote { .. }) => UnknownTensorMut::I8Remote(self.typed_mut::<i8, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I16, DeviceType::Remote { .. }) => UnknownTensorMut::I16Remote(self.typed_mut::<i16, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I32, DeviceType::Remote { .. }) => UnknownTensorMut::I32Remote(self.typed_mut::<i32, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I64, DeviceType::Remote { .. }) => UnknownTensorMut::I64Remote(self.typed_mut::<i64, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::I128, DeviceType::Remote { .. }) => UnknownTensorMut::I128Remote(self.typed_mut::<i128, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::F32, DeviceType::Remote { .. }) => UnknownTensorMut::F32Remote(self.typed_mut::<f32, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::F64, DeviceType::Remote { .. }) => UnknownTensorMut::F64Remote(self.typed_mut::<f64, crate::backend::remote::client::RemoteBackend>().unwrap()),
+            #[cfg(feature = "remote")]
+            (DType::BOOL, DeviceType::Remote { .. }) => UnknownTensorMut::BOOLRemote(self.typed_mut::<types::boolean, crate::backend::remote::client::RemoteBackend>().unwrap()),
         }
     }
 
@@ -222,6 +274,32 @@ pub enum UnknownTensor<'a> {
     F64Cuda(&'a TensorBase<f64, crate::backend::cuda::Cuda>),
     #[cfg(feature = "cuda")]
     BOOLCuda(&'a TensorBase<types::boolean, crate::backend::cuda::Cuda>),
+    #[cfg(feature = "remote")]
+    U8Remote(&'a TensorBase<u8, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    U16Remote(&'a TensorBase<u16, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    U32Remote(&'a TensorBase<u32, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    U64Remote(&'a TensorBase<u64, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    U128Remote(&'a TensorBase<u128, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I8Remote(&'a TensorBase<i8, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I16Remote(&'a TensorBase<i16, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I32Remote(&'a TensorBase<i32, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I64Remote(&'a TensorBase<i64, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I128Remote(&'a TensorBase<i128, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    F32Remote(&'a TensorBase<f32, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    F64Remote(&'a TensorBase<f64, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    BOOLRemote(&'a TensorBase<types::boolean, crate::backend::remote::client::RemoteBackend>),
 }
 
 pub enum UnknownTensorMut<'a> {
@@ -264,6 +342,32 @@ pub enum UnknownTensorMut<'a> {
     F64Cuda(&'a mut TensorBase<f64, crate::backend::cuda::Cuda>),
     #[cfg(feature = "cuda")]
     BOOLCuda(&'a mut TensorBase<types::boolean, crate::backend::cuda::Cuda>),
+    #[cfg(feature = "remote")]
+    U8Remote(&'a mut TensorBase<u8, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    U16Remote(&'a mut TensorBase<u16, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    U32Remote(&'a mut TensorBase<u32, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    U64Remote(&'a mut TensorBase<u64, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    U128Remote(&'a mut TensorBase<u128, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I8Remote(&'a mut TensorBase<i8, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I16Remote(&'a mut TensorBase<i16, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I32Remote(&'a mut TensorBase<i32, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I64Remote(&'a mut TensorBase<i64, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    I128Remote(&'a mut TensorBase<i128, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    F32Remote(&'a mut TensorBase<f32, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    F64Remote(&'a mut TensorBase<f64, crate::backend::remote::client::RemoteBackend>),
+    #[cfg(feature = "remote")]
+    BOOLRemote(&'a mut TensorBase<types::boolean, crate::backend::remote::client::RemoteBackend>),
 }
 
 

@@ -81,7 +81,8 @@ mod tests {
         let mut tensor = TensorBase::from_parts(
             backend, 
             buffer,
-            MetaTensor::new(vec![10, 10], vec![10, 1], 0) 
+            MetaTensor::new(vec![10, 10], vec![10, 1], 0),
+            None,
         );
 
 
