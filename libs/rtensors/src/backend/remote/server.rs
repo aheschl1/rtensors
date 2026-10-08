@@ -1,94 +1,13 @@
-use std::{collections::HashMap, io::{Read, Write}, net::IpAddr, sync::{atomic::AtomicU32, Arc, RwLock}, thread::{self, JoinHandle}};
+//! Remote tensor server. Each client connection gets its own session (buffer store + backend),
+//! executed by one worker thread in request order and dropped when the client disconnects.
 
-use flume::Receiver;
+use std::{collections::HashMap, net::{IpAddr, TcpListener, TcpStream}, thread::{self, JoinHandle}};
 
-use crate::{backend::{cpu::Cpu, remote::{enumdispatch::{dispatch_alloc, dispatch_alloc_from_slice, dispatch_apply_binary_elementwise_1d_strided, dispatch_apply_binary_elementwise_contiguous, dispatch_apply_binary_elementwise_nd, dispatch_apply_neg_1d_strided, dispatch_apply_neg_contiguous, dispatch_apply_neg_nd, dispatch_broadcast, dispatch_copy, dispatch_copy_from_slice, dispatch_dump, dispatch_len, dispatch_matmul, dispatch_read, dispatch_write, dispath_copy_within}, protocol::{Messages, Request, Response, Slice, TypelessBuf}}, Backend}, core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::types, MetaTensor}};
-#[cfg(feature = "cuda")]
-use crate::backend::cuda::Cuda;
+use crate::{backend::{cpu::Cpu, ContiguityTypes, remote::protocol::{read_frame, write_frame, BufId, Layout, Op, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}, Backend, BackendMatMul}, core::{primitives::DeviceType, tensor::TensorError, value::{types, DType, TensorValue}, MetaTensor}};
 
 pub(crate) struct RemoteServer {
     address: IpAddr,
     port: u16
-}
-
-// this is pure evil
-pub(crate) struct BufferCollection<B:Backend> {
-    pub(crate) u8_buffers: HashMap<u32, B::Buf<u8>>,
-    pub(crate) u16_buffers: HashMap<u32, B::Buf<u16>>,
-    pub(crate) u32_buffers: HashMap<u32, B::Buf<u32>>,
-    pub(crate) u64_buffers: HashMap<u32, B::Buf<u64>>,
-    pub(crate) u128_buffers: HashMap<u32, B::Buf<u128>>,
-    pub(crate) i8_buffers: HashMap<u32, B::Buf<i8>>,
-    pub(crate) i16_buffers: HashMap<u32, B::Buf<i16>>,
-    pub(crate) i32_buffers: HashMap<u32, B::Buf<i32>>,
-    pub(crate) i64_buffers: HashMap<u32, B::Buf<i64>>,
-    pub(crate) i128_buffers: HashMap<u32, B::Buf<i128>>,
-    pub(crate) f32_buffers: HashMap<u32, B::Buf<f32>>,
-    pub(crate) f64_buffers: HashMap<u32, B::Buf<f64>>,
-    pub(crate) bool_buffers: HashMap<u32, B::Buf<types::boolean>>,
-}
-
-impl<B: Backend> Default for BufferCollection<B> {
-    fn default() -> Self {
-        Self {
-            u8_buffers: HashMap::new(),
-            u16_buffers: HashMap::new(),
-            u32_buffers: HashMap::new(),
-            u64_buffers: HashMap::new(),
-            u128_buffers: HashMap::new(),
-            i8_buffers: HashMap::new(),
-            i16_buffers: HashMap::new(),
-            i32_buffers: HashMap::new(),
-            i64_buffers: HashMap::new(),
-            i128_buffers: HashMap::new(),
-            f32_buffers: HashMap::new(),
-            f64_buffers: HashMap::new(),
-            bool_buffers: HashMap::new(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ClientConnection {
-    pub(crate) output_messages_sender: flume::Sender<Response>,
-    pub(crate) output_messages_receiver: flume::Receiver<Response>,
-    pub(crate) background_tasks_receiver: flume::Receiver<AsyncJob>,
-    pub(crate) background_tasks_sender: flume::Sender<AsyncJob>,
-    #[cfg(feature = "cuda")]
-    pub(crate) cuda_buffers: Arc<RwLock<BufferCollection<Cuda>>>,
-    pub(crate) cpu_buffers: Arc<RwLock<BufferCollection<Cpu>>>,
-    pub(crate) cpu: Cpu,
-    pub(crate) next_buffer_id: Arc<AtomicU32>,
-    #[cfg(feature = "cuda")]
-    pub(crate) cuda: Cuda,
-}
-
-impl ClientConnection {
-    pub fn new() -> Self {
-        let (output_messages_sender, output_messages_receiver) = flume::unbounded();
-        let (background_tasks_sender, background_tasks_receiver) = flume::unbounded();
-        Self {
-            output_messages_sender,
-            output_messages_receiver,
-            background_tasks_receiver,
-            background_tasks_sender,
-            cpu_buffers: Arc::new(RwLock::new(BufferCollection::default())),
-            #[cfg(feature = "cuda")]
-            cuda_buffers: Arc::new(RwLock::new(BufferCollection::default())),
-            cpu: Cpu::new(),
-            next_buffer_id: Arc::new(AtomicU32::new(0)),
-            #[cfg(feature = "cuda")]
-            cuda: Cuda::new(),
-        }
-    }
-
-    pub fn queue_response(&self, response: Response) -> Result<(), TensorError> {
-        self.output_messages_sender.send(response).map_err(|e| TensorError::RemoteError(format!("Failed to send response: {}", e)))
-    }
-
-    pub fn queue_job(&self, job: AsyncJob) -> Result<(), TensorError> {
-        self.background_tasks_sender.send(job).map_err(|e| TensorError::RemoteError(format!("Failed to send job: {}", e)))
-    }
 }
 
 impl RemoteServer {
@@ -100,18 +19,14 @@ impl RemoteServer {
     }
 
     pub fn serve(&mut self) -> std::io::Result<()> {
-        let listener = std::net::TcpListener::bind((self.address, self.port))?;
+        let listener = TcpListener::bind((self.address, self.port))?;
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let connection = ClientConnection::new();
-                    // launch a new thread 
-                    std::thread::spawn(move || {
-                        handle_connection(connection, stream);
-                    });
+                    thread::spawn(move || handle_connection(stream));
                 }
                 Err(e) => {
-                    eprintln!("Connection failed: {}", e);
+                    tracing::warn!("remote server: connection failed: {e}");
                 }
             }
         }
@@ -119,899 +34,534 @@ impl RemoteServer {
     }
 }
 
-
-#[inline(always)]
-pub(crate) fn select_buffer(_connection: &ClientConnection) -> DeviceType {
-    DeviceType::Cpu
-}
-
-macro_rules! alloc_from_slice_for_dtype {
-    ($slice:expr, $connection:expr, $dtype_variant:ident, $rust_type:ty, $buffer_field:ident) => {{
-        let boxed_slice = $slice.to_boxed_slice::<$rust_type>()?;
-        let device_type = select_buffer($connection);
-        let buffer = match device_type {
-            DeviceType::Cpu => {
-                let buf = $connection.cpu.alloc_from_slice(boxed_slice)?;
-                let buffer_id = $connection.next_buffer_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                $connection.cpu_buffers.write().unwrap().$buffer_field.insert(buffer_id, buf);
-                RemoteBuf {
-                    id: buffer_id,
-                    dtype: DType::$dtype_variant,
-                    _marker: std::marker::PhantomData::<$rust_type>,
-                }
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let buf = $connection.cuda.alloc_from_slice(boxed_slice)?;
-                let buffer_id = $connection.next_buffer_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                $connection.cuda_buffers.write().unwrap().$buffer_field.insert(buffer_id, buf);
-                RemoteBuf {
-                    id: buffer_id,
-                    dtype: DType::$dtype_variant,
-                    _marker: std::marker::PhantomData::<$rust_type>,
-                }
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        };
-        TypelessBuf::from(buffer)
-    }};
-}
-
-macro_rules! alloc_for_dtype {
-    ($len:expr, $connection:expr, $dtype_variant:ident, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        let buffer = match device_type {
-            DeviceType::Cpu => {
-                let buf = $connection.cpu.alloc::<$rust_type>($len)?;
-                let buffer_id = $connection.next_buffer_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                $connection.cpu_buffers.write().unwrap().$buffer_field.insert(buffer_id, buf);
-                RemoteBuf {
-                    id: buffer_id,
-                    dtype: DType::$dtype_variant,
-                    _marker: std::marker::PhantomData::<$rust_type>,
-                }
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let buf = $connection.cuda.alloc::<$rust_type>($len)?;
-                let buffer_id = $connection.next_buffer_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                $connection.cuda_buffers.write().unwrap().$buffer_field.insert(buffer_id, buf);
-                RemoteBuf {
-                    id: buffer_id,
-                    dtype: DType::$dtype_variant,
-                    _marker: std::marker::PhantomData::<$rust_type>,
-                }
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        };
-        TypelessBuf::from(buffer)
-    }};
-}
-
-macro_rules! copy_from_slice_for_dtype {
-    ($dst_id:expr, $src_slice:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let boxed_slice = $src_slice.to_boxed_slice::<$rust_type>()?;
-        let src_slice_ref: &[$rust_type] = &boxed_slice;
-        let device_type = select_buffer($connection);
-        match device_type {
-            DeviceType::Cpu => {
-                let mut buffers = $connection.cpu_buffers.write().unwrap();
-                let dst_buf = buffers.$buffer_field
-                    .get_mut(&$dst_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $dst_id)))?;
-                $connection.cpu.copy_from_slice(dst_buf, src_slice_ref)?;
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let mut buffers = $connection.cuda_buffers.write().unwrap();
-                let dst_buf = buffers.$buffer_field
-                    .get_mut(&$dst_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $dst_id)))?;
-                $connection.cuda.copy_from_slice(dst_buf, src_slice_ref)?;
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        }
-        Ok(())
-    }};
-}
-
-macro_rules! read_for_dtype {
-    ($buf_id:expr, $offset:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        let value = match device_type {
-            DeviceType::Cpu => {
-                let buffers = $connection.cpu_buffers.read().unwrap();
-                let buf = buffers.$buffer_field
-                    .get(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cpu.read(buf, $offset)?
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let buffers = $connection.cuda_buffers.read().unwrap();
-                let buf = buffers.$buffer_field
-                    .get(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cuda.read(buf, $offset)?
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        };
-        crate::backend::remote::protocol::Value::from_value(value)
-    }};
-}
-
-macro_rules! write_for_dtype {
-    ($buf_id:expr, $offset:expr, $value:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        let typed_value = $value.to_value::<$rust_type>()?;
-        match device_type {
-            DeviceType::Cpu => {
-                let mut buffers = $connection.cpu_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cpu.write(buf, $offset, typed_value)?;
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let mut buffers = $connection.cuda_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cuda.write(buf, $offset, typed_value)?;
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        }
-        Ok(())
-    }};
-}
-
-macro_rules! len_for_dtype {
-    ($buf_id:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        match device_type {
-            DeviceType::Cpu => {
-                let buffers = $connection.cpu_buffers.read().unwrap();
-                let buf = buffers.$buffer_field
-                    .get(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cpu.len(buf)
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let buffers = $connection.cuda_buffers.read().unwrap();
-                let buf = buffers.$buffer_field
-                    .get(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cuda.len(buf)
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        }
-    }};
-}
-
-macro_rules! copy_for_dtype {
-    ($buf_id:expr, $connection:expr, $dtype_variant:ident, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        let buffer = match device_type {
-            DeviceType::Cpu => {
-                let buffers = $connection.cpu_buffers.read().unwrap();
-                let src_buf = buffers.$buffer_field
-                    .get(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                let new_buf = $connection.cpu.copy(src_buf)?;
-                let buffer_id = $connection.next_buffer_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                drop(buffers);
-                $connection.cpu_buffers.write().unwrap().$buffer_field.insert(buffer_id, new_buf);
-                RemoteBuf {
-                    id: buffer_id,
-                    dtype: DType::$dtype_variant,
-                    _marker: std::marker::PhantomData::<$rust_type>,
-                }
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let buffers = $connection.cuda_buffers.read().unwrap();
-                let src_buf = buffers.$buffer_field
-                    .get(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                let new_buf = $connection.cuda.copy(src_buf)?;
-                let buffer_id = $connection.next_buffer_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                drop(buffers);
-                $connection.cuda_buffers.write().unwrap().$buffer_field.insert(buffer_id, new_buf);
-                RemoteBuf {
-                    id: buffer_id,
-                    dtype: DType::$dtype_variant,
-                    _marker: std::marker::PhantomData::<$rust_type>,
-                }
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        };
-        TypelessBuf::from(buffer)
-    }};
-}
-
-macro_rules! dump_for_dtype {
-    ($buf_id:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        let boxed_slice = match device_type {
-            DeviceType::Cpu => {
-                let buffers = $connection.cpu_buffers.read().unwrap();
-                let buf = buffers.$buffer_field
-                    .get(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cpu.dump(buf)?
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let buffers = $connection.cuda_buffers.read().unwrap();
-                let buf = buffers.$buffer_field
-                    .get(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cuda.dump(buf)?
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        };
-        Slice::from_boxed_slice(boxed_slice)
-    }};
-}
-
-/// Routes a `BinaryOpType` scalar op to the matching `scalar_apply_*` backend method.
-macro_rules! scalar_binary_call {
-    ($backend:expr, $op:expr, $suffix:ident, $buf:expr, $value:expr, $($args:expr),*) => {
-        paste::paste! {
-            match $op {
-                crate::ops::base::BinaryOpType::Add => $backend.[<scalar_apply_add $suffix>]($buf, $value, $($args),*),
-                crate::ops::base::BinaryOpType::Sub => $backend.[<scalar_apply_sub $suffix>]($buf, $value, $($args),*),
-                crate::ops::base::BinaryOpType::Mul => $backend.[<scalar_apply_mul $suffix>]($buf, $value, $($args),*),
-                crate::ops::base::BinaryOpType::Div => $backend.[<scalar_apply_div $suffix>]($buf, $value, $($args),*),
-            }
-        }
-    };
-}
-
-macro_rules! apply_elementwise_binary_contiguous_for_dtype {
-    ($buf_id:expr, $op:expr, $value:expr, $start:expr, $len:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        let typed_value = $value.to_value::<$rust_type>()?;
-        match device_type {
-            DeviceType::Cpu => {
-                let mut buffers = $connection.cpu_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                scalar_binary_call!($connection.cpu, $op, _contiguous, buf, typed_value, $start, $len)?;
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let mut buffers = $connection.cuda_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                scalar_binary_call!($connection.cuda, $op, _contiguous, buf, typed_value, $start, $len)?;
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        }
-        Ok(())
-    }};
-}
-
-macro_rules! apply_elementwise_binary_1d_strided_for_dtype {
-    ($buf_id:expr, $op:expr, $value:expr, $offset:expr, $stride:expr, $len:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        let typed_value = $value.to_value::<$rust_type>()?;
-        match device_type {
-            DeviceType::Cpu => {
-                let mut buffers = $connection.cpu_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                scalar_binary_call!($connection.cpu, $op, _1d_strided, buf, typed_value, $offset, $stride, $len)?;
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let mut buffers = $connection.cuda_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                scalar_binary_call!($connection.cuda, $op, _1d_strided, buf, typed_value, $offset, $stride, $len)?;
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        }
-        Ok(())
-    }};
-}
-
-macro_rules! apply_elementwise_binary_nd_for_dtype {
-    ($buf_id:expr, $op:expr, $value:expr, $offset:expr, $shape:expr, $stride:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        let typed_value = $value.to_value::<$rust_type>()?;
-        match device_type {
-            DeviceType::Cpu => {
-                let mut buffers = $connection.cpu_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                scalar_binary_call!($connection.cpu, $op, _nd, buf, typed_value, $offset, $shape, $stride)?;
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let mut buffers = $connection.cuda_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                scalar_binary_call!($connection.cuda, $op, _nd, buf, typed_value, $offset, $shape, $stride)?;
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        }
-        Ok(())
-    }};
-}
-
-macro_rules! apply_neg_contiguous_for_dtype {
-    ($buf_id:expr, $start:expr, $len:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        match device_type {
-            DeviceType::Cpu => {
-                let mut buffers = $connection.cpu_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cpu.apply_neg_contiguous(buf, $start, $len)
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let mut buffers = $connection.cuda_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cuda.apply_neg_contiguous(buf, $start, $len)
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()));
-            }
-        }
-    }};
-}
-
-macro_rules! apply_neg_nd_for_dtype {
-    ($buf_id:expr, $offset:expr, $shape:expr, $stride:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        match device_type {
-            DeviceType::Cpu => {
-                let mut buffers = $connection.cpu_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cpu.apply_neg_nd(buf, $offset, $shape, $stride)
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let mut buffers = $connection.cuda_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cuda.apply_neg_nd(buf, $offset, $shape, $stride)
-            },
-            _ => {
-                return Err(TensorError::RemoteError("Unsupported device type".into()))
-            }
-        }
-    }};
-}
-
-macro_rules! apply_neg_1d_strided_for_dtype {
-    ($buf_id:expr, $offset:expr, $stride:expr, $len:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        let device_type = select_buffer($connection);
-        match device_type {
-            DeviceType::Cpu => {
-                let mut buffers = $connection.cpu_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cpu.apply_neg_1d_strided(buf, $offset, $stride, $len)
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let mut buffers = $connection.cuda_buffers.write().unwrap();
-                let buf = buffers.$buffer_field
-                    .get_mut(&$buf_id)
-                    .ok_or_else(|| TensorError::RemoteError(format!("Buffer {} not found", $buf_id)))?;
-                $connection.cuda.apply_neg_1d_strided(buf, $offset, $stride, $len)
-            },
-            _ => {
-                Err(TensorError::RemoteError("Unsupported device type".into()))
-            }
-        }
-    }};
-}
-
-/// Runs `$body` against the per-connection buffer store and backend for the selected device.
-/// Inside `$body`, `$buffers` is the write-locked `BufferCollection` and `$backend` is the backend.
-macro_rules! with_device {
-    ($connection:expr, |$buffers:ident, $backend:ident| $body:expr) => {{
-        match select_buffer($connection) {
-            DeviceType::Cpu => {
-                let mut guard = $connection.cpu_buffers.write().unwrap();
-                let $buffers = &mut *guard;
-                let $backend = &$connection.cpu;
-                $body
-            },
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_device_id) => {
-                let mut guard = $connection.cuda_buffers.write().unwrap();
-                let $buffers = &mut *guard;
-                let $backend = &$connection.cuda;
-                $body
-            },
-            #[allow(unreachable_patterns)]
-            _ => Err(TensorError::RemoteError("Unsupported device type".into())),
-        }
-    }};
-}
-
-/// Looks up a buffer by id and returns a raw mutable pointer to it, so several buffers
-/// (possibly the same one) can be passed to backend routines that accept aliasing pointers.
-macro_rules! buf_ptr {
-    ($buffers:expr, $field:ident, $id:expr, $what:literal) => {
-        $buffers.$field
-            .get_mut(&$id)
-            .map(|b| b as *mut _)
-            .ok_or_else(|| TensorError::RemoteError(format!(concat!($what, " buffer {} not found"), $id)))?
-    };
-}
-
-macro_rules! broadcast_for_dtype {
-    ($left_id:expr, $left_meta:expr, $right_id:expr, $right_meta:expr, $dst_id:expr, $dst_meta:expr, $op:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        with_device!($connection, |buffers, backend| {
-            // Broadcast explicitly allows `dst` to alias `left` (in-place ops), so hand the backend
-            // raw pointers derived from mutable lookups rather than casting shared references.
-            // Each distinct id is looked up exactly once: a second `get_mut` on the same slot would
-            // invalidate the pointer derived from the first.
-            let left_ptr = buf_ptr!(buffers, $buffer_field, $left_id, "Left");
-            let right_ptr = if $right_id == $left_id { left_ptr } else { buf_ptr!(buffers, $buffer_field, $right_id, "Right") };
-            let dst_ptr = if $dst_id == $left_id {
-                left_ptr
-            } else if $dst_id == $right_id {
-                right_ptr
-            } else {
-                buf_ptr!(buffers, $buffer_field, $dst_id, "Dst")
-            };
-            backend.broadcast(
-                (left_ptr as *const _, $left_meta),
-                (right_ptr as *const _, $right_meta),
-                (dst_ptr, $dst_meta),
-                $op
-            )
-        })
-    }};
-}
-
-macro_rules! matmul_for_dtype {
-    ($lhs_id:expr, $lhs_meta:expr, $lhs_contiguity:expr, $rhs_id:expr, $rhs_meta:expr, $rhs_contiguity:expr, $dst_id:expr, $b:expr, $m:expr, $k:expr, $n:expr, $connection:expr, $dtype_variant:ident, $rust_type:ty, $buffer_field:ident) => {{
-        if $dst_id == $lhs_id || $dst_id == $rhs_id {
-            return Err(TensorError::RemoteError("Matmul destination must not alias an input".into()));
-        }
-        with_device!($connection, |buffers, backend| {
-            // lhs and rhs may be the same buffer (e.g. `x @ x`), so they cannot come from get_disjoint_mut.
-            // Look up a shared operand once; a second `get_mut` would invalidate the first pointer.
-            let lhs_ptr = buf_ptr!(buffers, $buffer_field, $lhs_id, "Lhs");
-            let rhs_ptr = if $rhs_id == $lhs_id { lhs_ptr } else { buf_ptr!(buffers, $buffer_field, $rhs_id, "Rhs") };
-            let dst_ptr = buf_ptr!(buffers, $buffer_field, $dst_id, "Dst");
-            // SAFETY: the pointers come from one lookup per distinct id in the locked map, which is not
-            // touched again while they live; dst is distinct from both inputs (checked above), and
-            // lhs/rhs are only read.
-            let (lhs_buf, rhs_buf, dst_buf) = unsafe { (&*lhs_ptr, &*rhs_ptr, &mut *dst_ptr) };
-            backend.matmul(
-                (lhs_buf, $lhs_meta, $lhs_contiguity),
-                (rhs_buf, $rhs_meta, $rhs_contiguity),
-                dst_buf,
-                $b, $m, $k, $n,
-            )
-        })?;
-    }};
-}
-
-macro_rules! copy_within_for_dtype {
-    ($dst_id:expr, $src_id:expr, $dst_offset:expr, $src_offset:expr, $len:expr, $connection:expr, $rust_type:ty, $buffer_field:ident) => {{
-        if $dst_id == $src_id {
-            return Err(TensorError::RemoteError("copy_range_within source and destination must be different buffers".into()));
-        }
-        with_device!($connection, |buffers, backend| {
-            let [Some(dst_buf), Some(src_buf)] = buffers.$buffer_field.get_disjoint_mut([&$dst_id, &$src_id]) else {
-                return Err(TensorError::RemoteError("Buffers missing.".into()));
-            };
-            backend.copy_range_within(dst_buf, src_buf, $dst_offset, $src_offset, $len)
-        })
-    }};
-}
-
-pub(crate) enum AsyncJob {
-    CopyFromSlice {
-        task_id: u32,
-        dst: TypelessBuf,
-        src: Slice,
-    },
-    ApplyElementwiseContiguous {
-        task_id: u32,
-        buf: TypelessBuf,
-        op: (crate::ops::base::BinaryOpType, crate::backend::remote::protocol::Value),
-        start: usize,
-        len: usize,
-    },
-    ApplyElementwise1dStrided {
-        task_id: u32,
-        buf: TypelessBuf,
-        op: (crate::ops::base::BinaryOpType, crate::backend::remote::protocol::Value),
-        offset: usize,
-        stride: isize,
-        len: usize,
-    },
-    ApplyElementwiseNd {
-        task_id: u32,
-        buf: TypelessBuf,
-        op: (crate::ops::base::BinaryOpType, crate::backend::remote::protocol::Value),
-        offset: usize,
-        shape: Vec<usize>,
-        stride: Vec<isize>,
-    },
-    CopyRangeWithin {
-        task_id: u32,
-        dst: TypelessBuf,
-        src: TypelessBuf,
-        dst_offset: usize,
-        src_offset: usize,
-        len: usize,
-    },
-    ApplyNegContiguous {
-        task_id: u32,
-        buf: TypelessBuf,
-        start: usize,
-        len: usize,
-    },
-    ApplyNeg1dStrided {
-        task_id: u32,
-        buf: TypelessBuf,
-        offset: usize,
-        stride: isize,
-        len: usize,
-    },
-    ApplyNegNd {
-        task_id: u32,
-        buf: TypelessBuf,
-        offset: usize,
-        shape: Vec<usize>,
-        stride: Vec<isize>,
-    },
-    Broadcast {
-        task_id: u32,
-        left: (TypelessBuf, MetaTensor),
-        right: (TypelessBuf, MetaTensor),
-        dst: (TypelessBuf, MetaTensor),
-        op: crate::ops::base::BinaryOpType,
-    },
-    MatMul {
-        task_id: u32,
-        lhs: (TypelessBuf, MetaTensor, ContiguityTypes),
-        rhs: (TypelessBuf, MetaTensor, ContiguityTypes),
-        dst: TypelessBuf,
-        b: usize,
-        m: usize,
-        k: usize,
-        n: usize,
-    },
-}
-
-
-#[inline(always)]
-fn handle_request(
-    request: Request, 
-    connection: &ClientConnection,
-){ 
-    macro_rules! async_job {
-        (ack: $message_type:ident, job: $job_type:ident, $($args:tt)*)  => {
-            let response = Response {
-                asynchronous: true,
-                complete: false,
-                task_id: request.task_id,
-                error: None,
-                message: Messages::$message_type(Ok(())),
-            };
-            connection.queue_response(response).expect("Failed to send message");
-
-            let job = AsyncJob::$job_type {
-                task_id: request.task_id,
-                $($args)*
-            };
-            connection.queue_job(job).expect("Failed to queue job");
-        };
-    }
-
-    macro_rules! sync_job {
-        ($message:expr, err: $error:expr) => {
-            let response = Response {
-                asynchronous: false,
-                complete: true,
-                task_id: request.task_id,
-                error: $error,
-                message: $message
-            };
-            connection.queue_response(response).expect("Failed to send message");
-        };
-    }
-
-    match request.message {
-        Messages::DeviceType => {
-            sync_job!(Messages::DeviceTypeResponse { device_type: select_buffer(connection) }, err: None);
-        }
-        Messages::AllocFromSlice { src } => {
-            let remote_buf = dispatch_alloc_from_slice(src, connection);
-            sync_job!(Messages::AllocFromSliceResponse (remote_buf), err: remote_buf.as_ref().err().cloned());
-        },
-        Messages::Alloc { len, dtype } => {
-            let remote_buf = dispatch_alloc(len, dtype, connection);
-            sync_job!(Messages::AllocResponse (remote_buf), err: remote_buf.as_ref().err().cloned());
-        },
-        Messages::CopyFromSlice { dst, src } => {
-            async_job!(ack: CopyFromSliceResponse, job: CopyFromSlice, dst, src);
-        },
-        Messages::Read { buf, offset } => {
-            let value = dispatch_read(buf, offset, connection);
-            sync_job!(Messages::ReadResponse (value), err: value.as_ref().err().cloned());
-        }
-        Messages::Write { buf, offset, value } => {
-            let result = dispatch_write(buf, offset, value, connection);
-            sync_job!(Messages::WriteResponse (result), err: result.as_ref().err().cloned());
-        }
-        Messages::Len { buf } => {
-            let len = dispatch_len(buf, connection);
-            sync_job!(Messages::LenResponse (len.unwrap_or(0)), err: len.as_ref().err().cloned());
-        }
-        Messages::Copy { src } => {
-            let new_buf = dispatch_copy(src, connection);
-            sync_job!(Messages::CopyResponse (new_buf), err: new_buf.as_ref().err().cloned());
-        }
-        Messages::Dump { src } => {
-            let slice = dispatch_dump(src, connection);
-            sync_job!(Messages::DumpResponse (slice), err: slice.as_ref().err().cloned());
-        }
-        Messages::ApplyElementwiseBinaryContiguous { buf, op, start, len } => {
-            async_job!(ack: ApplyElementwiseBinaryContiguousResponse, job: ApplyElementwiseContiguous, buf, op, start, len);
-        }
-        Messages::ApplyElementwiseBinary1dStrided { buf, op, offset, stride, len } => {
-            async_job!(ack: ApplyElementwiseBinary1dStridedResponse, job: ApplyElementwise1dStrided, buf, op, offset, stride, len);
-        }
-        Messages::ApplyElementwiseBinaryNd { buf, op, offset, shape, stride } => {
-            async_job!(ack: ApplyElementwiseBinaryNdResponse, job: ApplyElementwiseNd, buf, op, offset, shape, stride);
-        }
-        Messages::Broadcast { left, right, dst, op } => { 
-            async_job!(ack: BroadcastResponse, job: Broadcast, left, right, dst, op);    
-        }
-        Messages::Matmul { lhs, rhs, dst, b, m, k, n } => {
-            async_job!(ack: MatmulResponse, job: MatMul, lhs, rhs, dst, b, m, k, n);
-        }
-        Messages::ApplyNegContiguous { buf, start, len } => {
-            async_job!(ack: ApplyNegContiguousResponse, job: ApplyNegContiguous, buf, start, len);
-        }
-        Messages::ApplyNeg1dStrided { buf, offset, stride, len } => {
-            async_job!(ack: ApplyNeg1dStridedResponse, job: ApplyNeg1dStrided, buf, offset, stride, len);
-        }
-        Messages::ApplyNegNd { buf, offset, shape, stride } => {
-            async_job!(ack: ApplyNegNdResponse, job: ApplyNegNd, buf, offset, shape, stride);
-        }
-        Messages::CopyRangeWithin { dst, src, dst_offset, src_offset, len } => {
-            async_job!(ack: CopyRangeWithinResponse, job: CopyRangeWithin, dst, src, dst_offset, src_offset, len);
-        }
-
-
-        Messages::DeviceTypeResponse { .. } |
-        Messages::AllocFromSliceResponse { .. } |
-        Messages::AllocResponse { .. } |
-        Messages::CopyFromSliceResponse { .. } |
-        Messages::ReadResponse { .. } |
-        Messages::WriteResponse { .. } |
-        Messages::LenResponse { .. } |
-        Messages::CopyResponse { .. } |
-        Messages::DumpResponse { .. } |
-        Messages::ApplyElementwiseBinary1dStridedResponse { .. } |
-        Messages::ApplyElementwiseBinaryContiguousResponse { .. } |
-        Messages::ApplyElementwiseBinaryNdResponse { .. } |
-        Messages::BroadcastResponse { .. } |
-        Messages::MatmulResponse { .. } |
-        Messages::ApplyNeg1dStridedResponse { .. } |
-        Messages::ApplyNegNdResponse { .. } |
-        Messages::ErrorResponse { .. } |
-        Messages::ActionCompleted { .. } |
-        Messages::CopyRangeWithinResponse { .. } |
-        Messages::ApplyNegContiguousResponse { .. } => {
-            sync_job!(Messages::ErrorResponse { 
-                message: "Unsupported request".to_string() }, err: Some(TensorError::RemoteError("Unsupported request".to_string()))
-            );
-        }
-    }
-}
-
-
-fn drain_messages(mut stream: std::net::TcpStream, receiver: Receiver<Response>) {
-    loop {
-        match receiver.recv() {
-            Ok(response) => {
-                let result: Result<(), TensorError> = || -> Result<(), TensorError> {
-                    let serialized = response.serialize()
-                        .map_err(|e| TensorError::RemoteError(format!("Failed to serialize response: {}", e)))?;
-                    let n = serialized.len() as u32;
-                    stream.write_all(&n.to_le_bytes())
-                        .map_err(|e| TensorError::RemoteError(format!("Failed to write response length: {}", e)))?;
-                    stream.write_all(&serialized)
-                        .map_err(|e| TensorError::RemoteError(format!("Failed to write response: {}", e)))?;
-                    Ok(())
-                }();
-                if let Err(e) = result {
-                    eprintln!("{}", e);
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to receive response: {}", e);
-                break;
-            }
-        }
-    }
-}
-
-fn handle_connection(connection: ClientConnection, mut stream: std::net::TcpStream) {
-    // launch draining thread
-    let stream_inner = stream.try_clone()
-        .expect("Failed to clone stream for draining thread");
-    let receiver = connection.output_messages_receiver.clone();
-    thread::spawn(move || {
-        drain_messages(stream_inner, receiver);
-    });
-    let connection_clone = connection.clone();
-    thread::spawn(move || {
-        drain_background_jobs(connection_clone);
-    });
-    // Handle communication with the client
-    let mut n_buffer = [0u8; 4];
-    loop {
-        // Read from and write to connection.stream
-        match stream.read_exact(&mut n_buffer) {
-            Ok(_) => {
-                let n = u32::from_le_bytes(n_buffer) as usize;
-                let mut data_buffer = vec![0u8; n];
-                match stream.read_exact(&mut data_buffer) {
-                    Ok(_) => {
-                        let request = Request::deserialize(&data_buffer).expect("Failed to deserialize request");
-                        handle_request(request, &connection);
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to read request data: {}", e);
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to read request size: {}", e);
-                break;
-            }
-        }
-    }
-}
-
-fn drain_background_jobs(connection: ClientConnection) {
-    loop {
-        let job = match connection.background_tasks_receiver.recv() {
-            Ok(job) => job,
-            Err(e) => {
-                eprintln!("Failed to receive background job: {}", e);
-                break;
-            }
-        };
-        let task_id = match &job {
-            AsyncJob::CopyFromSlice { task_id, .. } => *task_id,
-            AsyncJob::ApplyElementwiseContiguous { task_id, .. } => *task_id,
-            AsyncJob::ApplyElementwise1dStrided { task_id, .. } => *task_id,
-            AsyncJob::ApplyElementwiseNd { task_id, .. } => *task_id,
-            AsyncJob::Broadcast { task_id, .. } => *task_id,
-            AsyncJob::MatMul { task_id, .. } => *task_id,
-            AsyncJob::ApplyNegContiguous { task_id, .. } => *task_id,
-            AsyncJob::ApplyNeg1dStrided { task_id, .. } => *task_id,
-            AsyncJob::ApplyNegNd { task_id, .. } => *task_id,
-            AsyncJob::CopyRangeWithin { task_id, .. } => *task_id,
-        };
-        let (message, error) = match job {
-            AsyncJob::CopyFromSlice { dst, src, .. } => {
-                let result = dispatch_copy_from_slice(dst, src, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::CopyFromSliceResponse(result), err)
-            },
-            AsyncJob::ApplyElementwiseContiguous { buf, op, start, len, .. } => {
-                let (op_type, value) = op;
-                let result = dispatch_apply_binary_elementwise_contiguous(buf, op_type, value, start, len, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::ApplyElementwiseBinaryContiguousResponse ( result ), err)
-            },
-            AsyncJob::ApplyElementwise1dStrided { buf, op, offset, stride, len, .. } => {
-                let (op_type, value) = op;
-                let result = dispatch_apply_binary_elementwise_1d_strided(buf, op_type, value, offset, stride, len, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::ApplyElementwiseBinary1dStridedResponse ( result ), err)
-            },
-            AsyncJob::ApplyElementwiseNd { buf, op, offset, shape, stride, .. } => {
-                let (op_type, value) = op;
-                let result = dispatch_apply_binary_elementwise_nd(buf, op_type, value, offset, &shape, &stride, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::ApplyElementwiseBinaryNdResponse ( result ), err)
-            },
-            AsyncJob::ApplyNegContiguous { buf, start, len, .. } => {
-                let result = dispatch_apply_neg_contiguous(buf, start, len, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::ApplyNegContiguousResponse ( result ), err)
-            },
-            AsyncJob::ApplyNeg1dStrided { buf, offset, stride, len, .. } => {
-                let result = dispatch_apply_neg_1d_strided(buf, offset, stride, len, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::ApplyNeg1dStridedResponse ( result ), err)
-            },
-            AsyncJob::ApplyNegNd { buf, offset, shape, stride, .. } => {
-                let result = dispatch_apply_neg_nd(buf, offset, &shape, &stride, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::ApplyNegNdResponse ( result ), err)
-            },
-            AsyncJob::Broadcast { left, right, dst, op, .. } => {
-                let result = dispatch_broadcast(left, right, dst, op, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::BroadcastResponse ( result ), err)
-            },
-            AsyncJob::MatMul { lhs, rhs, dst, b, m, k, n, .. } => {
-                let result = dispatch_matmul(lhs, rhs, dst, b, m, k, n, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::MatmulResponse ( result ), err)
-            },
-            AsyncJob::CopyRangeWithin { dst, src, dst_offset, src_offset, len, .. } => {
-                let result = dispath_copy_within(dst, src, dst_offset, src_offset, len, &connection);
-                let err = result.as_ref().err().cloned();
-                (Messages::CopyRangeWithinResponse ( result ), err)
-            }
-        };
-        let completion_response = Response {
-            asynchronous: true,
-            complete: true,
-            task_id,
-            error,
-            message
-        };
-        let _ = connection.queue_response(completion_response);
-    }
-}
-
-/// launch a new server in a background thread listening on the given IP and port
+/// Launches a new server in a background thread listening on the given IP and port.
 pub fn launch_server(ip: IpAddr, port: u16) -> Result<JoinHandle<()>, TensorError> {
     let mut server = RemoteServer::new(ip, port);
     let handle = thread::spawn(move || {
-        server.serve().unwrap();
+        if let Err(e) = server.serve() {
+            tracing::error!("remote server on {ip}:{port} stopped: {e}");
+        }
     });
     Ok(handle)
+}
+
+/// A backend the server can execute every op on.
+pub(crate) trait ServerBackend:
+    Backend
+    + BackendMatMul<u8> + BackendMatMul<u16> + BackendMatMul<u32> + BackendMatMul<u64> + BackendMatMul<u128>
+    + BackendMatMul<i8> + BackendMatMul<i16> + BackendMatMul<i32> + BackendMatMul<i64> + BackendMatMul<i128>
+    + BackendMatMul<f32> + BackendMatMul<f64> + BackendMatMul<types::boolean>
+{
+}
+
+impl<B> ServerBackend for B where
+    B: Backend
+    + BackendMatMul<u8> + BackendMatMul<u16> + BackendMatMul<u32> + BackendMatMul<u64> + BackendMatMul<u128>
+    + BackendMatMul<i8> + BackendMatMul<i16> + BackendMatMul<i32> + BackendMatMul<i64> + BackendMatMul<i128>
+    + BackendMatMul<f32> + BackendMatMul<f64> + BackendMatMul<types::boolean>
+{
+}
+
+/// Generates the type-erased buffer enum and the `Elem` trait that moves typed buffers in and out of it.
+macro_rules! any_buf {
+    ($($variant:ident => $t:ty),+ $(,)?) => {
+        /// A backend buffer of any dtype.
+        pub(crate) enum AnyBuf<B: Backend> {
+            $($variant(B::Buf<$t>)),+
+        }
+
+        /// Element types that can live in an [`AnyBuf`].
+        pub(crate) trait Elem: TensorValue {
+            fn wrap<B: Backend>(buf: B::Buf<Self>) -> AnyBuf<B>;
+            fn get<B: Backend>(buf: &AnyBuf<B>) -> Option<&B::Buf<Self>>;
+            fn get_mut<B: Backend>(buf: &mut AnyBuf<B>) -> Option<&mut B::Buf<Self>>;
+        }
+
+        $(
+            impl Elem for $t {
+                fn wrap<B: Backend>(buf: B::Buf<Self>) -> AnyBuf<B> { AnyBuf::$variant(buf) }
+                #[allow(unreachable_patterns)]
+                fn get<B: Backend>(buf: &AnyBuf<B>) -> Option<&B::Buf<Self>> {
+                    match buf { AnyBuf::$variant(b) => Some(b), _ => None }
+                }
+                #[allow(unreachable_patterns)]
+                fn get_mut<B: Backend>(buf: &mut AnyBuf<B>) -> Option<&mut B::Buf<Self>> {
+                    match buf { AnyBuf::$variant(b) => Some(b), _ => None }
+                }
+            }
+        )+
+    };
+}
+
+any_buf!(
+    U8 => u8, U16 => u16, U32 => u32, U64 => u64, U128 => u128,
+    I8 => i8, I16 => i16, I32 => i32, I64 => i64, I128 => i128,
+    F32 => f32, F64 => f64, Bool => types::boolean,
+);
+
+/// Expands `$body` once per dtype in the chosen class, with `$T` bound to the element type.
+/// Dtypes outside the class produce an `UnsupportedOperation` error naming `$what`.
+macro_rules! dispatch {
+    (@arms $dtype:expr, $what:expr, $T:ident => $body:expr; $($variant:ident => $t:ty),+) => {
+        match $dtype {
+            $(DType::$variant => { type $T = $t; $body })+
+            #[allow(unreachable_patterns)]
+            other => Err(TensorError::UnsupportedOperation(format!("{} is not supported for dtype {:?}", $what, other))),
+        }
+    };
+    (any $dtype:expr, $what:expr, $T:ident => $body:expr) => {
+        dispatch!(@arms $dtype, $what, $T => $body;
+            U8 => u8, U16 => u16, U32 => u32, U64 => u64, U128 => u128,
+            I8 => i8, I16 => i16, I32 => i32, I64 => i64, I128 => i128,
+            F32 => f32, F64 => f64, BOOL => types::boolean)
+    };
+    (signed $dtype:expr, $what:expr, $T:ident => $body:expr) => {
+        dispatch!(@arms $dtype, $what, $T => $body;
+            I8 => i8, I16 => i16, I32 => i32, I64 => i64, I128 => i128, F32 => f32, F64 => f64)
+    };
+    (float $dtype:expr, $what:expr, $T:ident => $body:expr) => {
+        dispatch!(@arms $dtype, $what, $T => $body; F32 => f32, F64 => f64)
+    };
+}
+
+/// Calls the `_contiguous` / `_1d_strided` / `_nd` variant of `$method` matching `$layout`.
+/// `$extra` arguments (e.g. a scalar operand) go between the buffer and the layout arguments.
+macro_rules! with_layout {
+    ($backend:expr, $method:ident, $buf:expr, $layout:expr $(, $extra:expr)*) => {
+        paste::paste! {{
+            // Evaluate the buffer before destructuring the layout, since it may borrow the layout.
+            let buf = $buf;
+            match $layout {
+                Layout::Contiguous { start, len } => $backend.[<$method _contiguous>](buf $(, $extra)*, start, len),
+                Layout::Strided1d { offset, stride, len } => $backend.[<$method _1d_strided>](buf $(, $extra)*, offset, stride, len),
+                Layout::Nd { offset, shape, stride } => $backend.[<$method _nd>](buf $(, $extra)*, offset, &shape, &stride),
+            }
+        }}
+    };
+}
+
+fn missing(id: BufId) -> TensorError {
+    TensorError::RemoteError(format!("buffer {id} does not exist"))
+}
+
+fn wrong_dtype(buf: TypelessBuf, actual: DType) -> TensorError {
+    TensorError::RemoteError(format!("buffer {} has dtype {:?}, request expected {:?}", buf.id, actual, buf.dtype))
+}
+
+fn invalid(msg: String) -> TensorError {
+    TensorError::RemoteError(format!("invalid request: {msg}"))
+}
+
+/// Checks that every element addressed by `offset + sum(i_d * stride_d)` (for `i_d < shape_d`)
+/// lies inside a buffer of `len` elements. Backends index without (or with panicking) bounds
+/// checks, and a panic aborts a release-built server, so requests are validated up front.
+fn check_extent(what: &str, offset: usize, shape: &[usize], stride: &[isize], len: usize) -> Result<(), TensorError> {
+    if shape.len() != stride.len() {
+        return Err(invalid(format!("{what}: shape has {} dims but stride has {}", shape.len(), stride.len())));
+    }
+    if shape.iter().any(|&d| d == 0) {
+        return Ok(());
+    }
+    let (mut lo, mut hi) = (offset as i128, offset as i128);
+    for (&d, &s) in shape.iter().zip(stride) {
+        let span = (d as i128 - 1) * s as i128;
+        if span < 0 { lo += span } else { hi += span }
+    }
+    if lo < 0 || hi >= len as i128 {
+        return Err(invalid(format!("{what}: addresses elements {lo}..={hi} of a buffer with {len} elements")));
+    }
+    Ok(())
+}
+
+/// Same error the CPU backend reports for an out-of-range `read`/`write`.
+fn check_index(offset: usize, len: usize) -> Result<(), TensorError> {
+    if offset >= len {
+        return Err(TensorError::IdxOutOfBounds(format!("Index {offset} out of bounds for buffer of length {len}")));
+    }
+    Ok(())
+}
+
+fn check_layout(layout: &Layout, len: usize) -> Result<(), TensorError> {
+    match layout {
+        Layout::Contiguous { start, len: n } => check_extent("layout", *start, &[*n], &[1], len),
+        Layout::Strided1d { offset, stride, len: n } => check_extent("layout", *offset, &[*n], &[*stride], len),
+        Layout::Nd { offset, shape, stride } => check_extent("layout", *offset, shape, stride, len),
+    }
+}
+
+fn check_meta(what: &str, meta: &MetaTensor, len: usize) -> Result<(), TensorError> {
+    check_extent(what, meta.offset, meta.shape.as_slice(), meta.strides.as_ref(), len)
+}
+
+/// Checks a matmul operand the way the CPU/CUDA kernels address it: `rows x cols` matrices with
+/// one unit-stride dimension (per `contiguity`), `batches` of them `strides[rank - 3]` apart.
+fn check_matmul_operand(
+    what: &str, meta: &MetaTensor, contiguity: &ContiguityTypes, batches: usize, rows: usize, cols: usize, len: usize,
+) -> Result<(), TensorError> {
+    let rank = meta.rank();
+    if rank < 2 {
+        return Err(invalid(format!("{what}: matmul operands need rank >= 2")));
+    }
+    let shape = meta.shape.as_slice();
+    if shape[rank - 2] != rows || shape[rank - 1] != cols {
+        return Err(invalid(format!("{what}: expected a {rows}x{cols} matrix, got shape {shape:?}")));
+    }
+    if shape[..rank - 2].iter().product::<usize>() != batches {
+        return Err(invalid(format!("{what}: batch dims {:?} do not multiply to {batches}", &shape[..rank - 2])));
+    }
+    let strides: &[isize] = meta.strides.as_ref();
+    let (row_stride, col_stride) = (strides[rank - 2], strides[rank - 1]);
+    let unit_ok = match contiguity {
+        ContiguityTypes::RowMajor => col_stride == 1 || cols <= 1,
+        ContiguityTypes::ColumnMajor => row_stride == 1 || rows <= 1,
+        ContiguityTypes::None => false,
+    };
+    if !unit_ok || row_stride < 0 || col_stride < 0 {
+        return Err(invalid(format!("{what}: strides {strides:?} do not match {contiguity:?} layout")));
+    }
+    let batch_stride = if rank > 2 { strides[rank - 3] } else { 0 };
+    // Kernels step through batches by strides[rank - 3] alone, which is only right when the
+    // batch dims collapse into one.
+    let collapsible = (0..rank.saturating_sub(3))
+        .all(|d| shape[d] <= 1 || strides[d] == strides[d + 1] * shape[d + 1] as isize);
+    if batch_stride < 0 || !collapsible {
+        return Err(invalid(format!("{what}: batch dims must be collapsible, got strides {strides:?}")));
+    }
+    let as_batched = [batches, rows, cols];
+    let as_strides = [batch_stride, row_stride, col_stride];
+    check_extent(what, meta.offset, &as_batched, &as_strides, len)
+}
+
+/// Buffers owned by one client connection.
+pub(crate) struct Store<B: Backend> {
+    bufs: HashMap<BufId, AnyBuf<B>>,
+}
+
+impl<B: Backend> Store<B> {
+    fn new() -> Self {
+        Self { bufs: HashMap::new() }
+    }
+
+    fn insert<T: Elem>(&mut self, dst: TypelessBuf, buf: B::Buf<T>) -> Result<(), TensorError> {
+        if dst.dtype != T::DTYPE {
+            return Err(wrong_dtype(dst, T::DTYPE));
+        }
+        if self.bufs.contains_key(&dst.id) {
+            return Err(TensorError::RemoteError(format!("buffer {} already exists", dst.id)));
+        }
+        self.bufs.insert(dst.id, T::wrap(buf));
+        Ok(())
+    }
+
+    fn get<T: Elem>(&self, buf: TypelessBuf) -> Result<&B::Buf<T>, TensorError> {
+        let any = self.bufs.get(&buf.id).ok_or_else(|| missing(buf.id))?;
+        T::get(any).filter(|_| buf.dtype == T::DTYPE).ok_or_else(|| wrong_dtype(buf, dtype_of(any)))
+    }
+
+    fn get_mut<T: Elem>(&mut self, buf: TypelessBuf) -> Result<&mut B::Buf<T>, TensorError> {
+        let any = self.bufs.get_mut(&buf.id).ok_or_else(|| missing(buf.id))?;
+        let actual = dtype_of(any);
+        T::get_mut(any).filter(|_| buf.dtype == T::DTYPE).ok_or_else(|| wrong_dtype(buf, actual))
+    }
+
+    /// Raw pointers to several buffers that may alias one another. Each distinct id is looked up
+    /// exactly once, since a second `get_mut` on the same slot would invalidate the first pointer.
+    fn ptrs<T: Elem, const N: usize>(&mut self, bufs: [TypelessBuf; N]) -> Result<[*mut B::Buf<T>; N], TensorError> {
+        let mut out: [*mut B::Buf<T>; N] = [std::ptr::null_mut(); N];
+        for i in 0..N {
+            out[i] = match (0..i).find(|&j| bufs[j].id == bufs[i].id) {
+                Some(j) => out[j],
+                None => self.get_mut::<T>(bufs[i])? as *mut _,
+            };
+        }
+        Ok(out)
+    }
+}
+
+fn dtype_of<B: Backend>(buf: &AnyBuf<B>) -> DType {
+    match buf {
+        AnyBuf::U8(_) => DType::U8, AnyBuf::U16(_) => DType::U16, AnyBuf::U32(_) => DType::U32,
+        AnyBuf::U64(_) => DType::U64, AnyBuf::U128(_) => DType::U128, AnyBuf::I8(_) => DType::I8,
+        AnyBuf::I16(_) => DType::I16, AnyBuf::I32(_) => DType::I32, AnyBuf::I64(_) => DType::I64,
+        AnyBuf::I128(_) => DType::I128, AnyBuf::F32(_) => DType::F32, AnyBuf::F64(_) => DType::F64,
+        AnyBuf::Bool(_) => DType::BOOL,
+    }
+}
+
+/// One client's backend and buffers.
+pub(crate) struct Session<B: ServerBackend> {
+    backend: B,
+    store: Store<B>,
+    device: DeviceType,
+}
+
+impl<B: ServerBackend> Session<B> {
+    fn new(backend: B, device: DeviceType) -> Self {
+        Self { backend, store: Store::new(), device }
+    }
+
+    fn execute(&mut self, op: Op) -> Result<Reply, TensorError> {
+        let Self { backend, store, device } = self;
+        match op {
+            Op::Hello { .. } => Err(TensorError::RemoteError("unexpected second handshake".into())),
+            Op::Sync => Ok(Reply::Ack),
+            Op::DeviceType => Ok(Reply::DeviceType(device.clone())),
+            Op::Alloc { dst, len } => dispatch!(any dst.dtype, "alloc", T => {
+                let buf = backend.alloc::<T>(len)?;
+                store.insert::<T>(dst, buf).map(|_| Reply::Ack)
+            }),
+            Op::AllocFromSlice { dst, src } => dispatch!(any dst.dtype, "alloc_from_slice", T => {
+                let buf = backend.alloc_from_slice::<T>(src.to_boxed_slice::<T>()?)?;
+                store.insert::<T>(dst, buf).map(|_| Reply::Ack)
+            }),
+            Op::CopyFromSlice { dst, src } => dispatch!(any dst.dtype, "copy_from_slice", T => {
+                let data = src.to_boxed_slice::<T>()?;
+                let buf = store.get_mut::<T>(dst)?;
+                if backend.len(buf) != data.len() {
+                    return Err(TensorError::SizeMismatch(format!(
+                        "copy_from_slice: source has {} elements, destination has {}", data.len(), backend.len(buf)
+                    )));
+                }
+                backend.copy_from_slice(buf, &data).map(|_| Reply::Ack)
+            }),
+            Op::CopyRangeWithin { dst, src, dst_offset, src_offset, len } => dispatch!(any dst.dtype, "copy_range_within", T => {
+                if dst.id == src.id {
+                    return Err(TensorError::RemoteError("copy_range_within source and destination must be different buffers".into()));
+                }
+                let [dst_ptr, src_ptr] = store.ptrs::<T, 2>([dst, src])?;
+                // SAFETY (for the lengths below too): the pointers come from the store, which is
+                // not touched while they are in use.
+                let (dst_len, src_len) = unsafe { (backend.len(&*dst_ptr), backend.len(&*src_ptr)) };
+                check_extent("copy_range_within dst", dst_offset, &[len], &[1], dst_len)?;
+                check_extent("copy_range_within src", src_offset, &[len], &[1], src_len)?;
+                // SAFETY: distinct ids, so the pointers refer to different buffers in the store,
+                // which is not touched while they are in use.
+                let (dst_buf, src_buf) = unsafe { (&mut *dst_ptr, &*src_ptr) };
+                backend.copy_range_within(dst_buf, src_buf, dst_offset, src_offset, len).map(|_| Reply::Ack)
+            }),
+            Op::Read { buf, offset } => dispatch!(any buf.dtype, "read", T => {
+                let src = store.get::<T>(buf)?;
+                check_index(offset, backend.len(src))?;
+                let value = backend.read(src, offset)?;
+                Ok(Reply::Value(Value::from_value(value)))
+            }),
+            Op::Write { buf, offset, value } => dispatch!(any buf.dtype, "write", T => {
+                let value = value.to_value::<T>()?;
+                let dst = store.get_mut::<T>(buf)?;
+                check_index(offset, backend.len(dst))?;
+                backend.write(dst, offset, value).map(|_| Reply::Ack)
+            }),
+            Op::Copy { src, dst } => dispatch!(any src.dtype, "copy", T => {
+                let copy = backend.copy(store.get::<T>(src)?)?;
+                store.insert::<T>(dst, copy).map(|_| Reply::Ack)
+            }),
+            Op::Dump { src } => dispatch!(any src.dtype, "dump", T => {
+                let data = backend.dump(store.get::<T>(src)?)?;
+                Ok(Reply::Slice(Slice::from_boxed_slice(data)))
+            }),
+            Op::Broadcast { left, right, dst, op } => dispatch!(any dst.0.dtype, "broadcast", T => {
+                if left.1.shape != dst.1.shape || right.1.shape != dst.1.shape {
+                    return Err(invalid(format!(
+                        "broadcast operands must be pre-broadcast to the output shape {:?}", dst.1.shape
+                    )));
+                }
+                let [left_ptr, right_ptr, dst_ptr] = store.ptrs::<T, 3>([left.0, right.0, dst.0])?;
+                // SAFETY: pointers into the store, which is not touched while they are in use.
+                unsafe {
+                    check_meta("broadcast left", &left.1, backend.len(&*left_ptr))?;
+                    check_meta("broadcast right", &right.1, backend.len(&*right_ptr))?;
+                    check_meta("broadcast dst", &dst.1, backend.len(&*dst_ptr))?;
+                }
+                // Broadcast explicitly allows dst to alias an input and works on raw pointers.
+                backend.broadcast(
+                    (left_ptr as *const _, &left.1),
+                    (right_ptr as *const _, &right.1),
+                    (dst_ptr, &dst.1),
+                    op,
+                ).map(|_| Reply::Ack)
+            }),
+            Op::Matmul { lhs, rhs, dst, b, m, k, n } => dispatch!(any dst.dtype, "matmul", T => {
+                if dst.id == lhs.0.id || dst.id == rhs.0.id {
+                    return Err(TensorError::RemoteError("matmul destination must not alias an input".into()));
+                }
+                let [lhs_ptr, rhs_ptr, dst_ptr] = store.ptrs::<T, 3>([lhs.0, rhs.0, dst])?;
+                // SAFETY: one lookup per distinct id; dst is distinct from both inputs and the
+                // inputs (which may be the same buffer, e.g. `x @ x`) are only read.
+                let (lhs_buf, rhs_buf, dst_buf) = unsafe { (&*lhs_ptr, &*rhs_ptr, &mut *dst_ptr) };
+                if lhs.1.rank() != rhs.1.rank() {
+                    return Err(invalid("matmul operands must have the same rank".into()));
+                }
+                if lhs.2 != rhs.2 && !matches!(T::DTYPE, DType::F32 | DType::F64) {
+                    // The generic (non-BLAS) kernels only handle matching layouts.
+                    return Err(TensorError::UnsupportedOperation(format!(
+                        "matmul with {:?} x {:?} operands for dtype {:?}", lhs.2, rhs.2, T::DTYPE
+                    )));
+                }
+                check_matmul_operand("matmul lhs", &lhs.1, &lhs.2, b, m, k, backend.len(lhs_buf))?;
+                check_matmul_operand("matmul rhs", &rhs.1, &rhs.2, b, k, n, backend.len(rhs_buf))?;
+                let out = b.checked_mul(m).and_then(|x| x.checked_mul(n))
+                    .ok_or_else(|| invalid("matmul output size overflows".into()))?;
+                if backend.len(dst_buf) < out {
+                    return Err(invalid(format!("matmul dst has {} elements, needs {out}", backend.len(dst_buf))));
+                }
+                <B as BackendMatMul<T>>::matmul(
+                    backend,
+                    (lhs_buf, &lhs.1, lhs.2),
+                    (rhs_buf, &rhs.1, rhs.2),
+                    dst_buf,
+                    b, m, k, n,
+                ).map(|_| Reply::Ack)
+            }),
+            Op::Unary { buf, op, layout } => unary(backend, store, buf, op, layout).map(|_| Reply::Ack),
+            Op::Scalar { buf, op, value, layout } => scalar(backend, store, buf, op, value, layout).map(|_| Reply::Ack),
+        }
+    }
+}
+
+/// Generates `float_unary`, which maps each listed float-only unary op to its backend method.
+macro_rules! float_unary_ops {
+    ($($op:ident => $method:ident),+ $(,)?) => {
+        fn float_unary<B: ServerBackend, T: Elem + crate::core::value::WeightValue>(
+            backend: &B, buf: &mut B::Buf<T>, op: UnaryOp, layout: Layout,
+        ) -> Result<(), TensorError> {
+            match op {
+                $(UnaryOp::$op => with_layout!(backend, $method, buf, layout),)+
+                other => Err(TensorError::UnsupportedOperation(format!("{} is not a float-only unary op", other.name()))),
+            }
+        }
+    };
+}
+
+float_unary_ops!(
+    Sigmoid => apply_sigmoid, Silu => apply_silu, Tanh => apply_tanh, Sqrt => apply_sqrt,
+    Ln => apply_ln, Expm1 => apply_expm1, Ln1p => apply_ln1p, Floor => apply_floor,
+    Ceil => apply_ceil, Round => apply_round, Trunc => apply_trunc, Sin => apply_sin,
+    Cos => apply_cos, Tan => apply_tan, Asin => apply_asin, Acos => apply_acos,
+    Atan => apply_atan, Sinh => apply_sinh, Cosh => apply_cosh, Asinh => apply_asinh,
+    Acosh => apply_acosh, Atanh => apply_atanh, Rsqrt => apply_rsqrt,
+    Reciprocal => apply_reciprocal, Square => apply_square, Cube => apply_cube,
+    Exp => apply_exp, Sign => apply_sign,
+);
+
+/// Looks up the buffer an elementwise op writes and checks the layout stays inside it.
+fn target<'a, B: ServerBackend, T: Elem>(backend: &B, store: &'a mut Store<B>, buf: TypelessBuf, layout: &Layout) -> Result<&'a mut B::Buf<T>, TensorError> {
+    let target = store.get_mut::<T>(buf)?;
+    check_layout(layout, backend.len(target))?;
+    Ok(target)
+}
+
+fn unary<B: ServerBackend>(backend: &B, store: &mut Store<B>, buf: TypelessBuf, op: UnaryOp, layout: Layout) -> Result<(), TensorError> {
+    match op {
+        UnaryOp::Neg => dispatch!(signed buf.dtype, op.name(), T => with_layout!(backend, apply_neg, target::<B, T>(backend, store, buf, &layout)?, layout)),
+        UnaryOp::Relu => dispatch!(any buf.dtype, op.name(), T => with_layout!(backend, apply_relu, target::<B, T>(backend, store, buf, &layout)?, layout)),
+        UnaryOp::Abs => dispatch!(any buf.dtype, op.name(), T => with_layout!(backend, apply_abs, target::<B, T>(backend, store, buf, &layout)?, layout)),
+        _ => dispatch!(float buf.dtype, op.name(), T => float_unary::<B, T>(backend, target::<B, T>(backend, store, buf, &layout)?, op, layout)),
+    }
+}
+
+fn scalar<B: ServerBackend>(backend: &B, store: &mut Store<B>, buf: TypelessBuf, op: ScalarOp, value: Value, layout: Layout) -> Result<(), TensorError> {
+    macro_rules! run {
+        ($class:ident, $method:ident) => {
+            dispatch!($class buf.dtype, op.name(), T => {
+                let value = value.to_value::<T>()?;
+                with_layout!(backend, $method, target::<B, T>(backend, store, buf, &layout)?, layout, value)
+            })
+        };
+    }
+    match op {
+        ScalarOp::Add => run!(any, scalar_apply_add),
+        ScalarOp::Sub => run!(any, scalar_apply_sub),
+        ScalarOp::Mul => run!(any, scalar_apply_mul),
+        ScalarOp::Div => run!(any, scalar_apply_div),
+        ScalarOp::LeakyRelu => run!(any, scalar_apply_leaky_relu),
+        ScalarOp::Log => run!(float, scalar_apply_log),
+        ScalarOp::Log1p => run!(float, scalar_apply_log1p),
+        ScalarOp::Elu => run!(float, scalar_apply_elu),
+    }
+}
+
+/// Backend selected for a connection.
+enum DeviceSession {
+    Cpu(Session<Cpu>),
+}
+
+impl DeviceSession {
+    fn execute(&mut self, op: Op) -> Result<Reply, TensorError> {
+        match self {
+            DeviceSession::Cpu(session) => session.execute(op),
+        }
+    }
+}
+
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
+    panic.downcast_ref::<&str>().copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+/// Reads requests on the calling thread and executes them in order on a worker thread, so slow
+/// ops don't stop the socket from being drained. Returning drops the session and its buffers.
+fn handle_connection(stream: TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("remote server: failed to clone stream: {e}");
+            return;
+        }
+    };
+    let (tx, rx) = flume::unbounded::<Request>();
+
+    let worker = thread::spawn(move || {
+        let mut session: Option<DeviceSession> = None;
+        for request in rx.iter() {
+            let id = request.id;
+            let reply = request.reply;
+            let result = match (&mut session, request.op) {
+                (None, Op::Hello { version }) if version == PROTOCOL_VERSION => {
+                    session = Some(DeviceSession::Cpu(Session::new(Cpu::new(), DeviceType::Cpu)));
+                    Ok(Reply::Ack)
+                }
+                (None, Op::Hello { version }) => Err(TensorError::RemoteError(format!(
+                    "protocol version mismatch: client speaks {version}, server speaks {PROTOCOL_VERSION}"
+                ))),
+                (None, _) => Err(TensorError::RemoteError("handshake required before any other request".into())),
+                // Requests are validated before they reach the backend, so a panic here is a backend
+                // bug. With unwinding it becomes an error for this request; note that a server built
+                // with `panic = "abort"` (this workspace's release profile) still aborts.
+                (Some(session), op) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.execute(op)))
+                    .unwrap_or_else(|panic| Err(TensorError::RemoteError(format!("server panicked: {}", panic_message(&panic))))),
+            };
+            let handshake_failed = session.is_none();
+            // Fire-and-forget requests only hear back when they fail.
+            if reply || result.is_err() {
+                if let Err(e) = write_frame(&mut writer, &Response { id, result }) {
+                    tracing::warn!("remote server: failed to send response: {e}");
+                    break;
+                }
+            }
+            if handshake_failed {
+                break;
+            }
+        }
+        let _ = writer.shutdown(std::net::Shutdown::Both);
+    });
+
+    let mut reader = stream;
+    loop {
+        match read_frame::<_, Request>(&mut reader) {
+            Ok(Some(request)) => {
+                if tx.send(request).is_err() {
+                    break; // worker stopped
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("remote server: dropping connection: {e}");
+                break;
+            }
+        }
+    }
+    drop(tx);
+    let _ = worker.join();
 }

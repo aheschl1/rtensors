@@ -1,7 +1,28 @@
-use serde::{Deserialize, Serialize};
+//! Wire protocol shared by the remote client and server.
+//!
+//! Every frame is a little-endian `u64` byte length followed by a bincode payload. The client
+//! sends [`Request`]s and the server answers with [`Response`]s. The server executes requests
+//! strictly in the order they arrive, so a request never observes a buffer before every earlier
+//! request has finished with it. That ordering is what lets most operations be fire-and-forget:
+//! only requests with `reply: true` get a response on success, while a failing request always
+//! gets one so the client can surface the error.
 
-use crate::{backend::remote::client::RemoteBuf, core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{DType, TensorValue}, MetaTensor}, ops::base::BinaryOpType};
+use std::io::{Read, Write};
 
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+use crate::{core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{DType, TensorValue}, MetaTensor}, ops::base::BinaryOpType};
+
+/// Bumped whenever the wire format changes; client and server must agree.
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
+
+/// Upper bound on a single frame. Frames are read incrementally, so this only guards against
+/// nonsensical length prefixes rather than reserving memory up front.
+pub(crate) const MAX_FRAME_BYTES: u64 = 1 << 40;
+
+/// Identifies a buffer within one connection. Chosen by the client so allocations can be
+/// pipelined without waiting for the server.
+pub(crate) type BufId = u64;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Slice {
@@ -17,12 +38,6 @@ fn validate_bytes(dtype: DType, data: &[u8]) -> Result<(), TensorError> {
         return Err(TensorError::BackendError("Invalid boolean byte in payload".to_string()));
     }
     Ok(())
-}
-
-impl<T: TensorValue> From<Slice> for Result<Box<[T]>, TensorError> {
-    fn from(val: Slice) -> Self {
-        val.to_boxed_slice::<T>()
-    }
 }
 
 impl Slice {
@@ -77,30 +92,10 @@ impl Slice {
 }
 
 
-impl<T: TensorValue> From<Box<[T]>> for Slice {
-    fn from(boxed: Box<[T]>) -> Self {
-        Slice::from_boxed_slice(boxed)
-    }
-}
-
-
-impl<T: TensorValue> From<&[T]> for Slice {
-    fn from(slice: &[T]) -> Self {
-        Slice::from_slice(slice)
-    }
-}
-
-
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Value {
     data: Vec<u8>, // bytes
     dtype: DType,
-}
-
-impl<T: TensorValue> From<Value> for Result<T, TensorError> {
-    fn from(val: Value) -> Self {
-        val.to_value::<T>()
-    }
 }
 
 impl Value {
@@ -137,213 +132,93 @@ impl Slice {
     }
 }
 
-impl<T: TensorValue> From<T> for Value {
-    fn from(value: T) -> Self {
-        Value::from_value(value)
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TypelessBuf {
-    pub(crate) id: u32,
+    pub(crate) id: BufId,
     pub(crate) dtype: DType,
 }
 
-impl<T: TensorValue> From<TypelessBuf> for Result<RemoteBuf<T>, TensorError> {
-    fn from(val: TypelessBuf) -> Self {
-        Ok(RemoteBuf::from_typeless(val))
-    }
+/// Memory layout of the elements an elementwise op touches, mirroring the
+/// `_contiguous` / `_1d_strided` / `_nd` method families of [`crate::backend::Backend`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub(crate) enum Layout {
+    Contiguous { start: usize, len: usize },
+    Strided1d { offset: usize, stride: isize, len: usize },
+    Nd { offset: usize, shape: Vec<usize>, stride: Vec<isize> },
 }
 
+/// Defines an op enum together with its snake_case name, used for error messages.
+macro_rules! op_enum {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident => $method:ident),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum $name {
+            $($variant),+
+        }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct Response {
-    pub(crate) asynchronous: bool,
-    pub(crate) complete: bool,
-    pub(crate) task_id: u32,
-    pub(crate) message: Messages,
-    pub(crate) error: Option<TensorError>,
+        impl $name {
+            pub(crate) fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => stringify!($method)),+
+                }
+            }
+        }
+    };
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct Request {
-    pub(crate) task_id: u32,
-    pub(crate) message: Messages,
-}
-
-impl Request {
-    #[inline(always)]
-    pub fn serialize(&self) -> Result<Vec<u8>, bincode::Error> {
-        debug_assert!(!self.message.is_response());
-        bincode::serialize(self)
+op_enum!(
+    /// In-place unary ops (`Backend::apply_<op>_*`).
+    UnaryOp {
+        Neg => neg, Relu => relu, Sigmoid => sigmoid, Silu => silu, Tanh => tanh, Abs => abs,
+        Sqrt => sqrt, Ln => ln, Expm1 => expm1, Ln1p => ln1p, Floor => floor, Ceil => ceil,
+        Round => round, Trunc => trunc, Sin => sin, Cos => cos, Tan => tan, Asin => asin,
+        Acos => acos, Atan => atan, Sinh => sinh, Cosh => cosh, Asinh => asinh, Acosh => acosh,
+        Atanh => atanh, Rsqrt => rsqrt, Reciprocal => reciprocal, Square => square, Cube => cube,
+        Exp => exp, Sign => sign,
     }
+);
 
-    #[inline(always)]
-    pub fn deserialize(data: &[u8]) -> Result<Self, bincode::Error> {
-        let resp: Request = bincode::deserialize(data)?;
-        debug_assert!(!resp.message.is_response());
-        Ok(resp)
+op_enum!(
+    /// In-place ops taking one scalar operand (`Backend::scalar_apply_<op>_*`).
+    ScalarOp {
+        Add => add, Sub => sub, Mul => mul, Div => div, Log => log, Log1p => log1p,
+        LeakyRelu => leaky_relu, Elu => elu,
     }
-}
+);
 
-impl Response {
-    #[inline(always)]
-    pub fn serialize(&self) -> Result<Vec<u8>, bincode::Error> {
-        debug_assert!(self.message.is_response());
-        bincode::serialize(self)
-    }
-
-    #[inline(always)]
-    pub fn deserialize(data: &[u8]) -> Result<Self, bincode::Error> {
-        let resp: Response = bincode::deserialize(data)?;
-        debug_assert!(resp.message.is_response());
-        Ok(resp)
-    }
-}
-
-impl<T: TensorValue> From<RemoteBuf<T>> for TypelessBuf {
-    fn from(buf: RemoteBuf<T>) -> Self {
-        Self {
-            id: buf.id,
-            dtype: buf.dtype,
+impl From<BinaryOpType> for ScalarOp {
+    fn from(op: BinaryOpType) -> Self {
+        match op {
+            BinaryOpType::Add => ScalarOp::Add,
+            BinaryOpType::Sub => ScalarOp::Sub,
+            BinaryOpType::Mul => ScalarOp::Mul,
+            BinaryOpType::Div => ScalarOp::Div,
         }
     }
 }
 
-macro_rules! impl_typeless_buf_conversions {
-    ($($type:ty),+ $(,)?) => {
-        $(
-            impl From<TypelessBuf> for RemoteBuf<$type> {
-                fn from(buf: TypelessBuf) -> Self {
-                    Self {
-                        id: buf.id,
-                        dtype: buf.dtype,
-                        _marker: std::marker::PhantomData::<$type>,
-                    }
-                }
-            }
-        )+
-    };
-}
-
-impl_typeless_buf_conversions!(
-    f32, f64,
-    i8, i16, i32, i64, i128,
-    u8, u16, u32, u64, u128,
-);
-
+/// Operations the server can execute. Buffer-creating ops carry the id the client chose.
 #[derive(Serialize, Deserialize)]
-pub (crate) enum Messages {
-    ErrorResponse {
-        message: String,
-    },
+pub(crate) enum Op {
+    /// Must be the first request on a connection.
+    Hello { version: u32 },
+    /// No-op that is always answered; flushes the pipeline and surfaces pending errors.
+    Sync,
     DeviceType,
-    DeviceTypeResponse {
-        device_type: DeviceType
-    },
-
-    AllocFromSlice {
-        src: Slice
-    },
-    AllocFromSliceResponse(Result<TypelessBuf, TensorError>),
-    
-    Alloc {
-        len: usize,
-        dtype: DType,
-    },
-    AllocResponse (Result<TypelessBuf, TensorError>),
-
-    CopyFromSlice {
-        dst: TypelessBuf,
-        src: Slice
-    },
-    CopyFromSliceResponse (Result<(), TensorError>),
-
-    Read {
-        buf: TypelessBuf,
-        offset: usize,
-    },
-    ReadResponse (Result<Value, TensorError>,),
-
-    Write {
-        buf: TypelessBuf,
-        offset: usize,
-        value: Value,
-    },
-    WriteResponse (Result<(), TensorError>),
-
-    Len {
-        buf: TypelessBuf,
-    },
-    LenResponse (usize),
-
-    Copy {
-        src: TypelessBuf,
-    },
-    CopyResponse(Result<TypelessBuf, TensorError>),
-
-    Dump {
-        src: TypelessBuf,
-    },
-    DumpResponse (Result<Slice, TensorError>),
-
-    ApplyElementwiseBinary1dStrided {
-        buf: TypelessBuf,
-        op: (BinaryOpType, Value),
-        offset: usize,
-        stride: isize,
-        len: usize,
-    },
-    ApplyElementwiseBinary1dStridedResponse (Result<(), TensorError>),
-
-    ApplyElementwiseBinaryContiguous {
-        buf: TypelessBuf,
-        op: (BinaryOpType, Value),
-        start: usize,
-        len: usize,
-    },
-    ApplyElementwiseBinaryContiguousResponse (Result<(), TensorError>),
-
-    ApplyElementwiseBinaryNd {
-        buf: TypelessBuf,
-        op: (BinaryOpType, Value),
-        offset: usize,
-        shape: Vec<usize>,
-        stride: Vec<isize>,
-    },
-    ApplyElementwiseBinaryNdResponse (Result<(), TensorError>),
-
+    Alloc { dst: TypelessBuf, len: usize },
+    AllocFromSlice { dst: TypelessBuf, src: Slice },
+    CopyFromSlice { dst: TypelessBuf, src: Slice },
+    CopyRangeWithin { dst: TypelessBuf, src: TypelessBuf, dst_offset: usize, src_offset: usize, len: usize },
+    Read { buf: TypelessBuf, offset: usize },
+    Write { buf: TypelessBuf, offset: usize, value: Value },
+    Copy { src: TypelessBuf, dst: TypelessBuf },
+    Dump { src: TypelessBuf },
     Broadcast {
         left: (TypelessBuf, MetaTensor),
         right: (TypelessBuf, MetaTensor),
         dst: (TypelessBuf, MetaTensor),
         op: BinaryOpType,
     },
-    BroadcastResponse (Result<(), TensorError>),
-
-    ApplyNegContiguous {
-        buf: TypelessBuf,
-        start: usize,
-        len: usize,
-    },
-    ApplyNegContiguousResponse (Result<(), TensorError>),
-
-    ApplyNeg1dStrided {
-        buf: TypelessBuf,
-        offset: usize,
-        stride: isize,
-        len: usize,
-    },
-    ApplyNeg1dStridedResponse (Result<(), TensorError>),
-
-    ApplyNegNd {
-        buf: TypelessBuf,
-        offset: usize,
-        shape: Vec<usize>,
-        stride: Vec<isize>,
-    },
-    ApplyNegNdResponse (Result<(), TensorError>),
-
     Matmul {
         lhs: (TypelessBuf, MetaTensor, ContiguityTypes),
         rhs: (TypelessBuf, MetaTensor, ContiguityTypes),
@@ -353,55 +228,72 @@ pub (crate) enum Messages {
         k: usize,
         n: usize,
     },
-    MatmulResponse (Result<(), TensorError>),
-
-
-
-
-
-
-
-
-
-
-    CopyRangeWithin {
-        dst: TypelessBuf,
-        src: TypelessBuf,
-        dst_offset: usize,
-        src_offset: usize,
-        len: usize,
-    },
-    CopyRangeWithinResponse(Result<(), TensorError>),
-
-    ActionCompleted(u32)
-
+    Unary { buf: TypelessBuf, op: UnaryOp, layout: Layout },
+    Scalar { buf: TypelessBuf, op: ScalarOp, value: Value, layout: Layout },
 }
 
-impl Messages {
-    #[inline(always)]
-    pub fn is_response(&self) -> bool {
-        match self {
-            Messages::DeviceTypeResponse { .. } |
-            Messages::AllocFromSliceResponse { .. } |
-            Messages::AllocResponse { .. } |
-            Messages::CopyFromSliceResponse { .. } |
-            Messages::ReadResponse { .. } |
-            Messages::WriteResponse { .. } |
-            Messages::LenResponse { .. } |
-            Messages::CopyResponse { .. } |
-            Messages::DumpResponse { .. } |
-            Messages::ApplyElementwiseBinary1dStridedResponse { .. } |
-            Messages::ApplyElementwiseBinaryContiguousResponse { .. } |
-            Messages::ApplyElementwiseBinaryNdResponse { .. } |
-            Messages::BroadcastResponse { .. } |
-            Messages::MatmulResponse { .. } |
-            Messages::ApplyNeg1dStridedResponse { .. } |
-            Messages::ApplyNegContiguousResponse { .. } |
-            Messages::ApplyNegNdResponse { .. } |
-            Messages::ErrorResponse { .. } |
-            Messages::ActionCompleted { .. } |
-            Messages::CopyRangeWithinResponse { .. } => true,
-            _ => false,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Request {
+    pub(crate) id: u64,
+    /// Explicit async flag: when false the server only responds if the op fails.
+    pub(crate) reply: bool,
+    pub(crate) op: Op,
+}
+
+/// Successful results. Most ops only ever produce `Ack`.
+#[derive(Serialize, Deserialize)]
+pub(crate) enum Reply {
+    Ack,
+    Value(Value),
+    Slice(Slice),
+    DeviceType(DeviceType),
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Response {
+    pub(crate) id: u64,
+    pub(crate) result: Result<Reply, TensorError>,
+}
+
+fn io_err(e: std::io::Error) -> TensorError {
+    TensorError::RemoteError(format!("connection error: {e}"))
+}
+
+/// Serializes `msg` as one length-prefixed frame and writes it with a single `write_all`.
+pub(crate) fn write_frame<W: Write, M: Serialize>(w: &mut W, msg: &M) -> Result<(), TensorError> {
+    let mut frame = vec![0u8; 8];
+    bincode::serialize_into(&mut frame, msg)
+        .map_err(|e| TensorError::RemoteError(format!("failed to encode message: {e}")))?;
+    let n = (frame.len() - 8) as u64;
+    frame[..8].copy_from_slice(&n.to_le_bytes());
+    w.write_all(&frame).map_err(io_err)?;
+    w.flush().map_err(io_err)
+}
+
+/// Reads one frame. Returns `Ok(None)` if the peer closed the connection cleanly between frames.
+pub(crate) fn read_frame<R: Read, M: DeserializeOwned>(r: &mut R) -> Result<Option<M>, TensorError> {
+    let mut len = [0u8; 8];
+    let mut filled = 0;
+    while filled < len.len() {
+        match r.read(&mut len[filled..]) {
+            Ok(0) if filled == 0 => return Ok(None),
+            Ok(0) => return Err(TensorError::RemoteError("connection closed mid-frame".into())),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io_err(e)),
         }
     }
+    let n = u64::from_le_bytes(len);
+    if n > MAX_FRAME_BYTES {
+        return Err(TensorError::RemoteError(format!("frame of {n} bytes exceeds the {MAX_FRAME_BYTES} byte limit")));
+    }
+    // Grow the buffer as bytes arrive instead of trusting the prefix with one huge allocation.
+    let mut payload = Vec::with_capacity(n.min(64 << 20) as usize);
+    r.take(n).read_to_end(&mut payload).map_err(io_err)?;
+    if payload.len() as u64 != n {
+        return Err(TensorError::RemoteError("connection closed mid-frame".into()));
+    }
+    bincode::deserialize(&payload)
+        .map(Some)
+        .map_err(|e| TensorError::RemoteError(format!("failed to decode message: {e}")))
 }

@@ -1,8 +1,6 @@
-#[macro_use]
 pub mod server;
 pub mod client;
 pub mod protocol;
-mod enumdispatch;
 #[cfg(test)]
 mod remote_tests;
 
@@ -56,7 +54,7 @@ mod tests {
     #[test]
     fn remote_basic() {
         let server_ip = "127.0.0.1";
-        let server_port = 7879;
+        let server_port = 7880;
         let server_addr = format!("{}:{}", server_ip, server_port);
         println!("Server address: {}", server_addr);
 
