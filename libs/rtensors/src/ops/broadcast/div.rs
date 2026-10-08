@@ -179,7 +179,7 @@ macro_rules! impl_div {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.as_ref());
                 attach_broadcast_div_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -215,7 +215,7 @@ macro_rules! impl_div {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.as_ref());
                 attach_broadcast_div_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -251,7 +251,7 @@ macro_rules! impl_div {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.as_ref());
                 attach_broadcast_div_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -287,7 +287,7 @@ macro_rules! impl_div {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.as_ref());
                 attach_broadcast_div_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -324,7 +324,7 @@ macro_rules! impl_div {
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
                 
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.as_ref());
                 attach_broadcast_div_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -361,7 +361,7 @@ macro_rules! impl_div {
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
                 
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.as_ref());
                 attach_broadcast_div_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -398,7 +398,7 @@ macro_rules! impl_div {
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
                 
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.as_ref());
                 attach_broadcast_div_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -435,7 +435,7 @@ macro_rules! impl_div {
                     compute_broadcasted_params(&self.meta, &rhs.meta)
                         .expect("Shapes are not broadcastable");
                 
-                let mut result = TensorBase::<T, B>::zeros(out_shape.as_ref());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.as_ref());
                 attach_broadcast_div_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -580,7 +580,7 @@ fn attach_broadcast_div_grad<T: TensorValue, B: Backend>(
 ) -> Option<()>
 {
     // TODO make .reciprical valid for all types
-    let mut rhs_reciprocal = TensorBase::<T, B>::zeros(rhs_shape);
+    let mut rhs_reciprocal = TensorBase::<T, B>::zeros_on(&right.backend, rhs_shape);
     for coord in right.iter_coords() {
         let val = right.get(&coord).unwrap();
         rhs_reciprocal.set(&coord, T::ONE / val).unwrap();

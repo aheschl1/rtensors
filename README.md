@@ -280,36 +280,56 @@ grad::with(|ctx| {
 
 ## Remote Backend
 
-Still early stage in terms of ergonomics of use.
-
-The protocol includes asynchronous operations, which are transparently handled.
-When a long running operation which acts inplace of its operators only, an Ack is returned immediately,
-and the user process can continue. When a read is needed, there is a sync point.
-
-For example:
-
-```rust
-let remote_tensor = RemoteTensor::<f32>::ones((1000, 1000));
-remote_tensor += 1; // async, will continue immediately, though the computation is long
-let value = remote_tensor.get((0, 0)).unwrap(); // sync point, waits for prior ops to finish
-```
+Enable the `remote` feature to run tensor operations on another machine. A server holds the
+buffers and executes the ops on its CPU (or GPU, if built with `cuda`); the client sends
+requests over TCP.
 
 ### Start a server
 
-```rust
-use crate::backend::remote::server::launch_server;
-launch_server("127.0.0.1", 7878);
+```bash
+cargo run --release -p rtensors --features remote --bin rtensors-server -- \
+    --host 0.0.0.0 --port 7878 --max-session-bytes 8000000000
+# add `,cuda` to --features to let clients open CUDA sessions
 ```
 
+Or from code:
+
 ```rust
-// Initialize remote backend
-remote_backend_init("127.0.0.1", 7878);
-let remote_tensor = RemoteTensor::<f32>::ones((3, 4));
-// Or, specify a backend directly
-let backend = RemoteBackend::new("127.0.0.1", 7878);
-backend.connect().unwrap();
-let remote_tensor = RemoteTensor::from_parts(backend, vec![1, 2, 3, 4, 5, 6], Shape::from((2, 2))).unwrap();
+use rtensors::backend::remote::server::{RemoteServer, ServerConfig};
+RemoteServer::new("0.0.0.0".parse()?, 7878)
+    .with_config(ServerConfig { max_session_bytes: Some(8 << 30), ..Default::default() })
+    .serve()?;
 ```
+
+There is no authentication or encryption, so only expose the server on trusted networks.
+
+### Use it
+
+```rust
+use rtensors::backend::remote::{self, RemoteDevice};
+
+// One shared connection per server and device; the first one also becomes the default
+// used by constructors such as `RemoteTensor::zeros`.
+let backend = remote::try_use_remote_device("10.0.0.2".parse()?, 7878, RemoteDevice::Cuda(0))?;
+
+let a = RemoteTensor::<f32>::from_buf_on(&backend, vec![1.0, 2.0, 3.0, 4.0], (2, 2))?;
+let b = Tensor::<f32>::ones((2, 2)).to_remote(&backend)?;
+let mut c = a.matmul(&b)?;   // runs on the server
+c += 1.0;                    // returns immediately; the server runs requests in order
+let local = c.cpu()?;        // waits for the result
+```
+
+Operations that only modify remote buffers are pipelined: they return as soon as the request
+is sent. Reads (`get`, `cpu()`, `item()`, ...) wait for their own reply, and because the server
+executes each connection's requests in order they always see earlier writes. If a pipelined
+operation fails on the server, the error is returned by the next call made by the same
+thread, or by `backend.sync()`.
+
+Tensors used together in one operation must live on the same connection. Use `from_buf_on` /
+`to_remote` to place tensors on a specific backend, or `remote::set_default_backend` to choose
+what `RemoteBackend::new()` (and constructors like `zeros`/`ones`) use.
+Dropping a remote tensor frees its buffer on the server; closing the connection frees all of them.
+`backend.set_timeout(Some(duration))` bounds how long blocking calls wait.
 
 ## Boolean Type
 

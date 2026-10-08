@@ -3,11 +3,51 @@
 
 use std::{collections::HashMap, net::{IpAddr, TcpListener, TcpStream}, thread::{self, JoinHandle}};
 
-use crate::{backend::{cpu::Cpu, ContiguityTypes, remote::protocol::{read_frame, write_frame, BufId, Layout, Op, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}, Backend, BackendMatMul}, core::{primitives::DeviceType, tensor::TensorError, value::{types, DType, TensorValue}, Dim, MetaTensor}, ops::reduction::ReductionOpTypes};
+use crate::{backend::{cpu::Cpu, ContiguityTypes, remote::protocol::{read_frame_limited, write_frame, BufId, Layout, Op, RemoteDevice, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}, Backend, BackendMatMul}, core::{primitives::DeviceType, tensor::TensorError, value::{types, DType, TensorValue}, Dim, MetaTensor}, ops::reduction::ReductionOpTypes};
 
-pub(crate) struct RemoteServer {
+/// Limits applied to every connection a [`RemoteServer`] accepts.
+///
+/// Worst-case memory per connection is roughly `max_session_bytes` of live buffers plus
+/// `queue_depth` queued requests of up to the frame limit each (plus temporaries the backend
+/// allocates while running an op, e.g. CUDA reduction scratch space, which are not counted).
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    /// Upper bound on the bytes of live buffers one connection may hold. `None` means no limit,
+    /// in which case an oversized allocation can exhaust (and abort) the server process.
+    pub max_session_bytes: Option<usize>,
+    /// Requests buffered per connection before the server stops reading from its socket, which
+    /// in turn blocks the client's writes (backpressure).
+    pub queue_depth: usize,
+    /// Largest request frame accepted, in bytes. `None` derives it from `max_session_bytes`
+    /// (that plus 1 MiB of slack), or 1 TiB without a session cap. Uploads larger than this
+    /// are rejected and the connection is dropped, before the payload is buffered.
+    pub max_frame_bytes: Option<u64>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self { max_session_bytes: None, queue_depth: 1024, max_frame_bytes: None }
+    }
+}
+
+impl ServerConfig {
+    fn frame_limit(&self) -> u64 {
+        self.max_frame_bytes.unwrap_or_else(|| match self.max_session_bytes {
+            Some(max) => (max as u64).saturating_add(1 << 20),
+            None => crate::backend::remote::protocol::MAX_FRAME_BYTES,
+        })
+    }
+}
+
+/// Serves tensor operations to [`super::client::RemoteBackend`] clients over TCP.
+///
+/// Every connection gets its own session: its buffers live on the backend the client asked for
+/// in its handshake (CPU, or CUDA when built with the `cuda` feature) and are dropped when the
+/// connection closes. There is no authentication or encryption, so only listen on trusted networks.
+pub struct RemoteServer {
     address: IpAddr,
-    port: u16
+    port: u16,
+    config: ServerConfig,
 }
 
 impl RemoteServer {
@@ -15,15 +55,28 @@ impl RemoteServer {
         Self {
             address,
             port,
+            config: ServerConfig::default(),
         }
     }
 
+    pub fn with_config(mut self, config: ServerConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Accepts connections until the listener fails. Blocks the calling thread.
     pub fn serve(&mut self) -> std::io::Result<()> {
         let listener = TcpListener::bind((self.address, self.port))?;
+        self.serve_on(listener)
+    }
+
+    /// Like [`Self::serve`], on an already bound listener (e.g. one bound to port 0).
+    pub fn serve_on(&mut self, listener: TcpListener) -> std::io::Result<()> {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    thread::spawn(move || handle_connection(stream));
+                    let config = self.config.clone();
+                    thread::spawn(move || handle_connection(stream, config));
                 }
                 Err(e) => {
                     tracing::warn!("remote server: connection failed: {e}");
@@ -45,6 +98,17 @@ pub fn launch_server(ip: IpAddr, port: u16) -> Result<JoinHandle<()>, TensorErro
     Ok(handle)
 }
 
+/// Starts a background server on `ip:port` unless something is already listening there.
+/// The listener is bound before returning, so callers can connect immediately.
+#[cfg(test)]
+pub(crate) fn ensure_test_server(ip: IpAddr, port: u16) {
+    if let Ok(listener) = TcpListener::bind((ip, port)) {
+        thread::spawn(move || {
+            let _ = RemoteServer::new(ip, port).serve_on(listener);
+        });
+    }
+}
+
 /// A backend the server can execute ops on, plus what it can actually do. Some backend methods
 /// are `todo!()` or panic for certain inputs; the server reports those as unsupported instead
 /// of calling them (a panic aborts a release-built server).
@@ -58,6 +122,8 @@ pub(crate) trait ServerBackend:
     fn supports_reduction(op: &ReductionOpTypes) -> bool;
     /// Whether `apply_argmax_*` is implemented.
     const SUPPORTS_ARGMAX: bool;
+    /// Longest flat reduction the kernels handle.
+    const MAX_REDUCE_LEN: usize = usize::MAX;
 }
 
 impl ServerBackend for Cpu {
@@ -75,6 +141,8 @@ impl ServerBackend for crate::backend::cuda::Cuda {
         !matches!(op, ReductionOpTypes::ArgMax | ReductionOpTypes::ArgMin | ReductionOpTypes::LogSumExp)
     }
     const SUPPORTS_ARGMAX: bool = true;
+    // The CUB-based kernels take the element count as an `int`.
+    const MAX_REDUCE_LEN: usize = i32::MAX as usize;
 }
 
 /// Generates the type-erased buffer enum and the `Elem` trait that moves typed buffers in and out of it.
@@ -328,22 +396,58 @@ fn check_reduction_op<B: ServerBackend>(op: &ReductionOpTypes, arg: bool) -> Res
 /// Buffers owned by one client connection.
 pub(crate) struct Store<B: Backend> {
     bufs: HashMap<BufId, AnyBuf<B>>,
+    /// Bytes held by live buffers, and the optional cap on it.
+    bytes: usize,
+    max_bytes: Option<usize>,
 }
 
 impl<B: Backend> Store<B> {
-    fn new() -> Self {
-        Self { bufs: HashMap::new() }
+    fn new(max_bytes: Option<usize>) -> Self {
+        Self { bufs: HashMap::new(), bytes: 0, max_bytes }
     }
 
-    fn insert<T: Elem>(&mut self, dst: TypelessBuf, buf: B::Buf<T>) -> Result<(), TensorError> {
+    fn size_of<T: Elem>(len: usize) -> Result<usize, TensorError> {
+        len.checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| invalid(format!("allocation of {len} {:?} elements overflows", T::DTYPE)))
+    }
+
+    /// Checks that `len` more elements of `T` fit within the session's budget. Called before
+    /// the backend allocates, because a failed allocation aborts the process.
+    fn reserve<T: Elem>(&self, dst: TypelessBuf, len: usize) -> Result<(), TensorError> {
         if dst.dtype != T::DTYPE {
             return Err(wrong_dtype(dst, T::DTYPE));
         }
         if self.bufs.contains_key(&dst.id) {
             return Err(TensorError::RemoteError(format!("buffer {} already exists", dst.id)));
         }
+        let bytes = Self::size_of::<T>(len)?;
+        let total = self.bytes.checked_add(bytes);
+        if let Some(max) = self.max_bytes {
+            if total.is_none_or(|t| t > max) {
+                return Err(TensorError::RemoteError(format!(
+                    "allocating {bytes} bytes would exceed this session's limit of {max} bytes ({} in use)", self.bytes
+                )));
+            }
+        }
+        if bytes > isize::MAX as usize {
+            return Err(invalid(format!("allocation of {bytes} bytes is too large")));
+        }
+        Ok(())
+    }
+
+    /// Stores a buffer previously checked with [`Self::reserve`].
+    fn insert<T: Elem>(&mut self, dst: TypelessBuf, len: usize, buf: B::Buf<T>) -> Result<(), TensorError> {
+        self.reserve::<T>(dst, len)?;
+        self.bytes += Self::size_of::<T>(len)?;
         self.bufs.insert(dst.id, T::wrap(buf));
         Ok(())
+    }
+
+    fn remove(&mut self, id: BufId, backend: &B) {
+        if let Some(buf) = self.bufs.remove(&id) {
+            let bytes = any_len(backend, &buf) * dtype_size(dtype_of(&buf));
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
     }
 
     fn get<T: Elem>(&self, buf: TypelessBuf) -> Result<&B::Buf<T>, TensorError> {
@@ -371,6 +475,21 @@ impl<B: Backend> Store<B> {
     }
 }
 
+fn any_len<B: Backend>(backend: &B, buf: &AnyBuf<B>) -> usize {
+    match buf {
+        AnyBuf::U8(b) => backend.len(b), AnyBuf::U16(b) => backend.len(b), AnyBuf::U32(b) => backend.len(b),
+        AnyBuf::U64(b) => backend.len(b), AnyBuf::U128(b) => backend.len(b), AnyBuf::I8(b) => backend.len(b),
+        AnyBuf::I16(b) => backend.len(b), AnyBuf::I32(b) => backend.len(b), AnyBuf::I64(b) => backend.len(b),
+        AnyBuf::I128(b) => backend.len(b), AnyBuf::F32(b) => backend.len(b), AnyBuf::F64(b) => backend.len(b),
+        AnyBuf::Bool(b) => backend.len(b),
+    }
+}
+
+fn dtype_size(dtype: DType) -> usize {
+    let size: Result<usize, TensorError> = dispatch!(any dtype, "size", T => Ok(std::mem::size_of::<T>()));
+    size.unwrap_or(0)
+}
+
 fn dtype_of<B: Backend>(buf: &AnyBuf<B>) -> DType {
     match buf {
         AnyBuf::U8(_) => DType::U8, AnyBuf::U16(_) => DType::U16, AnyBuf::U32(_) => DType::U32,
@@ -389,23 +508,31 @@ pub(crate) struct Session<B: ServerBackend> {
 }
 
 impl<B: ServerBackend> Session<B> {
-    fn new(backend: B, device: DeviceType) -> Self {
-        Self { backend, store: Store::new(), device }
+    fn new(backend: B, device: DeviceType, max_bytes: Option<usize>) -> Self {
+        Self { backend, store: Store::new(max_bytes), device }
     }
 
     fn execute(&mut self, op: Op) -> Result<Reply, TensorError> {
         let Self { backend, store, device } = self;
         match op {
             Op::Hello { .. } => Err(TensorError::RemoteError("unexpected second handshake".into())),
+            Op::Free { buf } => {
+                store.remove(buf, backend);
+                Ok(Reply::Ack)
+            }
             Op::Sync => Ok(Reply::Ack),
             Op::DeviceType => Ok(Reply::DeviceType(device.clone())),
             Op::Alloc { dst, len } => dispatch!(any dst.dtype, "alloc", T => {
+                store.reserve::<T>(dst, len)?;
                 let buf = backend.alloc::<T>(len)?;
-                store.insert::<T>(dst, buf).map(|_| Reply::Ack)
+                store.insert::<T>(dst, len, buf).map(|_| Reply::Ack)
             }),
             Op::AllocFromSlice { dst, src } => dispatch!(any dst.dtype, "alloc_from_slice", T => {
-                let buf = backend.alloc_from_slice::<T>(src.to_boxed_slice::<T>()?)?;
-                store.insert::<T>(dst, buf).map(|_| Reply::Ack)
+                let data = src.to_boxed_slice::<T>()?;
+                let len = data.len();
+                store.reserve::<T>(dst, len)?;
+                let buf = backend.alloc_from_slice::<T>(data)?;
+                store.insert::<T>(dst, len, buf).map(|_| Reply::Ack)
             }),
             Op::CopyFromSlice { dst, src } => dispatch!(any dst.dtype, "copy_from_slice", T => {
                 let data = src.to_boxed_slice::<T>()?;
@@ -445,8 +572,10 @@ impl<B: ServerBackend> Session<B> {
                 backend.write(dst, offset, value).map(|_| Reply::Ack)
             }),
             Op::Copy { src, dst } => dispatch!(any src.dtype, "copy", T => {
+                let len = backend.len(store.get::<T>(src)?);
+                store.reserve::<T>(dst, len)?;
                 let copy = backend.copy(store.get::<T>(src)?)?;
-                store.insert::<T>(dst, copy).map(|_| Reply::Ack)
+                store.insert::<T>(dst, len, copy).map(|_| Reply::Ack)
             }),
             Op::Dump { src } => dispatch!(any src.dtype, "dump", T => {
                 let data = backend.dump(store.get::<T>(src)?)?;
@@ -528,6 +657,9 @@ impl<B: ServerBackend> Session<B> {
                 // while these references are live.
                 let (src_buf, dst_buf) = unsafe { (&*src_ptr, &mut *dst_ptr) };
                 check_reduce_flat(start, len, backend.len(src_buf), backend.len(dst_buf))?;
+                if len > B::MAX_REDUCE_LEN {
+                    return Err(TensorError::UnsupportedOperation(format!("reductions over more than {} elements", B::MAX_REDUCE_LEN)));
+                }
                 backend.apply_reduce_contiguous_flat(src_buf, dst_buf, start, len, op).map(|_| Reply::Ack)
             }),
             Op::ReduceNd { src, dst, dim, op } => dispatch!(float src.0.dtype, "reduce", T => {
@@ -548,6 +680,9 @@ impl<B: ServerBackend> Session<B> {
                 // while these references are live.
                 let (src_buf, dst_buf) = unsafe { (&*src_ptr, &mut *dst_ptr) };
                 check_reduce_flat(start, len, backend.len(src_buf), backend.len(dst_buf))?;
+                if len > B::MAX_REDUCE_LEN {
+                    return Err(TensorError::UnsupportedOperation(format!("reductions over more than {} elements", B::MAX_REDUCE_LEN)));
+                }
                 backend.apply_argmax_contiguous_flat(src_buf, dst_buf, start, len, op).map(|_| Reply::Ack)
             }),
             Op::ArgNd { src, dst, dim, op } => dispatch!(float src.0.dtype, "argmax", T => {
@@ -644,12 +779,39 @@ fn scalar<B: ServerBackend>(backend: &B, store: &mut Store<B>, buf: TypelessBuf,
 /// Backend selected for a connection.
 enum DeviceSession {
     Cpu(Session<Cpu>),
+    #[cfg(feature = "cuda")]
+    Cuda(Session<crate::backend::cuda::Cuda>),
 }
 
 impl DeviceSession {
+    fn open(device: RemoteDevice, config: &ServerConfig) -> Result<Self, TensorError> {
+        match device {
+            RemoteDevice::Cpu => Ok(DeviceSession::Cpu(Session::new(Cpu::new(), DeviceType::Cpu, config.max_session_bytes))),
+            #[cfg(feature = "cuda")]
+            RemoteDevice::Cuda(ordinal) => {
+                let backend = crate::backend::cuda::Cuda::construct(ordinal)?;
+                Ok(DeviceSession::Cuda(Session::new(backend, DeviceType::Cuda(ordinal), config.max_session_bytes)))
+            }
+            #[cfg(not(feature = "cuda"))]
+            RemoteDevice::Cuda(_) => Err(TensorError::UnsupportedOperation(
+                "this server was built without CUDA support".into(),
+            )),
+        }
+    }
+
+    fn device(&self) -> DeviceType {
+        match self {
+            DeviceSession::Cpu(session) => session.device.clone(),
+            #[cfg(feature = "cuda")]
+            DeviceSession::Cuda(session) => session.device.clone(),
+        }
+    }
+
     fn execute(&mut self, op: Op) -> Result<Reply, TensorError> {
         match self {
             DeviceSession::Cpu(session) => session.execute(op),
+            #[cfg(feature = "cuda")]
+            DeviceSession::Cuda(session) => session.execute(op),
         }
     }
 }
@@ -662,7 +824,7 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
 
 /// Reads requests on the calling thread and executes them in order on a worker thread, so slow
 /// ops don't stop the socket from being drained. Returning drops the session and its buffers.
-fn handle_connection(stream: TcpStream) {
+fn handle_connection(stream: TcpStream, config: ServerConfig) {
     let _ = stream.set_nodelay(true);
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -671,19 +833,40 @@ fn handle_connection(stream: TcpStream) {
             return;
         }
     };
-    let (tx, rx) = flume::unbounded::<Request>();
+    // Bounded, so a client that outpaces execution is slowed down instead of growing the queue.
+    let (tx, rx) = flume::bounded::<Request>(config.queue_depth.max(1));
 
+    let frame_limit = config.frame_limit();
     let worker = thread::spawn(move || {
+        // Shut the socket down however this thread exits (including a panic), so the reader
+        // loop and the client both see the connection close instead of hanging.
+        struct ShutdownOnDrop(TcpStream);
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        let mut writer = ShutdownOnDrop(writer);
+        let writer = &mut writer.0;
         let mut session: Option<DeviceSession> = None;
         for request in rx.iter() {
             let id = request.id;
             let reply = request.reply;
+            let silent = matches!(request.op, Op::Free { .. });
             let result = match (&mut session, request.op) {
-                (None, Op::Hello { version }) if version == PROTOCOL_VERSION => {
-                    session = Some(DeviceSession::Cpu(Session::new(Cpu::new(), DeviceType::Cpu)));
-                    Ok(Reply::Ack)
+                (None, Op::Hello { version, device }) if version == PROTOCOL_VERSION => {
+                    // Opening a backend can panic (e.g. CUDA context creation); report it.
+                    std::panic::catch_unwind(|| DeviceSession::open(device, &config))
+                        .unwrap_or_else(|panic| Err(TensorError::RemoteError(format!(
+                            "failed to open {device:?} session: {}", panic_message(&panic)
+                        ))))
+                        .map(|opened| {
+                        let device = opened.device();
+                        session = Some(opened);
+                        Reply::DeviceType(device)
+                    })
                 }
-                (None, Op::Hello { version }) => Err(TensorError::RemoteError(format!(
+                (None, Op::Hello { version, .. }) => Err(TensorError::RemoteError(format!(
                     "protocol version mismatch: client speaks {version}, server speaks {PROTOCOL_VERSION}"
                 ))),
                 (None, _) => Err(TensorError::RemoteError("handshake required before any other request".into())),
@@ -695,8 +878,8 @@ fn handle_connection(stream: TcpStream) {
             };
             let handshake_failed = session.is_none();
             // Fire-and-forget requests only hear back when they fail.
-            if reply || result.is_err() {
-                if let Err(e) = write_frame(&mut writer, &Response { id, result }) {
+            if reply || (result.is_err() && !silent) {
+                if let Err(e) = write_frame(writer, &Response { id, result }) {
                     tracing::warn!("remote server: failed to send response: {e}");
                     break;
                 }
@@ -705,12 +888,11 @@ fn handle_connection(stream: TcpStream) {
                 break;
             }
         }
-        let _ = writer.shutdown(std::net::Shutdown::Both);
     });
 
     let mut reader = stream;
     loop {
-        match read_frame::<_, Request>(&mut reader) {
+        match read_frame_limited::<_, Request>(&mut reader, frame_limit) {
             Ok(Some(request)) => {
                 if tx.send(request).is_err() {
                     break; // worker stopped

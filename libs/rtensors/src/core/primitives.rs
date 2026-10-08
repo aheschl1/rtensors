@@ -130,13 +130,23 @@ impl<T: TensorValue> RemoteTensor<T> {
         Ok(cpu)
     }
 
+    /// An empty tensor on the shared connection to `ip:port`
+    /// (see [`crate::backend::remote::try_use_remote_backend`]).
     pub fn with_remote(ip: IpAddr, port: u16) -> Result<Self, TensorError> {
-        let mut remote_backend = RemoteBackend::new_with_address(ip, port)
-            .map_err(|e| TensorError::RemoteError(format!("Failed to create remote backend: {}", e)))?;
-        remote_backend.connect()
-            .map_err(|e| TensorError::RemoteError(format!("Failed to connect to remote backend: {}", e)))?;
+        let remote_backend = crate::backend::remote::try_use_remote_backend(ip, port)?;
         let buf = remote_backend.alloc::<T>(0)?;
         Ok(Self::from_parts(remote_backend, buf, MetaTensor::new(vec![], vec![], 0), None))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl<T: TensorValue> Tensor<T> {
+    /// Copies this tensor to `backend`'s server. The copy starts a new autograd graph.
+    pub fn to_remote(&self, backend: &RemoteBackend) -> Result<RemoteTensor<T>, TensorError> {
+        let contiguous = crate::core::tensor::AsTensor::contiguous(self);
+        let buf = backend.alloc_from_slice(contiguous.backend.dump(&contiguous.buf)?)?;
+        // Not attached to this tensor's autograd node: the graph is per backend type.
+        Ok(RemoteTensor::from_parts(backend.clone(), buf, contiguous.meta.clone(), None))
     }
 }
 
@@ -353,6 +363,14 @@ where
     /// let tensor = Tensor::<f32>::from_buf(vec![1.0, 2.0, 3.0, 4.0], (2, 2)).unwrap();
     /// ```
     pub fn from_buf(raw: impl Into<Box<[T]>>, shape: impl Into<Shape>) -> Result<Self, TensorError> {
+        Self::from_buf_on(&B::new(), raw, shape)
+    }
+
+    /// Like [`Self::from_buf`], but allocates on `backend` instead of `B::new()`.
+    ///
+    /// Use this to place a tensor on a specific backend instance, e.g. a particular remote
+    /// connection; tensors used together in one op must share a backend instance.
+    pub fn from_buf_on(backend: &B, raw: impl Into<Box<[T]>>, shape: impl Into<Shape>) -> Result<Self, TensorError> {
         let shape: Shape = shape.into();
         if shape.len() > 128 {
             // artificial cap due to broadcast cuda kernel...
@@ -361,7 +379,7 @@ where
                 shape.len()
             )));
         }
-        let backend = B::new();
+        let backend = backend.clone();
         let buffer = backend.alloc_from_slice(raw.into())?;
         if shape.iter().product::<usize>() != backend.len(&buffer) {
             return Err(TensorError::InvalidShape(format!(
@@ -437,6 +455,14 @@ where
         let element_count = shape.iter().product::<usize>();
         let zero_buf = vec![T::ZERO; element_count];
         Self::from_buf(zero_buf, shape).expect("Failed to allocate memory")
+    }
+
+    /// Like [`Self::zeros`], but allocates on `backend` instead of `B::new()`.
+    pub fn zeros_on(backend: &B, shape: impl Into<Shape>) -> Self {
+        let shape: Shape = shape.into();
+        let element_count = shape.iter().product::<usize>();
+        let zero_buf = vec![T::ZERO; element_count];
+        Self::from_buf_on(backend, zero_buf, shape).expect("Failed to allocate memory")
     }
 
     /// Creates a tensor filled with ones.

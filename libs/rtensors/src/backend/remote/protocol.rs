@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::{core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{DType, TensorValue}, Dim, MetaTensor}, ops::{base::BinaryOpType, reduction::ReductionOpTypes}};
 
 /// Bumped whenever the wire format changes; client and server must agree.
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
 
 /// Upper bound on a single frame. Frames are read incrementally, so this only guards against
 /// nonsensical length prefixes rather than reserving memory up front.
@@ -24,8 +24,43 @@ pub(crate) const MAX_FRAME_BYTES: u64 = 1 << 40;
 /// pipelined without waiting for the server.
 pub(crate) type BufId = u64;
 
+/// Serializes a `Vec<u8>` as one byte string instead of a sequence of `u8`s, which bincode
+/// would otherwise encode (and decode) one element at a time.
+mod bytes {
+    use serde::{de::{SeqAccess, Visitor}, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(data)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct BytesVisitor;
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a byte string")
+            }
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(v)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+                while let Some(b) = seq.next_element()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        deserializer.deserialize_byte_buf(BytesVisitor)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Slice {
+    #[serde(with = "bytes")]
     pub(crate) data: Vec<u8>, // bytes
     pub(crate) dtype: DType,
 }
@@ -94,6 +129,7 @@ impl Slice {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Value {
+    #[serde(with = "bytes")]
     data: Vec<u8>, // bytes
     dtype: DType,
 }
@@ -130,6 +166,15 @@ impl Slice {
     fn into_value(self) -> Value {
         Value { data: self.data, dtype: self.dtype }
     }
+}
+
+/// Which of the server's backends a connection should execute on.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum RemoteDevice {
+    #[default]
+    Cpu,
+    /// CUDA device ordinal on the server. Requires a server built with the `cuda` feature.
+    Cuda(usize),
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,8 +245,10 @@ impl From<BinaryOpType> for ScalarOp {
 /// Operations the server can execute. Buffer-creating ops carry the id the client chose.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Op {
-    /// Must be the first request on a connection.
-    Hello { version: u32 },
+    /// Must be the first request on a connection; answered with `Reply::DeviceType`.
+    Hello { version: u32, device: RemoteDevice },
+    /// Drops a buffer. Never answered, not even on failure (the handle is already gone).
+    Free { buf: BufId },
     /// No-op that is always answered; flushes the pipeline and surfaces pending errors.
     Sync,
     DeviceType,
@@ -283,6 +330,11 @@ pub(crate) fn write_frame<W: Write, M: Serialize>(w: &mut W, msg: &M) -> Result<
 
 /// Reads one frame. Returns `Ok(None)` if the peer closed the connection cleanly between frames.
 pub(crate) fn read_frame<R: Read, M: DeserializeOwned>(r: &mut R) -> Result<Option<M>, TensorError> {
+    read_frame_limited(r, MAX_FRAME_BYTES)
+}
+
+/// [`read_frame`] with a caller-chosen size limit.
+pub(crate) fn read_frame_limited<R: Read, M: DeserializeOwned>(r: &mut R, max_bytes: u64) -> Result<Option<M>, TensorError> {
     let mut len = [0u8; 8];
     let mut filled = 0;
     while filled < len.len() {
@@ -295,8 +347,8 @@ pub(crate) fn read_frame<R: Read, M: DeserializeOwned>(r: &mut R) -> Result<Opti
         }
     }
     let n = u64::from_le_bytes(len);
-    if n > MAX_FRAME_BYTES {
-        return Err(TensorError::RemoteError(format!("frame of {n} bytes exceeds the {MAX_FRAME_BYTES} byte limit")));
+    if n > max_bytes {
+        return Err(TensorError::RemoteError(format!("frame of {n} bytes exceeds the {max_bytes} byte limit")));
     }
     // Grow the buffer as bytes arrive instead of trusting the prefix with one huge allocation.
     let mut payload = Vec::with_capacity(n.min(64 << 20) as usize);

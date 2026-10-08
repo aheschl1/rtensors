@@ -5330,9 +5330,9 @@ mod cuda_tests {
 #[cfg(feature = "remote")]
 #[cfg(test)]
 mod remote_tests {
-    use std::{ops::Add, sync::OnceLock, thread};
+    use std::{ops::Add, sync::OnceLock};
 
-    use crate::{backend::{remote::{self, client::RemoteBackend, server::RemoteServer}, Backend}, core::{primitives::{RemoteTensor, TensorBase}, tensor::{AsView, AsViewMut, TensorAccess, TensorAccessMut, TensorError}, value::TensorValue, MetaTensor, MetaTensorView, Shape, Tensor}};
+    use crate::{backend::{remote::{self, client::RemoteBackend}, Backend}, core::{primitives::{RemoteTensor, TensorBase}, tensor::{AsView, AsViewMut, TensorAccess, TensorAccessMut, TensorError}, value::TensorValue, MetaTensor, MetaTensorView, Shape, Tensor}};
 
 
     // Lazy static backend shared across all tests
@@ -5342,11 +5342,7 @@ mod remote_tests {
 
         BACKEND.get_or_init(|| {
             // Start the server
-            let mut server = RemoteServer::new("127.0.0.1".parse().unwrap(), 7878);
-            thread::spawn(move || {
-                let _ = server.serve();
-            });
-            thread::sleep(std::time::Duration::from_millis(10));
+            crate::backend::remote::server::ensure_test_server("127.0.0.1".parse().unwrap(), 7878);
 
             // Create and connect the backend
             let backend = remote::get_backend_default().unwrap();

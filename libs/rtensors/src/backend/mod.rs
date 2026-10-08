@@ -217,6 +217,11 @@ pub trait Backend: Send + Sync + 'static + Clone + Debug {
     type Buf<T: TensorValue>: Send + Sync + Debug + PartialEq;
 
     fn device_type() -> crate::core::primitives::DeviceType;
+    /// Device of this backend instance. Defaults to [`Backend::device_type`]; backends whose
+    /// instances differ (e.g. remote connections to different servers) override it.
+    fn device(&self) -> crate::core::primitives::DeviceType {
+        Self::device_type()
+    }
     fn alloc_from_slice<T: TensorValue>(&self, src: Box<[T]>) -> Result<Self::Buf<T>, TensorError>;
     fn alloc<T: TensorValue>(&self, len: usize) -> Result<Self::Buf<T>, TensorError>;
     fn copy_from_slice<T: TensorValue>(&self, dst: &mut Self::Buf<T>, src: &[T]) -> Result<(), TensorError>;

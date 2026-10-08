@@ -1,10 +1,16 @@
-use std::{collections::HashMap, fmt::Debug, net::{IpAddr, Shutdown, TcpStream}, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock}};
+use std::{collections::HashMap, fmt::Debug, net::{IpAddr, Shutdown, TcpStream}, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock}, time::Duration};
 
-use crate::{backend::{remote::{get_backend_default, protocol::{read_frame, write_frame, BufId, Layout, Op, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}}, Backend, BackendMatMul}, core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{TensorValue, WeightValue}, Dim, MetaTensor}, ops::{base::BinaryOpType, linalg::ConvConfig2D, reduction::ReductionOpTypes}};
+use crate::{backend::{remote::{get_backend_default, protocol::{read_frame, write_frame, BufId, Layout, Op, RemoteDevice, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}}, Backend, BackendMatMul}, core::{meta::ContiguityTypes, primitives::DeviceType, tensor::TensorError, value::{TensorValue, WeightValue}, Dim, MetaTensor}, ops::{base::BinaryOpType, linalg::ConvConfig2D, reduction::ReductionOpTypes}};
 
 /// Source of process-unique connection ids, used to catch buffers from one connection being
 /// passed to another (buffer ids are only meaningful within their own connection).
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// How long `connect` waits for the server's handshake reply.
+#[cfg(not(test))]
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Request ids carry the sending thread's tag in their high bits, so the failure of a pipelined
 /// request is reported to the thread that sent it rather than to whichever thread calls next.
@@ -18,13 +24,47 @@ fn thread_tag() -> u64 {
     TAG.with(|tag| *tag)
 }
 
-/// Handle to a buffer living on a remote server.
-#[derive(Debug, PartialEq, Eq)]
+/// Handle to a buffer living on a remote server. Dropping it frees the server-side buffer.
+///
+/// The handle keeps its connection alive, so a buffer never outlives the session it lives in.
 pub struct RemoteBuf<T: TensorValue> {
     pub(crate) id: BufId,
-    pub(crate) connection: u64,
     pub(crate) len: usize,
+    pub(crate) owner: Arc<Inner>,
     pub(crate) _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: TensorValue> Drop for RemoteBuf<T> {
+    fn drop(&mut self) {
+        // Fire-and-forget; the server never reports Free failures, and if the connection is
+        // gone the buffer went with it. Deliberately bypasses `submit`, which would consume
+        // (and here discard) this thread's pending error and then skip the Free.
+        let backend = RemoteBackend { inner: self.owner.clone() };
+        if backend.inner.state.lock().unwrap_or_else(|p| p.into_inner()).closed.is_some() {
+            return;
+        }
+        let id = backend.next_request_id();
+        let _ = backend.write(&Request { id, reply: false, op: Op::Free { buf: self.id } });
+    }
+}
+
+impl<T: TensorValue> PartialEq for RemoteBuf<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.owner, &other.owner)
+    }
+}
+
+impl<T: TensorValue> Eq for RemoteBuf<T> {}
+
+impl<T: TensorValue> Debug for RemoteBuf<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteBuf")
+            .field("id", &self.id)
+            .field("len", &self.len)
+            .field("dtype", &T::DTYPE)
+            .field("connection", &self.owner.connection)
+            .finish()
+    }
 }
 
 /// Connection state shared between callers and the reader thread. One mutex guards all of it,
@@ -40,7 +80,7 @@ struct State {
     closed: Option<String>,
 }
 
-struct Inner {
+pub(crate) struct Inner {
     remote_addr: IpAddr,
     remote_port: u16,
     connection: u64,
@@ -50,6 +90,10 @@ struct Inner {
     /// Write half of the socket. Holding the lock while writing keeps request order equal to
     /// send order, which the server's in-order execution relies on.
     writer: OnceLock<Mutex<TcpStream>>,
+    /// Device the server opened for this connection, learned in the handshake.
+    session_device: OnceLock<DeviceType>,
+    /// How long `call` waits for a reply; `None` waits forever.
+    timeout: Mutex<Option<Duration>>,
 }
 
 impl Drop for Inner {
@@ -109,12 +153,40 @@ impl RemoteBackend {
                 next_buffer: AtomicU64::new(0),
                 state: Arc::new(Mutex::new(State::default())),
                 writer: OnceLock::new(),
+                session_device: OnceLock::new(),
+                timeout: Mutex::new(None),
             }),
         })
     }
 
-    /// Opens the TCP connection, starts the reader thread and performs the version handshake.
+    /// Connects to a server and opens a CPU session.
+    pub fn connect_to(remote_addr: IpAddr, remote_port: u16) -> Result<Self, TensorError> {
+        Self::connect_device(remote_addr, remote_port, RemoteDevice::Cpu)
+    }
+
+    /// Connects to a server and opens a session on `device`.
+    pub fn connect_device(remote_addr: IpAddr, remote_port: u16, device: RemoteDevice) -> Result<Self, TensorError> {
+        let mut backend = Self::new_with_address(remote_addr, remote_port)
+            .map_err(|e| TensorError::RemoteError(e.to_string()))?;
+        backend.connect_with_device(device)
+            .map_err(|e| TensorError::RemoteError(format!("failed to connect to {remote_addr}:{remote_port}: {e}")))?;
+        Ok(backend)
+    }
+
+    /// Sets how long blocking calls wait for the server. A timed-out call returns an error;
+    /// the connection stays usable and the late reply is discarded.
+    pub fn set_timeout(&self, timeout: Option<Duration>) {
+        *self.inner.timeout.lock().unwrap() = timeout;
+    }
+
+    /// Opens the TCP connection with a CPU session. See [`Self::connect_with_device`].
     pub fn connect(&mut self) -> Result<(), std::io::Error> {
+        self.connect_with_device(RemoteDevice::Cpu)
+    }
+
+    /// Opens the TCP connection, starts the reader thread and performs the handshake, asking
+    /// the server to execute this connection's ops on `device`.
+    pub fn connect_with_device(&mut self, device: RemoteDevice) -> Result<(), std::io::Error> {
         if self.inner.writer.get().is_some() {
             return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "remote backend is already connected"));
         }
@@ -127,11 +199,20 @@ impl RemoteBackend {
         let state = self.inner.state.clone();
         std::thread::spawn(move || read_incoming(state, read_stream));
 
-        match self.call(Op::Hello { version: PROTOCOL_VERSION }) {
-            Ok(Reply::Ack) => Ok(()),
+        // Bounded so a server that accepts but never answers cannot hang `connect` forever.
+        match self.call_with_timeout(Op::Hello { version: PROTOCOL_VERSION, device }, Some(HANDSHAKE_TIMEOUT)) {
+            Ok(Reply::DeviceType(device)) => {
+                let _ = self.inner.session_device.set(device);
+                Ok(())
+            }
             Ok(_) => Err(std::io::Error::other("unexpected handshake reply")),
             Err(e) => Err(std::io::Error::other(e.to_string())),
         }
+    }
+
+    /// Whether the connection has been lost; every call on a closed backend fails.
+    pub fn is_closed(&self) -> bool {
+        self.inner.state.lock().unwrap().closed.is_some()
     }
 
     pub fn address(&self) -> (IpAddr, u16) {
@@ -174,8 +255,13 @@ impl RemoteBackend {
         })
     }
 
-    /// Sends a request and waits for its reply.
+    /// Sends a request and waits for its reply, up to the configured timeout.
     fn call(&self, op: Op) -> Result<Reply, TensorError> {
+        let timeout = *self.inner.timeout.lock().unwrap();
+        self.call_with_timeout(op, timeout)
+    }
+
+    fn call_with_timeout(&self, op: Op, timeout: Option<Duration>) -> Result<Reply, TensorError> {
         let id = self.next_request_id();
         let (tx, rx) = flume::bounded(1);
         {
@@ -187,10 +273,24 @@ impl RemoteBackend {
             self.inner.state.lock().unwrap().pending.remove(&id);
             return Err(e);
         }
-        let result = rx.recv().map_err(|_| {
-            let state = self.inner.state.lock().unwrap();
-            closed_error(state.closed.as_deref().unwrap_or("reader stopped"))
-        })?;
+        let received = match timeout {
+            Some(timeout) => rx.recv_timeout(timeout).map_err(|e| match e {
+                flume::RecvTimeoutError::Timeout => Some(timeout),
+                flume::RecvTimeoutError::Disconnected => None,
+            }),
+            None => rx.recv().map_err(|_| None),
+        };
+        let result = match received {
+            Ok(result) => result,
+            Err(Some(timeout)) => {
+                self.inner.state.lock().unwrap().pending.remove(&id);
+                return Err(TensorError::RemoteError(format!("remote call timed out after {timeout:?}")));
+            }
+            Err(None) => {
+                let state = self.inner.state.lock().unwrap();
+                return Err(closed_error(state.closed.as_deref().unwrap_or("reader stopped")));
+            }
+        };
         // The server answers in order, so any failure of a pipelined request this thread sent
         // earlier has been recorded by now. Surface it here rather than letting it go unnoticed.
         if let Some(e) = self.inner.state.lock().unwrap().deferred.remove(&thread_tag()) {
@@ -209,7 +309,7 @@ impl RemoteBackend {
     /// Converts a buffer handle for the wire, rejecting handles from another connection.
     #[inline]
     fn wire<T: TensorValue>(&self, buf: &RemoteBuf<T>) -> Result<TypelessBuf, TensorError> {
-        if buf.connection != self.inner.connection {
+        if !Arc::ptr_eq(&buf.owner, &self.inner) {
             return Err(TensorError::RemoteError(
                 "buffer belongs to a different remote connection".to_string(),
             ));
@@ -222,8 +322,8 @@ impl RemoteBackend {
     fn new_buf<T: TensorValue>(&self, len: usize) -> RemoteBuf<T> {
         RemoteBuf {
             id: self.inner.next_buffer.fetch_add(1, Ordering::Relaxed),
-            connection: self.inner.connection,
             len,
+            owner: self.inner.clone(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -284,15 +384,32 @@ macro_rules! remote_scalar {
 impl Backend for RemoteBackend {
     type Buf<T: TensorValue> = RemoteBuf<T>;
 
+    /// The process-wide default backend; see [`crate::backend::remote::set_default_backend`].
     fn new() -> Self {
-        get_backend_default().expect("No default remote backend available")
+        get_backend_default().expect(
+            "No default remote backend: call remote::set_default_backend or remote::use_remote_backend first \
+             (or run a server on 127.0.0.1:7878)",
+        )
     }
 
+    /// Device of the default backend, if one is set. Prefer [`Backend::device`], which is
+    /// accurate for every connection.
     fn device_type() -> DeviceType {
+        match crate::backend::remote::default_backend() {
+            Some(backend) => backend.device(),
+            None => DeviceType::Remote {
+                ip: "127.0.0.1".parse().unwrap(),
+                port: 7878,
+                remote_type: DeviceType::Cpu.into(),
+            },
+        }
+    }
+
+    fn device(&self) -> DeviceType {
         DeviceType::Remote {
-            ip: "127.0.0.1".parse().unwrap(),
-            port: 7878,
-            remote_type: DeviceType::Cpu.into(),
+            ip: self.inner.remote_addr,
+            port: self.inner.remote_port,
+            remote_type: self.inner.session_device.get().cloned().unwrap_or(DeviceType::Cpu).into(),
         }
     }
 

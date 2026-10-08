@@ -1,6 +1,7 @@
 pub mod server;
 pub mod client;
 pub mod protocol;
+pub use protocol::RemoteDevice;
 #[cfg(test)]
 mod remote_tests;
 
@@ -11,34 +12,60 @@ pub mod remote {
     use std::sync::OnceLock;
 
     use crate::backend::remote::client::RemoteBackend;
+    use crate::backend::remote::protocol::RemoteDevice;
+    use crate::core::tensor::TensorError;
 
-    static REMOTE_BACKENDS: OnceLock<Mutex<HashMap<String, RemoteBackend>>> = OnceLock::new();
+    type Key = (IpAddr, u16, RemoteDevice);
 
-    pub fn use_remote_backend(ip: IpAddr, port: u16) -> RemoteBackend {
-        let key = format!("{ip}:{port}");
+    /// One shared connection per server and device.
+    static SHARED: OnceLock<Mutex<HashMap<Key, RemoteBackend>>> = OnceLock::new();
+    /// What `RemoteBackend::new()` (and so `RemoteTensor::zeros` etc.) uses.
+    static DEFAULT: Mutex<Option<RemoteBackend>> = Mutex::new(None);
 
-        let map = REMOTE_BACKENDS
-            .get_or_init(|| Mutex::new(HashMap::new()));
-
+    /// Returns the shared connection to `ip:port` with a session on `device`, connecting on
+    /// first use (or again if the cached connection was lost). The first shared connection also
+    /// becomes the default backend if none is set, whatever its device.
+    pub fn try_use_remote_device(ip: IpAddr, port: u16, device: RemoteDevice) -> Result<RemoteBackend, TensorError> {
+        let map = SHARED.get_or_init(|| Mutex::new(HashMap::new()));
         let mut guard = map.lock().unwrap();
-
-        guard.entry(key.clone()).or_insert_with(|| {
-            let mut backend = RemoteBackend::new_with_address(ip, port).unwrap();
-            backend.connect().unwrap();
-            backend
-        });
-
-        guard.get(&key).unwrap().clone()
+        if let Some(backend) = guard.get(&(ip, port, device)) {
+            // Reconnect transparently if the server went away (e.g. was restarted).
+            if !backend.is_closed() {
+                return Ok(backend.clone());
+            }
+        }
+        let backend = RemoteBackend::connect_device(ip, port, device)?;
+        guard.insert((ip, port, device), backend.clone());
+        let mut default = DEFAULT.lock().unwrap();
+        if default.as_ref().is_none_or(|d| d.is_closed()) {
+            *default = Some(backend.clone());
+        }
+        Ok(backend)
     }
 
+    /// [`try_use_remote_device`] with a CPU session.
+    pub fn try_use_remote_backend(ip: IpAddr, port: u16) -> Result<RemoteBackend, TensorError> {
+        try_use_remote_device(ip, port, RemoteDevice::Cpu)
+    }
+
+    /// Panicking version of [`try_use_remote_backend`].
+    pub fn use_remote_backend(ip: IpAddr, port: u16) -> RemoteBackend {
+        try_use_remote_backend(ip, port).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Makes `backend` the one `RemoteBackend::new()` returns, replacing any previous default.
+    pub fn set_default_backend(backend: RemoteBackend) {
+        *DEFAULT.lock().unwrap() = Some(backend);
+    }
+
+    /// The current default backend, without connecting anywhere.
+    pub fn default_backend() -> Option<RemoteBackend> {
+        DEFAULT.lock().unwrap().clone()
+    }
+
+    /// The default backend, falling back to a CPU session on 127.0.0.1:7878.
     pub fn get_backend_default() -> Option<RemoteBackend> {
-        if REMOTE_BACKENDS.get().is_none() {
-            use_remote_backend("127.0.0.1".parse().unwrap(), 7878);
-        }
-        REMOTE_BACKENDS
-            .get()
-            .and_then(|m| m.lock().ok())
-            .and_then(|map| map.values().next().cloned())
+        default_backend().or_else(|| try_use_remote_backend("127.0.0.1".parse().unwrap(), 7878).ok())
     }
 }
 
@@ -47,9 +74,8 @@ pub use remote::*;
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
 
-    use crate::{backend::{remote::{client::RemoteBackend, server::RemoteServer}, Backend}, core::{primitives::TensorBase, tensor::TensorAccess, MetaTensor}};
+    use crate::{backend::{remote::client::RemoteBackend, Backend}, core::{primitives::TensorBase, tensor::TensorAccess, MetaTensor}};
 
     #[test]
     fn remote_basic() {
@@ -58,12 +84,7 @@ mod tests {
         let server_addr = format!("{}:{}", server_ip, server_port);
         println!("Server address: {}", server_addr);
 
-        let mut server = RemoteServer::new(server_ip.parse().unwrap(), server_port);
-        thread::spawn(move || {
-            server.serve().unwrap();
-        });
-        println!("Server started, waiting for client...");
-        thread::sleep(std::time::Duration::from_millis(10));
+        crate::backend::remote::server::ensure_test_server(server_ip.parse().unwrap(), server_port);
 
         let mut backend = RemoteBackend::new_with_address(server_ip.parse().unwrap(), server_port).unwrap();
         backend.connect().unwrap();

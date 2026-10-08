@@ -19,6 +19,7 @@ mod tests {
             Tensor,
             value::types,
         },
+        ops::reduction::TotalReductionOp,
         ops::{linalg::MatMul, reduction::ReductionOpTypes},
     };
     
@@ -29,11 +30,7 @@ mod tests {
     
     fn setup_server() {
         INIT.call_once(|| {
-            let mut server = RemoteServer::new(SERVER_IP.parse().unwrap(), SERVER_PORT);
-            thread::spawn(move || {
-                let _ = server.serve();
-            });
-            thread::sleep(std::time::Duration::from_millis(10));
+            crate::backend::remote::server::ensure_test_server(SERVER_IP.parse().unwrap(), SERVER_PORT);
         });
     }
     
@@ -718,12 +715,15 @@ mod tests {
         // Forge a handle with the same id but another dtype.
         let forged = crate::backend::remote::client::RemoteBuf::<f32> {
             id: buf.id,
-            connection: buf.connection,
             len: buf.len,
+            owner: buf.owner.clone(),
             _marker: std::marker::PhantomData,
         };
         let err = backend.read(&forged, 0).unwrap_err();
         assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("has dtype")), "{err:?}");
+        // Dropping the forged handle would free the real buffer.
+        std::mem::forget(forged);
+        assert_eq!(backend.read(&buf, 0).unwrap(), 1);
     }
 
     #[test]
@@ -731,7 +731,7 @@ mod tests {
         use crate::backend::remote::protocol::{read_frame, write_frame, Op, Request, Response};
         setup_server();
         let mut stream = std::net::TcpStream::connect((SERVER_IP, SERVER_PORT)).unwrap();
-        write_frame(&mut stream, &Request { id: 7, reply: true, op: Op::Hello { version: u32::MAX } }).unwrap();
+        write_frame(&mut stream, &Request { id: 7, reply: true, op: Op::Hello { version: u32::MAX, device: crate::backend::remote::RemoteDevice::Cpu } }).unwrap();
         let response: Response = read_frame(&mut stream).unwrap().unwrap();
         assert_eq!(response.id, 7);
         assert!(response.result.is_err());
@@ -947,5 +947,224 @@ mod tests {
     fn test_remote_bool_roundtrip() {
         let t = make_remote_tensor(vec![types::boolean(true), types::boolean(false)], vec![2]).unwrap();
         assert_eq!(t.cpu().unwrap(), Tensor::from_buf(vec![types::boolean(true), types::boolean(false)], vec![2]).unwrap());
+    }
+
+    /// Starts a server with `config` on an ephemeral port and returns the port.
+    fn spawn_server(config: crate::backend::remote::server::ServerConfig) -> u16 {
+        let listener = std::net::TcpListener::bind((SERVER_IP, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut server = RemoteServer::new(SERVER_IP.parse().unwrap(), port).with_config(config);
+            let _ = server.serve_on(listener);
+        });
+        port
+    }
+
+    #[test]
+    fn test_remote_buffers_are_freed_on_drop() {
+        use crate::backend::remote::server::ServerConfig;
+        // 4 MiB budget; allocating 1 MiB fifty times only works if dropped buffers are freed.
+        let port = spawn_server(ServerConfig { max_session_bytes: Some(4 << 20), ..Default::default() });
+        let backend = RemoteBackend::connect_to(SERVER_IP.parse().unwrap(), port).unwrap();
+        for i in 0..50u8 {
+            let t = RemoteTensor::<u8>::from_buf_on(&backend, vec![i; 1 << 20], vec![1 << 20]).unwrap();
+            assert_eq!(t.get(&Idx::At(7)).unwrap(), i);
+        }
+        // Temporaries created by ops are freed too.
+        let a = RemoteTensor::<f32>::from_buf_on(&backend, vec![1.0; 1 << 18], vec![1 << 18]).unwrap();
+        for _ in 0..20 {
+            let b = &a + &a;
+            assert_eq!(b.get(&Idx::At(0)).unwrap(), 2.0);
+        }
+        // Holding more than the budget fails cleanly instead of exhausting the server.
+        let held: Vec<_> = (0..3).map(|_| backend.alloc::<u8>(1 << 20).unwrap()).collect();
+        backend.alloc::<u8>(2 << 20).unwrap();
+        let err = backend.sync().unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("limit")), "{err:?}");
+        drop(held);
+        let _big = backend.alloc::<u8>(2 << 20).unwrap();
+        backend.sync().unwrap();
+        // Sizes that overflow are rejected rather than reaching the allocator.
+        backend.alloc::<u64>(usize::MAX / 2).unwrap();
+        assert!(backend.sync().is_err());
+    }
+
+    #[test]
+    fn test_remote_small_queue_depth_still_works() {
+        use crate::backend::remote::server::ServerConfig;
+        let port = spawn_server(ServerConfig { queue_depth: 1, ..Default::default() });
+        let backend = RemoteBackend::connect_to(SERVER_IP.parse().unwrap(), port).unwrap();
+        let mut t = RemoteTensor::<i64>::from_buf_on(&backend, vec![0; 64], vec![64]).unwrap();
+        for _ in 0..500 {
+            t += 1;
+        }
+        assert_eq!(t.get(&Idx::At(63)).unwrap(), 500);
+    }
+
+    #[test]
+    fn test_remote_call_timeout() {
+        use crate::backend::remote::protocol::{read_frame, write_frame, Reply, Request, Response};
+        use crate::core::primitives::DeviceType;
+        // A server that completes the handshake and then never answers.
+        let listener = std::net::TcpListener::bind((SERVER_IP, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello: Request = read_frame(&mut stream).unwrap().unwrap();
+            write_frame(&mut stream, &Response { id: hello.id, result: Ok(Reply::DeviceType(DeviceType::Cpu)) }).unwrap();
+            while let Ok(Some(_)) = read_frame::<_, Request>(&mut stream) {}
+        });
+        let backend = RemoteBackend::connect_to(SERVER_IP.parse().unwrap(), port).unwrap();
+        backend.set_timeout(Some(std::time::Duration::from_millis(100)));
+        let err = backend.sync().unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("timed out")), "{err:?}");
+    }
+
+    #[test]
+    fn test_remote_device_reports_its_server() {
+        use crate::core::primitives::DeviceType;
+        let backend = shared_backend();
+        let t = make_remote_tensor(vec![1.0f32], vec![1]).unwrap();
+        let expected = DeviceType::Remote { ip: SERVER_IP.parse().unwrap(), port: SERVER_PORT, remote_type: DeviceType::Cpu.into() };
+        assert_eq!(backend.device(), expected);
+        assert_eq!(t.device(), expected);
+        assert!(format!("{t:?}").contains(&format!("device=remote({SERVER_IP}:{SERVER_PORT}, cpu)")));
+    }
+
+    #[test]
+    fn test_remote_binary_ops_on_non_default_connection() {
+        // Outputs of a + b etc. used to be allocated via B::new() (the default connection).
+        let backend = own_backend();
+        let a = RemoteTensor::<f64>::from_buf_on(&backend, vec![6.0, 8.0], vec![2]).unwrap();
+        let b = RemoteTensor::<f64>::from_buf_on(&backend, vec![2.0, 4.0], vec![2]).unwrap();
+        let (ca, cb) = (a.cpu().unwrap(), b.cpu().unwrap());
+        assert_eq!((&a + &b).cpu().unwrap(), &ca + &cb);
+        assert_eq!((&a - &b).cpu().unwrap(), &ca - &cb);
+        assert_eq!((&a * &b).cpu().unwrap(), &ca * &cb);
+        assert_eq!((&a / &b).cpu().unwrap(), &ca / &cb);
+        assert_eq!(a.view().sum().unwrap().cpu().unwrap(), ca.view().sum().unwrap());
+    }
+
+    #[test]
+    fn test_remote_to_remote_roundtrip() {
+        let backend = shared_backend();
+        let cpu = Tensor::<i32>::from_buf(vec![1, 2, 3, 4, 5, 6], vec![2, 3]).unwrap();
+        let remote = cpu.to_remote(&backend).unwrap();
+        assert_eq!(remote.cpu().unwrap(), cpu);
+        // A non-contiguous source (transposed strides) is materialised first.
+        let mut transposed = cpu.clone();
+        transposed.meta = MetaTensor::new(vec![3, 2], vec![1, 3], 0);
+        let remote = transposed.to_remote(&backend).unwrap();
+        assert_eq!(remote.cpu().unwrap(), crate::core::tensor::AsTensor::owned(&transposed.view()));
+    }
+
+    /// The first shared connection becomes the process-wide default, which other test modules
+    /// rely on being the standard test server; make sure it is before creating others.
+    fn pin_default_backend() {
+        crate::backend::remote::server::ensure_test_server("127.0.0.1".parse().unwrap(), 7878);
+        crate::backend::remote::get_backend_default().unwrap();
+    }
+
+    #[test]
+    fn test_remote_shared_connections_are_reused() {
+        pin_default_backend();
+        setup_server();
+        let a = crate::backend::remote::try_use_remote_backend(SERVER_IP.parse().unwrap(), SERVER_PORT).unwrap();
+        let b = crate::backend::remote::try_use_remote_backend(SERVER_IP.parse().unwrap(), SERVER_PORT).unwrap();
+        let x = RemoteTensor::<i32>::from_buf_on(&a, vec![1, 2], vec![2]).unwrap();
+        let y = RemoteTensor::<i32>::from_buf_on(&b, vec![3, 4], vec![2]).unwrap();
+        assert_eq!((&x + &y).cpu().unwrap(), Tensor::<i32>::from_buf(vec![4, 6], vec![2]).unwrap());
+        // with_remote uses the same shared connection.
+        let z = RemoteTensor::<i32>::with_remote(SERVER_IP.parse().unwrap(), SERVER_PORT).unwrap();
+        assert_eq!(z.backend.device(), a.device());
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn test_remote_cuda_session_needs_cuda_server() {
+        setup_server();
+        let err = RemoteBackend::connect_device(SERVER_IP.parse().unwrap(), SERVER_PORT, crate::backend::remote::RemoteDevice::Cuda(0)).unwrap_err();
+        assert!(err.to_string().contains("without CUDA"), "{err}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_remote_cuda_session() {
+        use crate::core::primitives::DeviceType;
+        use crate::ops::{reduction::{ReductionOp, TotalReductionOp}, unary::*};
+        setup_server();
+        let backend = RemoteBackend::connect_device(SERVER_IP.parse().unwrap(), SERVER_PORT, crate::backend::remote::RemoteDevice::Cuda(0)).unwrap();
+        assert!(matches!(backend.device(), DeviceType::Remote { ref remote_type, .. } if **remote_type == DeviceType::Cuda(0)));
+        let data: Vec<f32> = (0..12).map(|i| i as f32 * 0.5 - 2.0).collect();
+        let mut remote = RemoteTensor::<f32>::from_buf_on(&backend, data.clone(), vec![3, 4]).unwrap();
+        let mut cpu = Tensor::<f32>::from_buf(data, vec![3, 4]).unwrap();
+        remote.relu_inplace();
+        cpu.relu_inplace();
+        remote *= 2.0;
+        cpu *= 2.0;
+        assert_eq!(remote.cpu().unwrap(), cpu);
+        assert_eq!(remote.sum().unwrap().cpu().unwrap(), cpu.sum().unwrap());
+        assert_eq!(remote.sum_at(1).unwrap().cpu().unwrap(), cpu.sum_at(1).unwrap());
+        let m = remote.matmul(&remote.transpose()).unwrap();
+        assert_eq!(m.cpu().unwrap(), cpu.matmul(&cpu.transpose()).unwrap());
+    }
+
+    #[test]
+    fn test_remote_drop_keeps_pending_error_and_still_frees() {
+        use crate::backend::remote::server::ServerConfig;
+        let port = spawn_server(ServerConfig { max_session_bytes: Some(4 << 20), ..Default::default() });
+        let backend = RemoteBackend::connect_to(SERVER_IP.parse().unwrap(), port).unwrap();
+        let held = backend.alloc::<u8>(3 << 20).unwrap();
+        backend.sync().unwrap();
+        // Pipelined failure (over the cap)...
+        let _rejected = backend.alloc::<u8>(2 << 20).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // ...followed by a drop: the error must survive, and the free must still happen.
+        drop(held);
+        let err = backend.sync().unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("limit")), "{err:?}");
+        let _again = backend.alloc::<u8>(3 << 20).unwrap();
+        backend.sync().unwrap();
+    }
+
+    #[test]
+    fn test_remote_oversized_frame_is_refused() {
+        use crate::backend::remote::server::ServerConfig;
+        let port = spawn_server(ServerConfig { max_session_bytes: Some(1 << 20), ..Default::default() });
+        let backend = RemoteBackend::connect_to(SERVER_IP.parse().unwrap(), port).unwrap();
+        // Larger than cap + slack: the server drops the connection instead of buffering it.
+        // Depending on timing the write itself or the next call sees the closed connection.
+        let err = backend.alloc_from_slice::<u8>(vec![0u8; 4 << 20].into())
+            .and_then(|_| backend.sync())
+            .unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(_)), "{err:?}");
+        assert!(backend.is_closed());
+    }
+
+    #[test]
+    fn test_remote_shared_connection_reconnects_after_loss() {
+        use crate::backend::remote::server::ServerConfig;
+        let port = spawn_server(ServerConfig { max_session_bytes: Some(1 << 20), ..Default::default() });
+        let ip = SERVER_IP.parse().unwrap();
+        pin_default_backend();
+        let first = crate::backend::remote::try_use_remote_backend(ip, port).unwrap();
+        assert!(first.alloc_from_slice::<u8>(vec![0u8; 4 << 20].into()).and_then(|_| first.sync()).is_err());
+        let second = crate::backend::remote::try_use_remote_backend(ip, port).unwrap();
+        assert!(!second.is_closed());
+        second.sync().unwrap();
+    }
+
+    #[test]
+    fn test_remote_connect_times_out_on_silent_server() {
+        let listener = std::net::TcpListener::bind((SERVER_IP, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        let started = std::time::Instant::now();
+        let err = RemoteBackend::connect_to(SERVER_IP.parse().unwrap(), port).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
     }
 }

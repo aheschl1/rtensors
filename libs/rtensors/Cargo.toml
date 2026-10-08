@@ -9,6 +9,11 @@ cuda = ["cudarc"]
 remote = ["serde", "bincode", "flume"]
 imagers = ["image"]
 
+[[bin]]
+name = "rtensors-server"
+path = "src/bin/rtensors-server.rs"
+required-features = ["remote"]
+
 [dependencies]
 proc = { path = "../proc"}
 cudarc = { version = "0.18.1", features = ["cuda-12000"], optional = true }

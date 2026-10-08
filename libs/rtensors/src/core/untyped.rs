@@ -27,7 +27,7 @@ where
     }
 
     fn device(&self) -> DeviceType {
-        B::device_type()
+        self.backend.device()
     }
 
     fn dtype(&self) -> DType {

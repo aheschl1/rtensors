@@ -66,7 +66,7 @@ pub(crate) mod seal {
 pub trait AsView<T: TensorValue, B: Backend> : OpTensor{
     /// Returns the device type where this tensor resides.
     fn device(&self) -> DeviceType {
-        B::device_type()
+        self.view().backend.device()
     }
     
     /// Returns an immutable view over the tensor data, sharing the same
@@ -399,7 +399,7 @@ fn pad_inner<T: TensorValue, B: Backend>(
     let output_shape = Shape::from(output_shape);
     let mut output_tensor = match padding_type {
         PaddingType::Zeros => {
-            TensorBase::<T, B>::zeros(output_shape)
+            TensorBase::<T, B>::zeros_on(tensor.backend, output_shape)
         }
     };
 
