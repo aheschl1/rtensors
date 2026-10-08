@@ -3,9 +3,13 @@
 
 use std::{collections::HashMap, net::{IpAddr, TcpListener, TcpStream}, thread::{self, JoinHandle}};
 
-use crate::{backend::{cpu::Cpu, ContiguityTypes, remote::protocol::{read_frame, write_frame, BufId, Layout, Op, RemoteDevice, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}, Backend, BackendMatMul}, core::{primitives::DeviceType, tensor::TensorError, value::{types, DType, TensorValue}, Dim, MetaTensor}, ops::reduction::ReductionOpTypes};
+use crate::{backend::{cpu::Cpu, ContiguityTypes, remote::protocol::{read_frame_limited, write_frame, BufId, Layout, Op, RemoteDevice, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}, Backend, BackendMatMul}, core::{primitives::DeviceType, tensor::TensorError, value::{types, DType, TensorValue}, Dim, MetaTensor}, ops::reduction::ReductionOpTypes};
 
 /// Limits applied to every connection a [`RemoteServer`] accepts.
+///
+/// Worst-case memory per connection is roughly `max_session_bytes` of live buffers plus
+/// `queue_depth` queued requests of up to the frame limit each (plus temporaries the backend
+/// allocates while running an op, e.g. CUDA reduction scratch space, which are not counted).
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// Upper bound on the bytes of live buffers one connection may hold. `None` means no limit,
@@ -14,11 +18,24 @@ pub struct ServerConfig {
     /// Requests buffered per connection before the server stops reading from its socket, which
     /// in turn blocks the client's writes (backpressure).
     pub queue_depth: usize,
+    /// Largest request frame accepted, in bytes. `None` derives it from `max_session_bytes`
+    /// (that plus 1 MiB of slack), or 1 TiB without a session cap. Uploads larger than this
+    /// are rejected and the connection is dropped, before the payload is buffered.
+    pub max_frame_bytes: Option<u64>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { max_session_bytes: None, queue_depth: 1024 }
+        Self { max_session_bytes: None, queue_depth: 1024, max_frame_bytes: None }
+    }
+}
+
+impl ServerConfig {
+    fn frame_limit(&self) -> u64 {
+        self.max_frame_bytes.unwrap_or_else(|| match self.max_session_bytes {
+            Some(max) => (max as u64).saturating_add(1 << 20),
+            None => crate::backend::remote::protocol::MAX_FRAME_BYTES,
+        })
     }
 }
 
@@ -819,7 +836,18 @@ fn handle_connection(stream: TcpStream, config: ServerConfig) {
     // Bounded, so a client that outpaces execution is slowed down instead of growing the queue.
     let (tx, rx) = flume::bounded::<Request>(config.queue_depth.max(1));
 
+    let frame_limit = config.frame_limit();
     let worker = thread::spawn(move || {
+        // Shut the socket down however this thread exits (including a panic), so the reader
+        // loop and the client both see the connection close instead of hanging.
+        struct ShutdownOnDrop(TcpStream);
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        let mut writer = ShutdownOnDrop(writer);
+        let writer = &mut writer.0;
         let mut session: Option<DeviceSession> = None;
         for request in rx.iter() {
             let id = request.id;
@@ -827,7 +855,12 @@ fn handle_connection(stream: TcpStream, config: ServerConfig) {
             let silent = matches!(request.op, Op::Free { .. });
             let result = match (&mut session, request.op) {
                 (None, Op::Hello { version, device }) if version == PROTOCOL_VERSION => {
-                    DeviceSession::open(device, &config).map(|opened| {
+                    // Opening a backend can panic (e.g. CUDA context creation); report it.
+                    std::panic::catch_unwind(|| DeviceSession::open(device, &config))
+                        .unwrap_or_else(|panic| Err(TensorError::RemoteError(format!(
+                            "failed to open {device:?} session: {}", panic_message(&panic)
+                        ))))
+                        .map(|opened| {
                         let device = opened.device();
                         session = Some(opened);
                         Reply::DeviceType(device)
@@ -846,7 +879,7 @@ fn handle_connection(stream: TcpStream, config: ServerConfig) {
             let handshake_failed = session.is_none();
             // Fire-and-forget requests only hear back when they fail.
             if reply || (result.is_err() && !silent) {
-                if let Err(e) = write_frame(&mut writer, &Response { id, result }) {
+                if let Err(e) = write_frame(writer, &Response { id, result }) {
                     tracing::warn!("remote server: failed to send response: {e}");
                     break;
                 }
@@ -855,12 +888,11 @@ fn handle_connection(stream: TcpStream, config: ServerConfig) {
                 break;
             }
         }
-        let _ = writer.shutdown(std::net::Shutdown::Both);
     });
 
     let mut reader = stream;
     loop {
-        match read_frame::<_, Request>(&mut reader) {
+        match read_frame_limited::<_, Request>(&mut reader, frame_limit) {
             Ok(Some(request)) => {
                 if tx.send(request).is_err() {
                     break; // worker stopped

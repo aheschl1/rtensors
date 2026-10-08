@@ -4,6 +4,31 @@
 #include "../../include/common.h"
 #include <limits.h>
 #include <cub/device/device_reduce.cuh>
+
+// Set when a scratch allocation fails. The launchers then return without starting any kernel
+// (running one on a null scratch pointer raises a sticky illegal-address error that poisons the
+// whole context); Rust reads and clears the flag via rtensors_take_cuda_alloc_error afterwards.
+// Thread-local because launches and the check happen on the calling thread.
+static thread_local int g_alloc_failed = 0;
+
+static bool try_cuda_malloc(void **ptr, size_t bytes)
+{
+    if (cudaMalloc(ptr, bytes) != cudaSuccess)
+    {
+        cudaGetLastError(); // clear the (non-sticky) allocation error
+        *ptr = nullptr;
+        g_alloc_failed = 1;
+        return false;
+    }
+    return true;
+}
+
+extern "C" int rtensors_take_cuda_alloc_error(void)
+{
+    int failed = g_alloc_failed;
+    g_alloc_failed = 0;
+    return failed;
+}
 // #include <cub/iterator/transform_input_iterator.cuh>
 
 /// @brief The summation functor.
@@ -234,7 +259,8 @@ void launch_flat_contiguous_reduce(
         d_in, d_out, num_items, op, init);
 
     // Allocate temporary storage
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    if (!try_cuda_malloc(&d_temp_storage, temp_storage_bytes))
+        return;
 
     // Run reduction
     cub::DeviceReduce::Reduce(
@@ -271,7 +297,8 @@ void launch_flat_contiguous_l2norm(
 {
     // 1) allocate temp for squares
     T *d_tmp = nullptr;
-    cudaMalloc(&d_tmp, num_items * sizeof(T));
+    if (!try_cuda_malloc((void **)&d_tmp, num_items * sizeof(T)))
+        return;
 
     // 2) map: tmp[i] = data[start+i]^2
     const T *d_in = data + start;
@@ -387,7 +414,8 @@ void launch_flat_contiguous_reduce_variance(
     using State = WelfordState<T>;
 
     State *d_states = nullptr;
-    cudaMalloc(&d_states, num_items * sizeof(State));
+    if (!try_cuda_malloc((void **)&d_states, num_items * sizeof(State)))
+        return;
 
     int threads = 256;
     int blocks = (int)((num_items + threads - 1) / threads);
@@ -395,7 +423,11 @@ void launch_flat_contiguous_reduce_variance(
 
     // Allocate the output, we only need one.
     State *d_states_out = nullptr;
-    cudaMalloc(&d_states_out, sizeof(State));
+    if (!try_cuda_malloc((void **)&d_states_out, sizeof(State)))
+    {
+        cudaFree(d_states);
+        return;
+    }
 
     // Determine temporary device storage requirements
     void *d_temp_storage = nullptr;
@@ -406,7 +438,12 @@ void launch_flat_contiguous_reduce_variance(
         WelfordCombine<T>{}, welford_init<T>());
 
     // Allocate temporary storage
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    if (!try_cuda_malloc(&d_temp_storage, temp_storage_bytes))
+    {
+        cudaFree(d_states_out);
+        cudaFree(d_states);
+        return;
+    }
 
     // Run reduction
     cub::DeviceReduce::Reduce(
@@ -820,7 +857,8 @@ void dispatch_flat_contiguous_argmax(
 
     // output pair (index, value)
     Pair *d_pair_out = nullptr;
-    cudaMalloc(&d_pair_out, sizeof(Pair));
+    if (!try_cuda_malloc((void **)&d_pair_out, sizeof(Pair)))
+        return;
 
     void *d_temp = nullptr;
     size_t temp_bytes = 0;
@@ -832,7 +870,11 @@ void dispatch_flat_contiguous_argmax(
         cub::DeviceReduce::ArgMin(nullptr, temp_bytes, d_in, d_pair_out, (int)num_items);
     }
     
-    cudaMalloc(&d_temp, temp_bytes);
+    if (!try_cuda_malloc(&d_temp, temp_bytes))
+    {
+        cudaFree(d_pair_out);
+        return;
+    }
 
     // run
     if(op == OP_ARGMAX) {

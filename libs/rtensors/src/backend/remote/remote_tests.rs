@@ -1058,8 +1058,16 @@ mod tests {
         assert_eq!(remote.cpu().unwrap(), crate::core::tensor::AsTensor::owned(&transposed.view()));
     }
 
+    /// The first shared connection becomes the process-wide default, which other test modules
+    /// rely on being the standard test server; make sure it is before creating others.
+    fn pin_default_backend() {
+        crate::backend::remote::server::ensure_test_server("127.0.0.1".parse().unwrap(), 7878);
+        crate::backend::remote::get_backend_default().unwrap();
+    }
+
     #[test]
     fn test_remote_shared_connections_are_reused() {
+        pin_default_backend();
         setup_server();
         let a = crate::backend::remote::try_use_remote_backend(SERVER_IP.parse().unwrap(), SERVER_PORT).unwrap();
         let b = crate::backend::remote::try_use_remote_backend(SERVER_IP.parse().unwrap(), SERVER_PORT).unwrap();
@@ -1099,5 +1107,64 @@ mod tests {
         assert_eq!(remote.sum_at(1).unwrap().cpu().unwrap(), cpu.sum_at(1).unwrap());
         let m = remote.matmul(&remote.transpose()).unwrap();
         assert_eq!(m.cpu().unwrap(), cpu.matmul(&cpu.transpose()).unwrap());
+    }
+
+    #[test]
+    fn test_remote_drop_keeps_pending_error_and_still_frees() {
+        use crate::backend::remote::server::ServerConfig;
+        let port = spawn_server(ServerConfig { max_session_bytes: Some(4 << 20), ..Default::default() });
+        let backend = RemoteBackend::connect_to(SERVER_IP.parse().unwrap(), port).unwrap();
+        let held = backend.alloc::<u8>(3 << 20).unwrap();
+        backend.sync().unwrap();
+        // Pipelined failure (over the cap)...
+        let _rejected = backend.alloc::<u8>(2 << 20).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // ...followed by a drop: the error must survive, and the free must still happen.
+        drop(held);
+        let err = backend.sync().unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("limit")), "{err:?}");
+        let _again = backend.alloc::<u8>(3 << 20).unwrap();
+        backend.sync().unwrap();
+    }
+
+    #[test]
+    fn test_remote_oversized_frame_is_refused() {
+        use crate::backend::remote::server::ServerConfig;
+        let port = spawn_server(ServerConfig { max_session_bytes: Some(1 << 20), ..Default::default() });
+        let backend = RemoteBackend::connect_to(SERVER_IP.parse().unwrap(), port).unwrap();
+        // Larger than cap + slack: the server drops the connection instead of buffering it.
+        // Depending on timing the write itself or the next call sees the closed connection.
+        let err = backend.alloc_from_slice::<u8>(vec![0u8; 4 << 20].into())
+            .and_then(|_| backend.sync())
+            .unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(_)), "{err:?}");
+        assert!(backend.is_closed());
+    }
+
+    #[test]
+    fn test_remote_shared_connection_reconnects_after_loss() {
+        use crate::backend::remote::server::ServerConfig;
+        let port = spawn_server(ServerConfig { max_session_bytes: Some(1 << 20), ..Default::default() });
+        let ip = SERVER_IP.parse().unwrap();
+        pin_default_backend();
+        let first = crate::backend::remote::try_use_remote_backend(ip, port).unwrap();
+        assert!(first.alloc_from_slice::<u8>(vec![0u8; 4 << 20].into()).and_then(|_| first.sync()).is_err());
+        let second = crate::backend::remote::try_use_remote_backend(ip, port).unwrap();
+        assert!(!second.is_closed());
+        second.sync().unwrap();
+    }
+
+    #[test]
+    fn test_remote_connect_times_out_on_silent_server() {
+        let listener = std::net::TcpListener::bind((SERVER_IP, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        let started = std::time::Instant::now();
+        let err = RemoteBackend::connect_to(SERVER_IP.parse().unwrap(), port).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
     }
 }

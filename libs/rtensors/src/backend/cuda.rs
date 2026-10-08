@@ -1686,7 +1686,9 @@ impl Backend for Cuda {
         len: usize, 
         op: crate::ops::reduction::ReductionOpTypes
     ) -> Result<(), TensorError> {
-        apply_reduction_contiguous_single_elem(self, src, dst, start, len, op)
+        let result = apply_reduction_contiguous_single_elem(self, src, dst, start, len, op);
+        take_alloc_error()?;
+        result
     }
     
     fn apply_reduce_contiguous_nd<T: WeightValue>(
@@ -1708,7 +1710,9 @@ impl Backend for Cuda {
             len: usize, 
             op: ReductionOpTypes
         ) -> Result<(), TensorError> {
-        apply_argmax_contiguous_single_elem(self, src, dst, start, len, op)
+        let result = apply_argmax_contiguous_single_elem(self, src, dst, start, len, op);
+        take_alloc_error()?;
+        result
     }
 
     fn apply_argmax_contiguous_nd<T: WeightValue>(
@@ -1730,6 +1734,16 @@ impl Backend for Cuda {
     ) -> Result<(), TensorError> {
         todo!()
     }
+}
+
+/// Reports a scratch allocation failure in the last flat reduction launched on this thread.
+/// The launcher skipped its kernels in that case, so the output was not written.
+#[inline]
+fn take_alloc_error() -> Result<(), TensorError> {
+    if unsafe { rtensors_take_cuda_alloc_error() } != 0 {
+        return Err(TensorError::CudaError("out of device memory for reduction scratch space".to_string()));
+    }
+    Ok(())
 }
 
 #[inline]

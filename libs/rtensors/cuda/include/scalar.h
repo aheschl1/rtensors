@@ -223,6 +223,10 @@ DECLARE_UNARY_FLOAT_OP_HEADERS(silu)
 DECLARE_REDUCTION_OP_HEADERS(float,  f32)
 DECLARE_REDUCTION_OP_HEADERS(double, f64)
 
+// Returns 1 (and clears the flag) if a reduction launcher on this thread skipped its work
+// because a scratch allocation failed.
+int rtensors_take_cuda_alloc_error(void);
+
 
 // Reduction operations
 #define DECLARE_ARGMAX_OP_HEADERS(TYPE, SUFFIX)                                                \

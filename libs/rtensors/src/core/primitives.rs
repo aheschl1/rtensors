@@ -141,11 +141,12 @@ impl<T: TensorValue> RemoteTensor<T> {
 
 #[cfg(feature = "remote")]
 impl<T: TensorValue> Tensor<T> {
-    /// Copies this tensor to `backend`'s server.
+    /// Copies this tensor to `backend`'s server. The copy starts a new autograd graph.
     pub fn to_remote(&self, backend: &RemoteBackend) -> Result<RemoteTensor<T>, TensorError> {
         let contiguous = crate::core::tensor::AsTensor::contiguous(self);
         let buf = backend.alloc_from_slice(contiguous.backend.dump(&contiguous.buf)?)?;
-        Ok(RemoteTensor::from_parts(backend.clone(), buf, contiguous.meta.clone(), self.op()))
+        // Not attached to this tensor's autograd node: the graph is per backend type.
+        Ok(RemoteTensor::from_parts(backend.clone(), buf, contiguous.meta.clone(), None))
     }
 }
 

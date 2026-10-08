@@ -15,6 +15,7 @@ usage: rtensors-server [options]
   --port <port>               port to listen on (default 7878)
   --max-session-bytes <n>     cap on live buffer bytes per connection (default: unlimited)
   --queue-depth <n>           requests buffered per connection before backpressure (default 1024)
+  --max-frame-bytes <n>       largest accepted request (default: session cap + 1 MiB, else 1 TiB)
   -h, --help                  show this help
 
 There is no authentication or encryption: only listen on trusted networks.";
@@ -33,6 +34,9 @@ fn parse() -> Result<(IpAddr, u16, ServerConfig), String> {
                 config.max_session_bytes = Some(value("--max-session-bytes")?.parse().map_err(|e| format!("--max-session-bytes: {e}"))?)
             }
             "--queue-depth" => config.queue_depth = value("--queue-depth")?.parse().map_err(|e| format!("--queue-depth: {e}"))?,
+            "--max-frame-bytes" => {
+                config.max_frame_bytes = Some(value("--max-frame-bytes")?.parse().map_err(|e| format!("--max-frame-bytes: {e}"))?)
+            }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -51,8 +55,16 @@ fn main() -> ExitCode {
             return if e.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
         }
     };
-    eprintln!("rtensors-server listening on {host}:{port} ({config:?})");
-    match RemoteServer::new(host, port).with_config(config).serve() {
+    let listener = match std::net::TcpListener::bind((host, port)) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("error: cannot listen on {host}:{port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| format!("{host}:{port}"));
+    eprintln!("rtensors-server listening on {bound} ({config:?})");
+    match RemoteServer::new(host, port).with_config(config).serve_on(listener) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");

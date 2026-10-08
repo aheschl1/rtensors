@@ -330,6 +330,11 @@ pub(crate) fn write_frame<W: Write, M: Serialize>(w: &mut W, msg: &M) -> Result<
 
 /// Reads one frame. Returns `Ok(None)` if the peer closed the connection cleanly between frames.
 pub(crate) fn read_frame<R: Read, M: DeserializeOwned>(r: &mut R) -> Result<Option<M>, TensorError> {
+    read_frame_limited(r, MAX_FRAME_BYTES)
+}
+
+/// [`read_frame`] with a caller-chosen size limit.
+pub(crate) fn read_frame_limited<R: Read, M: DeserializeOwned>(r: &mut R, max_bytes: u64) -> Result<Option<M>, TensorError> {
     let mut len = [0u8; 8];
     let mut filled = 0;
     while filled < len.len() {
@@ -342,8 +347,8 @@ pub(crate) fn read_frame<R: Read, M: DeserializeOwned>(r: &mut R) -> Result<Opti
         }
     }
     let n = u64::from_le_bytes(len);
-    if n > MAX_FRAME_BYTES {
-        return Err(TensorError::RemoteError(format!("frame of {n} bytes exceeds the {MAX_FRAME_BYTES} byte limit")));
+    if n > max_bytes {
+        return Err(TensorError::RemoteError(format!("frame of {n} bytes exceeds the {max_bytes} byte limit")));
     }
     // Grow the buffer as bytes arrive instead of trusting the prefix with one huge allocation.
     let mut payload = Vec::with_capacity(n.min(64 << 20) as usize);

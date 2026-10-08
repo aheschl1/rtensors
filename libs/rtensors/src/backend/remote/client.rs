@@ -6,6 +6,12 @@ use crate::{backend::{remote::{get_backend_default, protocol::{read_frame, write
 /// passed to another (buffer ids are only meaningful within their own connection).
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// How long `connect` waits for the server's handshake reply.
+#[cfg(not(test))]
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Request ids carry the sending thread's tag in their high bits, so the failure of a pipelined
 /// request is reported to the thread that sent it rather than to whichever thread calls next.
 const THREAD_TAG_SHIFT: u32 = 40;
@@ -31,9 +37,14 @@ pub struct RemoteBuf<T: TensorValue> {
 impl<T: TensorValue> Drop for RemoteBuf<T> {
     fn drop(&mut self) {
         // Fire-and-forget; the server never reports Free failures, and if the connection is
-        // gone the buffer went with it.
+        // gone the buffer went with it. Deliberately bypasses `submit`, which would consume
+        // (and here discard) this thread's pending error and then skip the Free.
         let backend = RemoteBackend { inner: self.owner.clone() };
-        let _ = backend.submit(Op::Free { buf: self.id });
+        if backend.inner.state.lock().unwrap_or_else(|p| p.into_inner()).closed.is_some() {
+            return;
+        }
+        let id = backend.next_request_id();
+        let _ = backend.write(&Request { id, reply: false, op: Op::Free { buf: self.id } });
     }
 }
 
@@ -188,7 +199,8 @@ impl RemoteBackend {
         let state = self.inner.state.clone();
         std::thread::spawn(move || read_incoming(state, read_stream));
 
-        match self.call(Op::Hello { version: PROTOCOL_VERSION, device }) {
+        // Bounded so a server that accepts but never answers cannot hang `connect` forever.
+        match self.call_with_timeout(Op::Hello { version: PROTOCOL_VERSION, device }, Some(HANDSHAKE_TIMEOUT)) {
             Ok(Reply::DeviceType(device)) => {
                 let _ = self.inner.session_device.set(device);
                 Ok(())
@@ -196,6 +208,11 @@ impl RemoteBackend {
             Ok(_) => Err(std::io::Error::other("unexpected handshake reply")),
             Err(e) => Err(std::io::Error::other(e.to_string())),
         }
+    }
+
+    /// Whether the connection has been lost; every call on a closed backend fails.
+    pub fn is_closed(&self) -> bool {
+        self.inner.state.lock().unwrap().closed.is_some()
     }
 
     pub fn address(&self) -> (IpAddr, u16) {
@@ -238,8 +255,13 @@ impl RemoteBackend {
         })
     }
 
-    /// Sends a request and waits for its reply.
+    /// Sends a request and waits for its reply, up to the configured timeout.
     fn call(&self, op: Op) -> Result<Reply, TensorError> {
+        let timeout = *self.inner.timeout.lock().unwrap();
+        self.call_with_timeout(op, timeout)
+    }
+
+    fn call_with_timeout(&self, op: Op, timeout: Option<Duration>) -> Result<Reply, TensorError> {
         let id = self.next_request_id();
         let (tx, rx) = flume::bounded(1);
         {
@@ -251,7 +273,6 @@ impl RemoteBackend {
             self.inner.state.lock().unwrap().pending.remove(&id);
             return Err(e);
         }
-        let timeout = *self.inner.timeout.lock().unwrap();
         let received = match timeout {
             Some(timeout) => rx.recv_timeout(timeout).map_err(|e| match e {
                 flume::RecvTimeoutError::Timeout => Some(timeout),

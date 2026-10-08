@@ -23,16 +23,23 @@ pub mod remote {
     static DEFAULT: Mutex<Option<RemoteBackend>> = Mutex::new(None);
 
     /// Returns the shared connection to `ip:port` with a session on `device`, connecting on
-    /// first use. The first shared connection also becomes the default backend if none is set.
+    /// first use (or again if the cached connection was lost). The first shared connection also
+    /// becomes the default backend if none is set, whatever its device.
     pub fn try_use_remote_device(ip: IpAddr, port: u16, device: RemoteDevice) -> Result<RemoteBackend, TensorError> {
         let map = SHARED.get_or_init(|| Mutex::new(HashMap::new()));
         let mut guard = map.lock().unwrap();
         if let Some(backend) = guard.get(&(ip, port, device)) {
-            return Ok(backend.clone());
+            // Reconnect transparently if the server went away (e.g. was restarted).
+            if !backend.is_closed() {
+                return Ok(backend.clone());
+            }
         }
         let backend = RemoteBackend::connect_device(ip, port, device)?;
         guard.insert((ip, port, device), backend.clone());
-        DEFAULT.lock().unwrap().get_or_insert_with(|| backend.clone());
+        let mut default = DEFAULT.lock().unwrap();
+        if default.as_ref().is_none_or(|d| d.is_closed()) {
+            *default = Some(backend.clone());
+        }
         Ok(backend)
     }
 
