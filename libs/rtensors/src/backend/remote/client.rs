@@ -232,6 +232,10 @@ impl RemoteBackend {
         self.submit(Op::Unary { buf: self.wire(buf)?, op, layout })
     }
 
+    fn fill<T: TensorValue>(&self, buf: &RemoteBuf<T>, value: T, layout: Layout) -> Result<(), TensorError> {
+        self.submit(Op::Fill { buf: self.wire(buf)?, value: Value::from_value(value), layout })
+    }
+
     fn scalar<T: TensorValue>(&self, buf: &RemoteBuf<T>, op: ScalarOp, value: T, layout: Layout) -> Result<(), TensorError> {
         self.submit(Op::Scalar { buf: self.wire(buf)?, op, value: Value::from_value(value), layout })
     }
@@ -345,18 +349,23 @@ impl Backend for RemoteBackend {
         }
     }
 
-    fn convert<T: TensorValue, N: TensorValue>(&self, _src: &Self::Buf<T>, _dst: &mut Self::Buf<N>) -> Result<(), TensorError> {
-        Err(unsupported("convert"))
+    fn convert<T: TensorValue, N: TensorValue>(&self, src: &Self::Buf<T>, dst: &mut Self::Buf<N>) -> Result<(), TensorError> {
+        if src.len != dst.len {
+            return Err(TensorError::SizeMismatch(format!(
+                "Buffer size mismatch in convert: src size {}, dst size {}", src.len, dst.len
+            )));
+        }
+        self.submit(Op::Convert { src: self.wire(src)?, dst: self.wire(dst)? })
     }
 
-    fn fill_nd<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _shape: &[usize], _stride: &[isize]) -> Result<(), TensorError> {
-        Err(unsupported("fill"))
+    fn fill_nd<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, offset: usize, shape: &[usize], stride: &[isize]) -> Result<(), TensorError> {
+        self.fill(buf, value, Layout::Nd { offset, shape: shape.to_vec(), stride: stride.to_vec() })
     }
-    fn fill_1d_strided<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _offset: usize, _stride: isize, _len: usize) -> Result<(), TensorError> {
-        Err(unsupported("fill"))
+    fn fill_1d_strided<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, offset: usize, stride: isize, len: usize) -> Result<(), TensorError> {
+        self.fill(buf, value, Layout::Strided1d { offset, stride, len })
     }
-    fn fill_contiguous<T: TensorValue>(&self, _buf: &mut Self::Buf<T>, _value: T, _start: usize, _len: usize) -> Result<(), TensorError> {
-        Err(unsupported("fill"))
+    fn fill_contiguous<T: TensorValue>(&self, buf: &mut Self::Buf<T>, value: T, start: usize, len: usize) -> Result<(), TensorError> {
+        self.fill(buf, value, Layout::Contiguous { start, len })
     }
 
     fn broadcast<T: TensorValue>(
@@ -391,19 +400,20 @@ impl Backend for RemoteBackend {
         leaky_relu => LeakyRelu, elu => Elu,
     );
 
-    fn apply_reduce_contiguous_flat<T: WeightValue>(&self, _src: &Self::Buf<T>, _dst: &mut Self::Buf<T>, _start: usize, _len: usize, _op: ReductionOpTypes) -> Result<(), TensorError> {
-        Err(unsupported("reduce"))
+    fn apply_reduce_contiguous_flat<T: WeightValue>(&self, src: &Self::Buf<T>, dst: &mut Self::Buf<T>, start: usize, len: usize, op: ReductionOpTypes) -> Result<(), TensorError> {
+        self.submit(Op::ReduceFlat { src: self.wire(src)?, dst: self.wire(dst)?, start, len, op })
     }
-    fn apply_reduce_contiguous_nd<T: WeightValue>(&self, _src: (&Self::Buf<T>, &MetaTensor), _dst: (&mut Self::Buf<T>, &MetaTensor), _dim: Dim, _op: ReductionOpTypes) -> Result<(), TensorError> {
-        Err(unsupported("reduce"))
+    fn apply_reduce_contiguous_nd<T: WeightValue>(&self, src: (&Self::Buf<T>, &MetaTensor), dst: (&mut Self::Buf<T>, &MetaTensor), dim: Dim, op: ReductionOpTypes) -> Result<(), TensorError> {
+        self.submit(Op::ReduceNd { src: (self.wire(src.0)?, src.1.clone()), dst: (self.wire(dst.0)?, dst.1.clone()), dim, op })
     }
-    fn apply_argmax_contiguous_flat<T: WeightValue>(&self, _src: &Self::Buf<T>, _dst: &mut Self::Buf<u64>, _start: usize, _len: usize, _op: ReductionOpTypes) -> Result<(), TensorError> {
-        Err(unsupported("argmax"))
+    fn apply_argmax_contiguous_flat<T: WeightValue>(&self, src: &Self::Buf<T>, dst: &mut Self::Buf<u64>, start: usize, len: usize, op: ReductionOpTypes) -> Result<(), TensorError> {
+        self.submit(Op::ArgFlat { src: self.wire(src)?, dst: self.wire(dst)?, start, len, op })
     }
-    fn apply_argmax_contiguous_nd<T: WeightValue>(&self, _src: (&Self::Buf<T>, &MetaTensor), _dst: (&mut Self::Buf<u64>, &MetaTensor), _dim: Dim, _op: ReductionOpTypes) -> Result<(), TensorError> {
-        Err(unsupported("argmax"))
+    fn apply_argmax_contiguous_nd<T: WeightValue>(&self, src: (&Self::Buf<T>, &MetaTensor), dst: (&mut Self::Buf<u64>, &MetaTensor), dim: Dim, op: ReductionOpTypes) -> Result<(), TensorError> {
+        self.submit(Op::ArgNd { src: (self.wire(src.0)?, src.1.clone()), dst: (self.wire(dst.0)?, dst.1.clone()), dim, op })
     }
     fn apply_conv_2d<T: WeightValue>(&self, _input: (&Self::Buf<T>, &MetaTensor), _kernel: (&Self::Buf<T>, &MetaTensor), _output: &mut Self::Buf<T>, _config: &ConvConfig2D) -> Result<(), TensorError> {
+        // Neither the CPU nor the CUDA backend implements conv_2d yet, so there is nothing to forward to.
         Err(unsupported("conv_2d"))
     }
 }

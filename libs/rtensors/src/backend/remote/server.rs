@@ -3,7 +3,7 @@
 
 use std::{collections::HashMap, net::{IpAddr, TcpListener, TcpStream}, thread::{self, JoinHandle}};
 
-use crate::{backend::{cpu::Cpu, ContiguityTypes, remote::protocol::{read_frame, write_frame, BufId, Layout, Op, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}, Backend, BackendMatMul}, core::{primitives::DeviceType, tensor::TensorError, value::{types, DType, TensorValue}, MetaTensor}};
+use crate::{backend::{cpu::Cpu, ContiguityTypes, remote::protocol::{read_frame, write_frame, BufId, Layout, Op, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}, Backend, BackendMatMul}, core::{primitives::DeviceType, tensor::TensorError, value::{types, DType, TensorValue}, Dim, MetaTensor}, ops::reduction::ReductionOpTypes};
 
 pub(crate) struct RemoteServer {
     address: IpAddr,
@@ -45,21 +45,36 @@ pub fn launch_server(ip: IpAddr, port: u16) -> Result<JoinHandle<()>, TensorErro
     Ok(handle)
 }
 
-/// A backend the server can execute every op on.
+/// A backend the server can execute ops on, plus what it can actually do. Some backend methods
+/// are `todo!()` or panic for certain inputs; the server reports those as unsupported instead
+/// of calling them (a panic aborts a release-built server).
 pub(crate) trait ServerBackend:
     Backend
     + BackendMatMul<u8> + BackendMatMul<u16> + BackendMatMul<u32> + BackendMatMul<u64> + BackendMatMul<u128>
     + BackendMatMul<i8> + BackendMatMul<i16> + BackendMatMul<i32> + BackendMatMul<i64> + BackendMatMul<i128>
     + BackendMatMul<f32> + BackendMatMul<f64> + BackendMatMul<types::boolean>
 {
+    /// Whether `apply_reduce_*` handles `op`.
+    fn supports_reduction(op: &ReductionOpTypes) -> bool;
+    /// Whether `apply_argmax_*` is implemented.
+    const SUPPORTS_ARGMAX: bool;
 }
 
-impl<B> ServerBackend for B where
-    B: Backend
-    + BackendMatMul<u8> + BackendMatMul<u16> + BackendMatMul<u32> + BackendMatMul<u64> + BackendMatMul<u128>
-    + BackendMatMul<i8> + BackendMatMul<i16> + BackendMatMul<i32> + BackendMatMul<i64> + BackendMatMul<i128>
-    + BackendMatMul<f32> + BackendMatMul<f64> + BackendMatMul<types::boolean>
-{
+impl ServerBackend for Cpu {
+    fn supports_reduction(op: &ReductionOpTypes) -> bool {
+        // The CPU accumulators only exist for these; others panic in `get_accumulator`.
+        matches!(op, ReductionOpTypes::Sum | ReductionOpTypes::Prod | ReductionOpTypes::Max | ReductionOpTypes::Min | ReductionOpTypes::Mean)
+    }
+    const SUPPORTS_ARGMAX: bool = false;
+}
+
+#[cfg(feature = "cuda")]
+impl ServerBackend for crate::backend::cuda::Cuda {
+    fn supports_reduction(op: &ReductionOpTypes) -> bool {
+        // The flat CUDA kernel silently skips LogSumExp, leaving the output untouched.
+        !matches!(op, ReductionOpTypes::ArgMax | ReductionOpTypes::ArgMin | ReductionOpTypes::LogSumExp)
+    }
+    const SUPPORTS_ARGMAX: bool = true;
 }
 
 /// Generates the type-erased buffer enum and the `Elem` trait that moves typed buffers in and out of it.
@@ -159,18 +174,36 @@ fn check_extent(what: &str, offset: usize, shape: &[usize], stride: &[isize], le
     if shape.len() != stride.len() {
         return Err(invalid(format!("{what}: shape has {} dims but stride has {}", shape.len(), stride.len())));
     }
+    if element_count(shape).is_none() {
+        return Err(invalid(format!("{what}: shape {shape:?} has too many elements")));
+    }
     if shape.iter().any(|&d| d == 0) {
+        // Nothing is addressed, but kernels still slice `offset..offset`.
+        if offset > len {
+            return Err(invalid(format!("{what}: offset {offset} is past the end of a buffer with {len} elements")));
+        }
         return Ok(());
     }
+    let overflow = || invalid(format!("{what}: extent overflows"));
     let (mut lo, mut hi) = (offset as i128, offset as i128);
     for (&d, &s) in shape.iter().zip(stride) {
+        // |span| < 2^64 * 2^63, so the product fits in i128; the running sums are checked.
         let span = (d as i128 - 1) * s as i128;
-        if span < 0 { lo += span } else { hi += span }
+        if span < 0 {
+            lo = lo.checked_add(span).ok_or_else(overflow)?;
+        } else {
+            hi = hi.checked_add(span).ok_or_else(overflow)?;
+        }
     }
     if lo < 0 || hi >= len as i128 {
         return Err(invalid(format!("{what}: addresses elements {lo}..={hi} of a buffer with {len} elements")));
     }
     Ok(())
+}
+
+/// Product of `dims`, or `None` if it overflows `usize`.
+fn element_count(dims: &[usize]) -> Option<usize> {
+    dims.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))
 }
 
 /// Same error the CPU backend reports for an out-of-range `read`/`write`.
@@ -230,6 +263,66 @@ fn check_matmul_operand(
     let as_batched = [batches, rows, cols];
     let as_strides = [batch_stride, row_stride, col_stride];
     check_extent(what, meta.offset, &as_batched, &as_strides, len)
+}
+
+/// Checks a reduction along `dim` of a contiguous, row-major `src` into `dst_len` outputs.
+/// The kernels index `src` as a dense row-major block of `size` elements (the CPU kernel from
+/// index 0, ignoring the offset, which is a known CPU-backend bug; CUDA from the offset), so
+/// require exactly that layout and that `offset + size` fits.
+///
+/// Returns `false` when there are no outputs, in which case the kernel must not run: with a
+/// zero-size dim the kernels still compute at least one output (`inner_dimensions` clamps to 1).
+fn check_reduce_nd(meta: &MetaTensor, dim: Dim, src_len: usize, dst_len: usize) -> Result<bool, TensorError> {
+    let shape = meta.shape.as_slice();
+    let strides: &[isize] = meta.strides.as_ref();
+    if strides.len() != shape.len() {
+        return Err(invalid(format!("reduction source has {} dims but {} strides", shape.len(), strides.len())));
+    }
+    if dim >= shape.len() {
+        return Err(invalid(format!("reduction dim {dim} out of range for rank {}", shape.len())));
+    }
+    let too_big = || invalid(format!("reduction source shape {shape:?} has too many elements"));
+    let size = element_count(shape).ok_or_else(too_big)?;
+    let outputs = element_count(&shape[..dim]).zip(element_count(&shape[dim + 1..]))
+        .and_then(|(outer, inner)| outer.checked_mul(inner))
+        .ok_or_else(too_big)?;
+    if outputs == 0 {
+        return Ok(false);
+    }
+    let mut expected = 1isize;
+    for d in (0..shape.len()).rev() {
+        if shape[d] > 1 && strides[d] != expected {
+            return Err(invalid(format!("reduction source must be row-major contiguous, got strides {strides:?} for shape {shape:?}")));
+        }
+        expected = expected.saturating_mul(shape[d] as isize);
+    }
+    if meta.offset.checked_add(size).is_none_or(|end| end > src_len) {
+        return Err(invalid(format!("reduction source of {size} elements at offset {} exceeds buffer of {src_len}", meta.offset)));
+    }
+    if dst_len < outputs {
+        return Err(invalid(format!("reduction output needs {outputs} elements, buffer has {dst_len}")));
+    }
+    Ok(true)
+}
+
+fn check_reduce_flat(start: usize, len: usize, src_len: usize, dst_len: usize) -> Result<(), TensorError> {
+    check_extent("reduction source", start, &[len], &[1], src_len)?;
+    if dst_len == 0 {
+        return Err(invalid("reduction output buffer is empty".into()));
+    }
+    Ok(())
+}
+
+fn check_reduction_op<B: ServerBackend>(op: &ReductionOpTypes, arg: bool) -> Result<(), TensorError> {
+    let is_arg = matches!(op, ReductionOpTypes::ArgMax | ReductionOpTypes::ArgMin);
+    if arg != is_arg {
+        return Err(invalid(format!("{op:?} is not valid for this reduction entry point")));
+    }
+    let supported = if arg { B::SUPPORTS_ARGMAX } else { B::supports_reduction(op) };
+    if !supported {
+        return Err(TensorError::UnsupportedOperation(format!("{op:?} reduction is not implemented by the server's backend")));
+    }
+    Ok(())
 }
 
 /// Buffers owned by one client connection.
@@ -412,6 +505,62 @@ impl<B: ServerBackend> Session<B> {
                     b, m, k, n,
                 ).map(|_| Reply::Ack)
             }),
+            Op::Fill { buf, value, layout } => dispatch!(any buf.dtype, "fill", T => {
+                let value = value.to_value::<T>()?;
+                with_layout!(backend, fill, target::<B, T>(backend, store, buf, &layout)?, layout, value).map(|_| Reply::Ack)
+            }),
+            Op::Convert { src, dst } => dispatch!(any src.dtype, "convert", T => dispatch!(any dst.dtype, "convert", N => {
+                let (src_ptr, dst_ptr) = distinct_ptrs::<B, T, N>(store, src, dst)?;
+                // SAFETY: distinct ids, one lookup each (distinct_ptrs); the store is not mutated
+                // while these references are live.
+                let (src_buf, dst_buf) = unsafe { (&*src_ptr, &mut *dst_ptr) };
+                if backend.len(src_buf) != backend.len(dst_buf) {
+                    return Err(TensorError::SizeMismatch(format!(
+                        "Buffer size mismatch in convert: src size {}, dst size {}", backend.len(src_buf), backend.len(dst_buf)
+                    )));
+                }
+                backend.convert::<T, N>(src_buf, dst_buf).map(|_| Reply::Ack)
+            })),
+            Op::ReduceFlat { src, dst, start, len, op } => dispatch!(float src.dtype, "reduce", T => {
+                check_reduction_op::<B>(&op, false)?;
+                let (src_ptr, dst_ptr) = distinct_ptrs::<B, T, T>(store, src, dst)?;
+                // SAFETY: distinct ids, one lookup each (distinct_ptrs); the store is not mutated
+                // while these references are live.
+                let (src_buf, dst_buf) = unsafe { (&*src_ptr, &mut *dst_ptr) };
+                check_reduce_flat(start, len, backend.len(src_buf), backend.len(dst_buf))?;
+                backend.apply_reduce_contiguous_flat(src_buf, dst_buf, start, len, op).map(|_| Reply::Ack)
+            }),
+            Op::ReduceNd { src, dst, dim, op } => dispatch!(float src.0.dtype, "reduce", T => {
+                check_reduction_op::<B>(&op, false)?;
+                let (src_ptr, dst_ptr) = distinct_ptrs::<B, T, T>(store, src.0, dst.0)?;
+                // SAFETY: distinct ids, one lookup each (distinct_ptrs); the store is not mutated
+                // while these references are live.
+                let (src_buf, dst_buf) = unsafe { (&*src_ptr, &mut *dst_ptr) };
+                if !check_reduce_nd(&src.1, dim, backend.len(src_buf), backend.len(dst_buf))? {
+                    return Ok(Reply::Ack);
+                }
+                backend.apply_reduce_contiguous_nd((src_buf, &src.1), (dst_buf, &dst.1), dim, op).map(|_| Reply::Ack)
+            }),
+            Op::ArgFlat { src, dst, start, len, op } => dispatch!(float src.dtype, "argmax", T => {
+                check_reduction_op::<B>(&op, true)?;
+                let (src_ptr, dst_ptr) = distinct_ptrs::<B, T, u64>(store, src, dst)?;
+                // SAFETY: distinct ids, one lookup each (distinct_ptrs); the store is not mutated
+                // while these references are live.
+                let (src_buf, dst_buf) = unsafe { (&*src_ptr, &mut *dst_ptr) };
+                check_reduce_flat(start, len, backend.len(src_buf), backend.len(dst_buf))?;
+                backend.apply_argmax_contiguous_flat(src_buf, dst_buf, start, len, op).map(|_| Reply::Ack)
+            }),
+            Op::ArgNd { src, dst, dim, op } => dispatch!(float src.0.dtype, "argmax", T => {
+                check_reduction_op::<B>(&op, true)?;
+                let (src_ptr, dst_ptr) = distinct_ptrs::<B, T, u64>(store, src.0, dst.0)?;
+                // SAFETY: distinct ids, one lookup each (distinct_ptrs); the store is not mutated
+                // while these references are live.
+                let (src_buf, dst_buf) = unsafe { (&*src_ptr, &mut *dst_ptr) };
+                if !check_reduce_nd(&src.1, dim, backend.len(src_buf), backend.len(dst_buf))? {
+                    return Ok(Reply::Ack);
+                }
+                backend.apply_argmax_contiguous_nd((src_buf, &src.1), (dst_buf, &dst.1), dim, op).map(|_| Reply::Ack)
+            }),
             Op::Unary { buf, op, layout } => unary(backend, store, buf, op, layout).map(|_| Reply::Ack),
             Op::Scalar { buf, op, value, layout } => scalar(backend, store, buf, op, value, layout).map(|_| Reply::Ack),
         }
@@ -442,6 +591,18 @@ float_unary_ops!(
     Reciprocal => apply_reciprocal, Square => apply_square, Cube => apply_cube,
     Exp => apply_exp, Sign => apply_sign,
 );
+
+/// Pointers to a source and a different destination buffer, possibly of different dtypes.
+/// Each comes from one lookup, and the store must not be touched while they are in use.
+#[allow(clippy::type_complexity)]
+fn distinct_ptrs<B: ServerBackend, S: Elem, D: Elem>(store: &mut Store<B>, src: TypelessBuf, dst: TypelessBuf) -> Result<(*const B::Buf<S>, *mut B::Buf<D>), TensorError> {
+    if src.id == dst.id {
+        return Err(invalid("source and destination must be different buffers".into()));
+    }
+    let src_ptr = store.get_mut::<S>(src)? as *const B::Buf<S>;
+    let dst_ptr = store.get_mut::<D>(dst)? as *mut B::Buf<D>;
+    Ok((src_ptr, dst_ptr))
+}
 
 /// Looks up the buffer an elementwise op writes and checks the layout stays inside it.
 fn target<'a, B: ServerBackend, T: Elem>(backend: &B, store: &'a mut Store<B>, buf: TypelessBuf, layout: &Layout) -> Result<&'a mut B::Buf<T>, TensorError> {

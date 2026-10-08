@@ -136,6 +136,8 @@ impl<T: WeightValue> Accumulator<T> for MeanAccumulator<T> {
     }
 }
 
+#[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReductionOpTypes {
     Sum,
     Prod,
@@ -196,6 +198,8 @@ impl ReductionOpTypes {
     }
 }
 
+#[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NormType {
     L1,
     L2
@@ -267,7 +271,10 @@ where
     let tensor = tensor.view();
     match axes {
         Idx::Item => {
-            let mut output = TensorBase::from_buf(vec![T::ZERO], vec![])?;
+            // Allocate on the input's backend: `from_buf` would use `B::new()`, which for the
+            // remote backend can be a different connection than the one holding the input.
+            let buf = tensor.backend.alloc_from_slice(vec![T::ZERO].into_boxed_slice())?;
+            let mut output = TensorBase::from_parts(tensor.backend.clone(), buf, MetaTensor::new(vec![], vec![], 0), None);
             tensor.backend.apply_reduce_contiguous_flat(
                 tensor.buf,
                 &mut output.buf,
@@ -307,7 +314,8 @@ where
     let tensor = tensor.view();
     match axes {
         Idx::Item => {
-            let mut output = TensorBase::<u64, _>::from_buf(vec![ 0u64 ], vec![])?;
+            let buf = tensor.backend.alloc_from_slice(vec![0u64].into_boxed_slice())?;
+            let mut output = TensorBase::<u64, B>::from_parts(tensor.backend.clone(), buf, MetaTensor::new(vec![], vec![], 0), None);
             tensor.backend.apply_argmax_contiguous_flat(
                 tensor.buf,
                 &mut output.buf,
