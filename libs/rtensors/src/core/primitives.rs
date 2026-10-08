@@ -6,6 +6,8 @@ use std::sync::{Arc, RwLock};
 
 use crate::backend::Backend;
 use crate::backend::cpu::Cpu;
+#[cfg(feature = "remote")]
+use crate::core::tensor::AsTensor;
 use crate::core::untyped::UntypedTensor;
 use crate::core::value::TensorValue;
 use crate::core::{shape_to_stride, MetaTensor, MetaTensorView, Shape};
@@ -143,7 +145,7 @@ impl<T: TensorValue> RemoteTensor<T> {
 impl<T: TensorValue> Tensor<T> {
     /// Copies this tensor to `backend`'s server. The copy starts a new autograd graph.
     pub fn to_remote(&self, backend: &RemoteBackend) -> Result<RemoteTensor<T>, TensorError> {
-        let contiguous = crate::core::tensor::AsTensor::contiguous(self);
+        let contiguous = self.contiguous();
         let buf = backend.alloc_from_slice(contiguous.backend.dump(&contiguous.buf)?)?;
         // Not attached to this tensor's autograd node: the graph is per backend type.
         Ok(RemoteTensor::from_parts(backend.clone(), buf, contiguous.meta.clone(), None))

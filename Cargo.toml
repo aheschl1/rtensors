@@ -6,7 +6,7 @@ members = [
     "libs/proc", 
     "libs/benchmark",
     "examples/mnist"
-]
+, "examples/remote-client"]
 
 [profile.release]
 opt-level = 3              # Maximum optimization
