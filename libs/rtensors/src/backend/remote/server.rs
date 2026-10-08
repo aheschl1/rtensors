@@ -588,9 +588,17 @@ macro_rules! broadcast_for_dtype {
         with_device!($connection, |buffers, backend| {
             // Broadcast explicitly allows `dst` to alias `left` (in-place ops), so hand the backend
             // raw pointers derived from mutable lookups rather than casting shared references.
+            // Each distinct id is looked up exactly once: a second `get_mut` on the same slot would
+            // invalidate the pointer derived from the first.
             let left_ptr = buf_ptr!(buffers, $buffer_field, $left_id, "Left");
-            let right_ptr = buf_ptr!(buffers, $buffer_field, $right_id, "Right");
-            let dst_ptr = buf_ptr!(buffers, $buffer_field, $dst_id, "Dst");
+            let right_ptr = if $right_id == $left_id { left_ptr } else { buf_ptr!(buffers, $buffer_field, $right_id, "Right") };
+            let dst_ptr = if $dst_id == $left_id {
+                left_ptr
+            } else if $dst_id == $right_id {
+                right_ptr
+            } else {
+                buf_ptr!(buffers, $buffer_field, $dst_id, "Dst")
+            };
             backend.broadcast(
                 (left_ptr as *const _, $left_meta),
                 (right_ptr as *const _, $right_meta),
@@ -608,11 +616,13 @@ macro_rules! matmul_for_dtype {
         }
         with_device!($connection, |buffers, backend| {
             // lhs and rhs may be the same buffer (e.g. `x @ x`), so they cannot come from get_disjoint_mut.
+            // Look up a shared operand once; a second `get_mut` would invalidate the first pointer.
             let lhs_ptr = buf_ptr!(buffers, $buffer_field, $lhs_id, "Lhs");
-            let rhs_ptr = buf_ptr!(buffers, $buffer_field, $rhs_id, "Rhs");
+            let rhs_ptr = if $rhs_id == $lhs_id { lhs_ptr } else { buf_ptr!(buffers, $buffer_field, $rhs_id, "Rhs") };
             let dst_ptr = buf_ptr!(buffers, $buffer_field, $dst_id, "Dst");
-            // SAFETY: all three point into the locked map, which is not touched again while they live;
-            // dst is distinct from both inputs (checked above), and lhs/rhs are only read.
+            // SAFETY: the pointers come from one lookup per distinct id in the locked map, which is not
+            // touched again while they live; dst is distinct from both inputs (checked above), and
+            // lhs/rhs are only read.
             let (lhs_buf, rhs_buf, dst_buf) = unsafe { (&*lhs_ptr, &*rhs_ptr, &mut *dst_ptr) };
             backend.matmul(
                 (lhs_buf, $lhs_meta, $lhs_contiguity),
