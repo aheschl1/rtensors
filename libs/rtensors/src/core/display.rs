@@ -143,6 +143,18 @@ fn format_tensor_recursive<T: TensorValue>(
 }
 
 /// Format tensor for Debug output in PyTorch style
+fn device_name(device: &crate::core::primitives::DeviceType) -> String {
+    match device {
+        crate::core::primitives::DeviceType::Cpu => "cpu".to_string(),
+        #[cfg(feature = "cuda")]
+        crate::core::primitives::DeviceType::Cuda(id) => format!("cuda:{}", id),
+        #[cfg(feature = "remote")]
+        crate::core::primitives::DeviceType::Remote { ip, port, remote_type } => {
+            format!("remote({ip}:{port}, {})", device_name(remote_type))
+        }
+    }
+}
+
 fn format_tensor_data<T: TensorValue, B: Backend>(
     backend: &B,
     buf: &B::Buf<T>,
@@ -176,7 +188,7 @@ fn format_tensor_data<T: TensorValue, B: Backend>(
     };
     
     // Get device string
-    let device_type = B::device_type();
+    let device_type = backend.device();
     
     write!(f, "tensor(")?;
     
@@ -204,13 +216,7 @@ fn format_tensor_data<T: TensorValue, B: Backend>(
     )?;
     
     // Format device string
-    let device_str = match device_type {
-        crate::core::primitives::DeviceType::Cpu => "cpu".to_string(),
-        #[cfg(feature = "cuda")]
-        crate::core::primitives::DeviceType::Cuda(id) => format!("cuda:{}", id),
-        #[cfg(feature = "remote")]
-        crate::core::primitives::DeviceType::Remote { .. } => "remote".to_string(),
-    };
+    let device_str = device_name(&device_type);
     
     write!(f, ", dtype={}, device={})", dtype_str, device_str)?;
     Ok(())

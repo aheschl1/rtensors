@@ -213,7 +213,7 @@ specify_unary_op_template! {
     (Abs) abs where T: WeightValue; |true, input, result, _ctx, grad_node| {
         // TODO: Make a kernel for this
         let input = input.unwrap();
-        let mut grad_map = TensorBase::<T, B>::zeros(input.shape());
+        let mut grad_map = TensorBase::<T, B>::zeros_on(&input.backend, input.shape());
         for coord in input.iter_coords() {
             let val = input.get(&coord).unwrap();
             if val > T::ZERO {
@@ -233,7 +233,7 @@ specify_unary_op_template! {
     },
     (Relu) relu; |true, input, result, _ctx, grad_node| {
         let input = input.unwrap();
-        let mut grad_map = TensorBase::<T, B>::zeros(input.shape());
+        let mut grad_map = TensorBase::<T, B>::zeros_on(&input.backend, input.shape());
         // TODO: Make a kernel for this
         for coord in input.iter_coords() {
             let val = input.get(&coord).unwrap();
@@ -1827,11 +1827,11 @@ mod cuda_tests {
 
 #[cfg(all(test, feature = "remote"))]
 mod remote_tests {
-    use std::{sync::OnceLock, thread};
+    use std::sync::OnceLock;
 
     use crate::{
         backend::{
-            remote::{client::RemoteBackend, get_backend_default, server::RemoteServer},
+            remote::{client::RemoteBackend, get_backend_default},
             Backend,
         },
         core::{
@@ -1849,11 +1849,7 @@ mod remote_tests {
         BACKEND
             .get_or_init(|| {
                 // Start the server
-                let mut server = RemoteServer::new("127.0.0.1".parse().unwrap(), 7878);
-                thread::spawn(move || {
-                    let _ = server.serve();
-                });
-                thread::sleep(std::time::Duration::from_millis(10));
+                crate::backend::remote::server::ensure_test_server("127.0.0.1".parse().unwrap(), 7878);
 
                 // Create and connect the backend
                 let backend = get_backend_default().unwrap();

@@ -148,7 +148,7 @@ specify_binary_scalar_op_template!(
     },
     (LeakyReluOp) leaky_relu; |true, input, _result, _ctx, grad_node, scalar| {
         let input = input.unwrap();
-        let mut grad_map = TensorBase::<T, B>::zeros(input.shape());
+        let mut grad_map = TensorBase::<T, B>::zeros_on(&input.backend, input.shape());
         for coord in input.iter_coords() {
             let val = input.get(&coord).unwrap();
             if val > T::ZERO {

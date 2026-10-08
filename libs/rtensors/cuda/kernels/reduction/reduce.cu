@@ -242,7 +242,7 @@ void launch_flat_contiguous_reduce(
         d_in, d_out, num_items, op, init);
 
     // Free the temporary storage allocation.
-    cudaFree(&d_temp_storage);
+    cudaFree(d_temp_storage);
 
     post_transform_kernel<<<1, 1>>>(d_out, num_items, post);
 }

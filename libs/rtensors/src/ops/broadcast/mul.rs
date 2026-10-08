@@ -178,7 +178,7 @@ macro_rules! impl_mul {
             fn mul(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.clone());
                 attach_broadcast_mul_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -213,7 +213,7 @@ macro_rules! impl_mul {
             fn mul(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.clone());
                 attach_broadcast_mul_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -248,7 +248,7 @@ macro_rules! impl_mul {
             fn mul(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.clone());
                 attach_broadcast_mul_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -283,7 +283,7 @@ macro_rules! impl_mul {
             fn mul(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.clone());
                 attach_broadcast_mul_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -318,7 +318,7 @@ macro_rules! impl_mul {
             fn mul(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.clone());
                 attach_broadcast_mul_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -353,7 +353,7 @@ macro_rules! impl_mul {
             fn mul(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.clone());
                 attach_broadcast_mul_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -388,7 +388,7 @@ macro_rules! impl_mul {
             fn mul(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.clone());
                 attach_broadcast_mul_grad(
                     self.contiguous(),
                     rhs.contiguous(),
@@ -424,7 +424,7 @@ macro_rules! impl_mul {
             fn mul(self, rhs: $rhs_type) -> Self::Output {
                 let (out_shape, broadcast_stra, broadcast_strb) =
                     compute_broadcasted_params(&self.meta, &rhs.meta).unwrap();
-                let mut result = TensorBase::<T, B>::zeros(out_shape.clone());
+                let mut result = TensorBase::<T, B>::zeros_on(&self.backend, out_shape.clone());
                 attach_broadcast_mul_grad(
                     self.contiguous(),
                     rhs.contiguous(),
