@@ -6,6 +6,18 @@ use crate::{backend::{remote::{get_backend_default, protocol::{read_frame, write
 /// passed to another (buffer ids are only meaningful within their own connection).
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Request ids carry the sending thread's tag in their high bits, so the failure of a pipelined
+/// request is reported to the thread that sent it rather than to whichever thread calls next.
+const THREAD_TAG_SHIFT: u32 = 40;
+static NEXT_THREAD_TAG: AtomicU64 = AtomicU64::new(0);
+
+fn thread_tag() -> u64 {
+    thread_local! {
+        static TAG: u64 = NEXT_THREAD_TAG.fetch_add(1, Ordering::Relaxed) & ((1 << (64 - THREAD_TAG_SHIFT)) - 1);
+    }
+    TAG.with(|tag| *tag)
+}
+
 /// Handle to a buffer living on a remote server.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RemoteBuf<T: TensorValue> {
@@ -21,8 +33,9 @@ pub struct RemoteBuf<T: TensorValue> {
 struct State {
     /// Callers waiting for the response to a request, keyed by request id.
     pending: HashMap<u64, flume::Sender<Result<Reply, TensorError>>>,
-    /// First error reported for a fire-and-forget request that has not been surfaced yet.
-    deferred: Option<TensorError>,
+    /// Per sending thread (see [`thread_tag`]): the first error reported for one of its
+    /// fire-and-forget requests that has not been surfaced yet.
+    deferred: HashMap<u64, TensorError>,
     /// Set once the connection is unusable, with the reason.
     closed: Option<String>,
 }
@@ -43,9 +56,8 @@ impl Drop for Inner {
     fn drop(&mut self) {
         // Wakes the reader thread with EOF and tells the server to drop this session's buffers.
         if let Some(writer) = self.writer.get() {
-            if let Ok(stream) = writer.lock() {
-                let _ = stream.shutdown(Shutdown::Both);
-            }
+            let stream = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = stream.shutdown(Shutdown::Both);
         }
     }
 }
@@ -54,7 +66,8 @@ impl Drop for Inner {
 ///
 /// Operations that only mutate remote buffers are pipelined: they return as soon as the request
 /// is written, and the server runs requests in order. If one of them fails, the error is
-/// returned by the next call made on this backend (or by [`RemoteBackend::sync`]).
+/// returned by the next call the same thread makes on this backend (or by [`RemoteBackend::sync`]).
+/// Clones share one connection and may be used from several threads.
 #[derive(Clone)]
 pub struct RemoteBackend {
     inner: Arc<Inner>,
@@ -125,8 +138,8 @@ impl RemoteBackend {
         (self.inner.remote_addr, self.inner.remote_port)
     }
 
-    /// Waits until the server has executed every request sent so far, returning the first
-    /// error any of them produced.
+    /// Waits until the server has executed every request sent so far (by any thread), then
+    /// returns the first unreported error among the requests this thread sent.
     pub fn sync(&self) -> Result<(), TensorError> {
         match self.call(Op::Sync)? {
             Reply::Ack => Ok(()),
@@ -134,15 +147,20 @@ impl RemoteBackend {
         }
     }
 
-    /// Fails fast if the connection is gone or an earlier pipelined request failed.
+    /// Fails fast if the connection is gone or one of this thread's pipelined requests failed.
     fn check_state(state: &mut State) -> Result<(), TensorError> {
         if let Some(reason) = &state.closed {
             return Err(closed_error(reason));
         }
-        if let Some(e) = state.deferred.take() {
+        if let Some(e) = state.deferred.remove(&thread_tag()) {
             return Err(e);
         }
         Ok(())
+    }
+
+    fn next_request_id(&self) -> u64 {
+        let counter = self.inner.next_request.fetch_add(1, Ordering::Relaxed) & ((1 << THREAD_TAG_SHIFT) - 1);
+        (thread_tag() << THREAD_TAG_SHIFT) | counter
     }
 
     fn write(&self, request: &Request) -> Result<(), TensorError> {
@@ -158,7 +176,7 @@ impl RemoteBackend {
 
     /// Sends a request and waits for its reply.
     fn call(&self, op: Op) -> Result<Reply, TensorError> {
-        let id = self.inner.next_request.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_request_id();
         let (tx, rx) = flume::bounded(1);
         {
             let mut state = self.inner.state.lock().unwrap();
@@ -173,9 +191,9 @@ impl RemoteBackend {
             let state = self.inner.state.lock().unwrap();
             closed_error(state.closed.as_deref().unwrap_or("reader stopped"))
         })?;
-        // The server answers in order, so any failure of an earlier pipelined request has been
-        // recorded by now. Surface it here rather than letting it go unnoticed.
-        if let Some(e) = self.inner.state.lock().unwrap().deferred.take() {
+        // The server answers in order, so any failure of a pipelined request this thread sent
+        // earlier has been recorded by now. Surface it here rather than letting it go unnoticed.
+        if let Some(e) = self.inner.state.lock().unwrap().deferred.remove(&thread_tag()) {
             return Err(e);
         }
         result
@@ -183,7 +201,7 @@ impl RemoteBackend {
 
     /// Sends a request without waiting. Failures are reported by a later call.
     fn submit(&self, op: Op) -> Result<(), TensorError> {
-        let id = self.inner.next_request.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_request_id();
         Self::check_state(&mut self.inner.state.lock().unwrap())?;
         self.write(&Request { id, reply: false, op })
     }
@@ -422,8 +440,8 @@ fn read_incoming(state: Arc<Mutex<State>>, mut stream: TcpStream) {
                     Some(waiter) => { let _ = waiter.send(response.result); }
                     None => {
                         if let Err(e) = response.result {
-                            // Keep the first failure; later ones are usually consequences of it.
-                            state.deferred.get_or_insert(e);
+                            // Keep the sender's first failure; later ones are usually consequences of it.
+                            state.deferred.entry(response.id >> THREAD_TAG_SHIFT).or_insert(e);
                         }
                     }
                 }

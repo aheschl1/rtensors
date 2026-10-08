@@ -610,14 +610,88 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_server_panic_is_an_error() {
+    fn test_remote_out_of_range_requests_are_rejected() {
+        // These would index out of bounds in the backend (a panic, which aborts a release-built
+        // server), so the server must reject them before they get there.
         let backend = own_backend();
         let mut buf = backend.alloc_from_slice::<f32>(vec![-1.0, 2.0].into()).unwrap();
-        // Out-of-range layout makes the CPU kernel panic on the server.
-        backend.apply_relu_contiguous(&mut buf, 0, 1000).unwrap();
-        let err = backend.sync().unwrap_err();
-        assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("panicked")), "{err:?}");
+        let other = backend.alloc_from_slice::<f32>(vec![0.0; 4].into()).unwrap();
+        let attempts: Vec<Box<dyn Fn(&mut crate::backend::remote::client::RemoteBuf<f32>)>> = vec![
+            Box::new(|b| backend.apply_relu_contiguous(b, 0, 1000).unwrap()),
+            Box::new(|b| backend.apply_relu_1d_strided(b, 1, -2, 2).unwrap()),
+            Box::new(|b| backend.scalar_apply_add_nd(b, 1.0, 0, &[2, 2], &[1, 1]).unwrap()),
+            Box::new(|b| backend.copy_range_within(b, &other, 1, 0, 2).unwrap()),
+        ];
+        for (i, attempt) in attempts.iter().enumerate() {
+            attempt(&mut buf);
+            let err = backend.sync().unwrap_err();
+            assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("invalid request")), "attempt {i}: {err:?}");
+        }
         assert_eq!(&*backend.dump(&buf).unwrap(), &[-1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_remote_matmul_rejects_bad_extents() {
+        let backend = own_backend();
+        let lhs = backend.alloc_from_slice::<f32>(vec![1.0; 4].into()).unwrap();
+        let rhs = backend.alloc_from_slice::<f32>(vec![1.0; 4].into()).unwrap();
+        let mut dst = backend.alloc::<f32>(4).unwrap();
+        let meta = MetaTensor::new(vec![2, 2], vec![2, 1], 0);
+        // Claims 3x3 matrices backed by 4-element buffers.
+        crate::backend::BackendMatMul::<f32>::matmul(
+            &backend,
+            (&lhs, &meta, crate::core::meta::ContiguityTypes::RowMajor),
+            (&rhs, &meta, crate::core::meta::ContiguityTypes::RowMajor),
+            &mut dst, 1, 3, 3, 3,
+        ).unwrap();
+        let err = backend.sync().unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("invalid request")), "{err:?}");
+        // Offset pushes a valid-looking 2x2 past the end of the buffer.
+        let shifted = MetaTensor::new(vec![2, 2], vec![2, 1], 1);
+        crate::backend::BackendMatMul::<f32>::matmul(
+            &backend,
+            (&lhs, &shifted, crate::core::meta::ContiguityTypes::RowMajor),
+            (&rhs, &meta, crate::core::meta::ContiguityTypes::RowMajor),
+            &mut dst, 1, 2, 2, 2,
+        ).unwrap();
+        assert!(backend.sync().is_err());
+    }
+
+    #[test]
+    fn test_remote_deferred_errors_stay_with_their_thread() {
+        let backend = own_backend();
+        let mut bad = backend.alloc_from_slice::<i32>(vec![0; 2].into()).unwrap();
+        backend.sync().unwrap();
+        // This thread's pipelined write fails on the server...
+        backend.write(&mut bad, 99, 1).unwrap();
+        // ...but another thread's calls are unaffected, even after the failure has arrived.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                backend.sync().unwrap();
+                let buf = backend.alloc_from_slice::<i32>(vec![5, 6].into()).unwrap();
+                assert_eq!(backend.read(&buf, 1).unwrap(), 6);
+            });
+        });
+        let err = backend.read(&bad, 0).unwrap_err();
+        assert!(matches!(err, TensorError::IdxOutOfBounds(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_remote_concurrent_threads_share_a_connection() {
+        let backend = own_backend();
+        std::thread::scope(|scope| {
+            for t in 0..8i64 {
+                let backend = &backend;
+                scope.spawn(move || {
+                    for i in 0..200i64 {
+                        let mut buf = backend.alloc_from_slice::<i64>(vec![t, i].into()).unwrap();
+                        backend.scalar_apply_mul_contiguous(&mut buf, 3, 0, 2).unwrap();
+                        backend.scalar_apply_add_contiguous(&mut buf, 1, 0, 2).unwrap();
+                        assert_eq!(&*backend.dump(&buf).unwrap(), &[3 * t + 1, 3 * i + 1]);
+                    }
+                });
+            }
+        });
     }
 
     #[test]
@@ -641,7 +715,8 @@ mod tests {
             len: buf.len,
             _marker: std::marker::PhantomData,
         };
-        assert!(backend.read(&forged, 0).is_err());
+        let err = backend.read(&forged, 0).unwrap_err();
+        assert!(matches!(err, TensorError::RemoteError(ref m) if m.contains("has dtype")), "{err:?}");
     }
 
     #[test]
@@ -682,6 +757,22 @@ mod tests {
             atanh_inplace, rsqrt_inplace, reciprocal_inplace, square_inplace, cube_inplace,
             exp_inplace, sign_inplace
         );
+    }
+
+    #[test]
+    fn test_remote_integer_unary_ops_match_cpu() {
+        use crate::ops::unary::*;
+        let data = vec![-7i32, -1, 0, 3, 12];
+        macro_rules! check {
+            ($($op:ident),+) => {$(
+                let mut remote = make_remote_tensor(data.clone(), vec![5]).unwrap();
+                let mut cpu = Tensor::<i32>::from_buf(data.clone(), vec![5]).unwrap();
+                remote.$op();
+                cpu.$op();
+                assert_eq!(remote.cpu().unwrap(), cpu, "{}", stringify!($op));
+            )+};
+        }
+        check!(neg_inplace, relu_inplace);
     }
 
     #[test]

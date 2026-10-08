@@ -3,7 +3,7 @@
 
 use std::{collections::HashMap, net::{IpAddr, TcpListener, TcpStream}, thread::{self, JoinHandle}};
 
-use crate::{backend::{cpu::Cpu, remote::protocol::{read_frame, write_frame, BufId, Layout, Op, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}, Backend, BackendMatMul}, core::{primitives::DeviceType, tensor::TensorError, value::{types, DType, TensorValue}}};
+use crate::{backend::{cpu::Cpu, ContiguityTypes, remote::protocol::{read_frame, write_frame, BufId, Layout, Op, Reply, Request, Response, ScalarOp, Slice, TypelessBuf, UnaryOp, Value, PROTOCOL_VERSION}, Backend, BackendMatMul}, core::{primitives::DeviceType, tensor::TensorError, value::{types, DType, TensorValue}, MetaTensor}};
 
 pub(crate) struct RemoteServer {
     address: IpAddr,
@@ -128,13 +128,15 @@ macro_rules! dispatch {
 /// `$extra` arguments (e.g. a scalar operand) go between the buffer and the layout arguments.
 macro_rules! with_layout {
     ($backend:expr, $method:ident, $buf:expr, $layout:expr $(, $extra:expr)*) => {
-        paste::paste! {
+        paste::paste! {{
+            // Evaluate the buffer before destructuring the layout, since it may borrow the layout.
+            let buf = $buf;
             match $layout {
-                Layout::Contiguous { start, len } => $backend.[<$method _contiguous>]($buf $(, $extra)*, start, len),
-                Layout::Strided1d { offset, stride, len } => $backend.[<$method _1d_strided>]($buf $(, $extra)*, offset, stride, len),
-                Layout::Nd { offset, shape, stride } => $backend.[<$method _nd>]($buf $(, $extra)*, offset, &shape, &stride),
+                Layout::Contiguous { start, len } => $backend.[<$method _contiguous>](buf $(, $extra)*, start, len),
+                Layout::Strided1d { offset, stride, len } => $backend.[<$method _1d_strided>](buf $(, $extra)*, offset, stride, len),
+                Layout::Nd { offset, shape, stride } => $backend.[<$method _nd>](buf $(, $extra)*, offset, &shape, &stride),
             }
-        }
+        }}
     };
 }
 
@@ -144,6 +146,90 @@ fn missing(id: BufId) -> TensorError {
 
 fn wrong_dtype(buf: TypelessBuf, actual: DType) -> TensorError {
     TensorError::RemoteError(format!("buffer {} has dtype {:?}, request expected {:?}", buf.id, actual, buf.dtype))
+}
+
+fn invalid(msg: String) -> TensorError {
+    TensorError::RemoteError(format!("invalid request: {msg}"))
+}
+
+/// Checks that every element addressed by `offset + sum(i_d * stride_d)` (for `i_d < shape_d`)
+/// lies inside a buffer of `len` elements. Backends index without (or with panicking) bounds
+/// checks, and a panic aborts a release-built server, so requests are validated up front.
+fn check_extent(what: &str, offset: usize, shape: &[usize], stride: &[isize], len: usize) -> Result<(), TensorError> {
+    if shape.len() != stride.len() {
+        return Err(invalid(format!("{what}: shape has {} dims but stride has {}", shape.len(), stride.len())));
+    }
+    if shape.iter().any(|&d| d == 0) {
+        return Ok(());
+    }
+    let (mut lo, mut hi) = (offset as i128, offset as i128);
+    for (&d, &s) in shape.iter().zip(stride) {
+        let span = (d as i128 - 1) * s as i128;
+        if span < 0 { lo += span } else { hi += span }
+    }
+    if lo < 0 || hi >= len as i128 {
+        return Err(invalid(format!("{what}: addresses elements {lo}..={hi} of a buffer with {len} elements")));
+    }
+    Ok(())
+}
+
+/// Same error the CPU backend reports for an out-of-range `read`/`write`.
+fn check_index(offset: usize, len: usize) -> Result<(), TensorError> {
+    if offset >= len {
+        return Err(TensorError::IdxOutOfBounds(format!("Index {offset} out of bounds for buffer of length {len}")));
+    }
+    Ok(())
+}
+
+fn check_layout(layout: &Layout, len: usize) -> Result<(), TensorError> {
+    match layout {
+        Layout::Contiguous { start, len: n } => check_extent("layout", *start, &[*n], &[1], len),
+        Layout::Strided1d { offset, stride, len: n } => check_extent("layout", *offset, &[*n], &[*stride], len),
+        Layout::Nd { offset, shape, stride } => check_extent("layout", *offset, shape, stride, len),
+    }
+}
+
+fn check_meta(what: &str, meta: &MetaTensor, len: usize) -> Result<(), TensorError> {
+    check_extent(what, meta.offset, meta.shape.as_slice(), meta.strides.as_ref(), len)
+}
+
+/// Checks a matmul operand the way the CPU/CUDA kernels address it: `rows x cols` matrices with
+/// one unit-stride dimension (per `contiguity`), `batches` of them `strides[rank - 3]` apart.
+fn check_matmul_operand(
+    what: &str, meta: &MetaTensor, contiguity: &ContiguityTypes, batches: usize, rows: usize, cols: usize, len: usize,
+) -> Result<(), TensorError> {
+    let rank = meta.rank();
+    if rank < 2 {
+        return Err(invalid(format!("{what}: matmul operands need rank >= 2")));
+    }
+    let shape = meta.shape.as_slice();
+    if shape[rank - 2] != rows || shape[rank - 1] != cols {
+        return Err(invalid(format!("{what}: expected a {rows}x{cols} matrix, got shape {shape:?}")));
+    }
+    if shape[..rank - 2].iter().product::<usize>() != batches {
+        return Err(invalid(format!("{what}: batch dims {:?} do not multiply to {batches}", &shape[..rank - 2])));
+    }
+    let strides: &[isize] = meta.strides.as_ref();
+    let (row_stride, col_stride) = (strides[rank - 2], strides[rank - 1]);
+    let unit_ok = match contiguity {
+        ContiguityTypes::RowMajor => col_stride == 1 || cols <= 1,
+        ContiguityTypes::ColumnMajor => row_stride == 1 || rows <= 1,
+        ContiguityTypes::None => false,
+    };
+    if !unit_ok || row_stride < 0 || col_stride < 0 {
+        return Err(invalid(format!("{what}: strides {strides:?} do not match {contiguity:?} layout")));
+    }
+    let batch_stride = if rank > 2 { strides[rank - 3] } else { 0 };
+    // Kernels step through batches by strides[rank - 3] alone, which is only right when the
+    // batch dims collapse into one.
+    let collapsible = (0..rank.saturating_sub(3))
+        .all(|d| shape[d] <= 1 || strides[d] == strides[d + 1] * shape[d + 1] as isize);
+    if batch_stride < 0 || !collapsible {
+        return Err(invalid(format!("{what}: batch dims must be collapsible, got strides {strides:?}")));
+    }
+    let as_batched = [batches, rows, cols];
+    let as_strides = [batch_stride, row_stride, col_stride];
+    check_extent(what, meta.offset, &as_batched, &as_strides, len)
 }
 
 /// Buffers owned by one client connection.
@@ -243,18 +329,27 @@ impl<B: ServerBackend> Session<B> {
                     return Err(TensorError::RemoteError("copy_range_within source and destination must be different buffers".into()));
                 }
                 let [dst_ptr, src_ptr] = store.ptrs::<T, 2>([dst, src])?;
+                // SAFETY (for the lengths below too): the pointers come from the store, which is
+                // not touched while they are in use.
+                let (dst_len, src_len) = unsafe { (backend.len(&*dst_ptr), backend.len(&*src_ptr)) };
+                check_extent("copy_range_within dst", dst_offset, &[len], &[1], dst_len)?;
+                check_extent("copy_range_within src", src_offset, &[len], &[1], src_len)?;
                 // SAFETY: distinct ids, so the pointers refer to different buffers in the store,
                 // which is not touched while they are in use.
                 let (dst_buf, src_buf) = unsafe { (&mut *dst_ptr, &*src_ptr) };
                 backend.copy_range_within(dst_buf, src_buf, dst_offset, src_offset, len).map(|_| Reply::Ack)
             }),
             Op::Read { buf, offset } => dispatch!(any buf.dtype, "read", T => {
-                let value = backend.read(store.get::<T>(buf)?, offset)?;
+                let src = store.get::<T>(buf)?;
+                check_index(offset, backend.len(src))?;
+                let value = backend.read(src, offset)?;
                 Ok(Reply::Value(Value::from_value(value)))
             }),
             Op::Write { buf, offset, value } => dispatch!(any buf.dtype, "write", T => {
                 let value = value.to_value::<T>()?;
-                backend.write(store.get_mut::<T>(buf)?, offset, value).map(|_| Reply::Ack)
+                let dst = store.get_mut::<T>(buf)?;
+                check_index(offset, backend.len(dst))?;
+                backend.write(dst, offset, value).map(|_| Reply::Ack)
             }),
             Op::Copy { src, dst } => dispatch!(any src.dtype, "copy", T => {
                 let copy = backend.copy(store.get::<T>(src)?)?;
@@ -265,7 +360,18 @@ impl<B: ServerBackend> Session<B> {
                 Ok(Reply::Slice(Slice::from_boxed_slice(data)))
             }),
             Op::Broadcast { left, right, dst, op } => dispatch!(any dst.0.dtype, "broadcast", T => {
+                if left.1.shape != dst.1.shape || right.1.shape != dst.1.shape {
+                    return Err(invalid(format!(
+                        "broadcast operands must be pre-broadcast to the output shape {:?}", dst.1.shape
+                    )));
+                }
                 let [left_ptr, right_ptr, dst_ptr] = store.ptrs::<T, 3>([left.0, right.0, dst.0])?;
+                // SAFETY: pointers into the store, which is not touched while they are in use.
+                unsafe {
+                    check_meta("broadcast left", &left.1, backend.len(&*left_ptr))?;
+                    check_meta("broadcast right", &right.1, backend.len(&*right_ptr))?;
+                    check_meta("broadcast dst", &dst.1, backend.len(&*dst_ptr))?;
+                }
                 // Broadcast explicitly allows dst to alias an input and works on raw pointers.
                 backend.broadcast(
                     (left_ptr as *const _, &left.1),
@@ -282,6 +388,22 @@ impl<B: ServerBackend> Session<B> {
                 // SAFETY: one lookup per distinct id; dst is distinct from both inputs and the
                 // inputs (which may be the same buffer, e.g. `x @ x`) are only read.
                 let (lhs_buf, rhs_buf, dst_buf) = unsafe { (&*lhs_ptr, &*rhs_ptr, &mut *dst_ptr) };
+                if lhs.1.rank() != rhs.1.rank() {
+                    return Err(invalid("matmul operands must have the same rank".into()));
+                }
+                if lhs.2 != rhs.2 && !matches!(T::DTYPE, DType::F32 | DType::F64) {
+                    // The generic (non-BLAS) kernels only handle matching layouts.
+                    return Err(TensorError::UnsupportedOperation(format!(
+                        "matmul with {:?} x {:?} operands for dtype {:?}", lhs.2, rhs.2, T::DTYPE
+                    )));
+                }
+                check_matmul_operand("matmul lhs", &lhs.1, &lhs.2, b, m, k, backend.len(lhs_buf))?;
+                check_matmul_operand("matmul rhs", &rhs.1, &rhs.2, b, k, n, backend.len(rhs_buf))?;
+                let out = b.checked_mul(m).and_then(|x| x.checked_mul(n))
+                    .ok_or_else(|| invalid("matmul output size overflows".into()))?;
+                if backend.len(dst_buf) < out {
+                    return Err(invalid(format!("matmul dst has {} elements, needs {out}", backend.len(dst_buf))));
+                }
                 <B as BackendMatMul<T>>::matmul(
                     backend,
                     (lhs_buf, &lhs.1, lhs.2),
@@ -321,12 +443,19 @@ float_unary_ops!(
     Exp => apply_exp, Sign => apply_sign,
 );
 
+/// Looks up the buffer an elementwise op writes and checks the layout stays inside it.
+fn target<'a, B: ServerBackend, T: Elem>(backend: &B, store: &'a mut Store<B>, buf: TypelessBuf, layout: &Layout) -> Result<&'a mut B::Buf<T>, TensorError> {
+    let target = store.get_mut::<T>(buf)?;
+    check_layout(layout, backend.len(target))?;
+    Ok(target)
+}
+
 fn unary<B: ServerBackend>(backend: &B, store: &mut Store<B>, buf: TypelessBuf, op: UnaryOp, layout: Layout) -> Result<(), TensorError> {
     match op {
-        UnaryOp::Neg => dispatch!(signed buf.dtype, op.name(), T => with_layout!(backend, apply_neg, store.get_mut::<T>(buf)?, layout)),
-        UnaryOp::Relu => dispatch!(any buf.dtype, op.name(), T => with_layout!(backend, apply_relu, store.get_mut::<T>(buf)?, layout)),
-        UnaryOp::Abs => dispatch!(any buf.dtype, op.name(), T => with_layout!(backend, apply_abs, store.get_mut::<T>(buf)?, layout)),
-        _ => dispatch!(float buf.dtype, op.name(), T => float_unary::<B, T>(backend, store.get_mut::<T>(buf)?, op, layout)),
+        UnaryOp::Neg => dispatch!(signed buf.dtype, op.name(), T => with_layout!(backend, apply_neg, target::<B, T>(backend, store, buf, &layout)?, layout)),
+        UnaryOp::Relu => dispatch!(any buf.dtype, op.name(), T => with_layout!(backend, apply_relu, target::<B, T>(backend, store, buf, &layout)?, layout)),
+        UnaryOp::Abs => dispatch!(any buf.dtype, op.name(), T => with_layout!(backend, apply_abs, target::<B, T>(backend, store, buf, &layout)?, layout)),
+        _ => dispatch!(float buf.dtype, op.name(), T => float_unary::<B, T>(backend, target::<B, T>(backend, store, buf, &layout)?, op, layout)),
     }
 }
 
@@ -335,7 +464,7 @@ fn scalar<B: ServerBackend>(backend: &B, store: &mut Store<B>, buf: TypelessBuf,
         ($class:ident, $method:ident) => {
             dispatch!($class buf.dtype, op.name(), T => {
                 let value = value.to_value::<T>()?;
-                with_layout!(backend, $method, store.get_mut::<T>(buf)?, layout, value)
+                with_layout!(backend, $method, target::<B, T>(backend, store, buf, &layout)?, layout, value)
             })
         };
     }
@@ -397,8 +526,9 @@ fn handle_connection(stream: TcpStream) {
                     "protocol version mismatch: client speaks {version}, server speaks {PROTOCOL_VERSION}"
                 ))),
                 (None, _) => Err(TensorError::RemoteError("handshake required before any other request".into())),
-                // A backend panic (e.g. an out-of-range layout from a misbehaving client) becomes
-                // an error for that request instead of killing the connection.
+                // Requests are validated before they reach the backend, so a panic here is a backend
+                // bug. With unwinding it becomes an error for this request; note that a server built
+                // with `panic = "abort"` (this workspace's release profile) still aborts.
                 (Some(session), op) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.execute(op)))
                     .unwrap_or_else(|panic| Err(TensorError::RemoteError(format!("server panicked: {}", panic_message(&panic))))),
             };
