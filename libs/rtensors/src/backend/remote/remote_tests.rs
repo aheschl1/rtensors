@@ -589,6 +589,10 @@ mod tests {
         assert!(matches!(err, TensorError::UnsupportedOperation(_)), "{err:?}");
     }
 
+    fn assert_invalid(result: Result<(), TensorError>) {
+        assert!(matches!(result, Err(TensorError::RemoteError(ref m)) if m.contains("invalid request")), "{result:?}");
+    }
+
     /// A fresh connection, for tests that deliberately leave errors behind.
     fn own_backend() -> RemoteBackend {
         setup_server();
@@ -854,7 +858,7 @@ mod tests {
         assert!(matches!(err, TensorError::UnsupportedOperation(_)), "{err:?}");
         // Reduction kinds can't be swapped between entry points.
         backend.apply_reduce_contiguous_flat(&src, &mut dst, 0, 3, ReductionOpTypes::ArgMax).unwrap();
-        assert!(backend.sync().is_err());
+        assert_invalid(backend.sync());
     }
 
     #[test]
@@ -874,8 +878,70 @@ mod tests {
         let transposed = MetaTensor::new(vec![3, 2], vec![1, 3], 0);
         let out_meta = MetaTensor::new(vec![3], vec![1], 0);
         backend.apply_reduce_contiguous_nd((&src, &transposed), (&mut dst2, &out_meta), 1, ReductionOpTypes::Sum).unwrap();
-        assert!(backend.sync().is_err());
+        assert_invalid(backend.sync());
+
+        // Empty extent with a start past the end (kernels still slice start..start).
+        backend.apply_reduce_contiguous_flat(&src, &mut dst, 100, 0, ReductionOpTypes::Sum).unwrap();
+        assert_invalid(backend.sync());
+        let mut fill_target = backend.alloc::<f32>(6).unwrap();
+        backend.fill_contiguous(&mut fill_target, 1.0, 100, 0).unwrap();
+        assert_invalid(backend.sync());
+        // Missing strides.
+        let no_strides = MetaTensor::new(vec![1, 1], vec![], 0);
+        backend.apply_reduce_contiguous_nd((&src, &no_strides), (&mut dst, &out_meta), 0, ReductionOpTypes::Sum).unwrap();
+        assert_invalid(backend.sync());
+        // Shape whose element count overflows.
+        let huge = MetaTensor::new(vec![4, 1 << 62], vec![1 << 62, 1], 0);
+        backend.apply_reduce_contiguous_nd((&src, &huge), (&mut dst2, &out_meta), 1, ReductionOpTypes::Sum).unwrap();
+        assert_invalid(backend.sync());
+        // Extent arithmetic that would wrap.
+        backend.fill_nd(&mut fill_target, 2.0, 0, &[usize::MAX, usize::MAX - 1], &[isize::MAX, 1000]).unwrap();
+        assert_invalid(backend.sync());
+        backend.fill_nd(&mut fill_target, 2.0, 0, &[3, 7], &[2, 1]).unwrap();
+        assert_invalid(backend.sync());
+        assert_eq!(&*backend.dump(&fill_target).unwrap(), &[0.0; 6]);
     }
+
+    #[test]
+    fn test_remote_empty_reductions() {
+        use crate::ops::reduction::ReductionOp;
+        // A zero-size trailing dim means no outputs; the kernels must not run at all.
+        let remote = make_remote_tensor(Vec::<f32>::new(), vec![3, 0]).unwrap();
+        // (The CPU backend panics on this locally; the server must not.)
+        let out = remote.sum_at(0).unwrap();
+        assert_eq!(out.size(), 0);
+        assert_eq!(out.cpu().unwrap().size(), 0);
+        // Reducing an empty dim gives one output per remaining element.
+        let remote = make_remote_tensor(Vec::<f32>::new(), vec![0, 3]).unwrap();
+        let cpu = Tensor::<f32>::from_buf(Vec::<f32>::new(), vec![0, 3]).unwrap();
+        assert_eq!(remote.sum_at(0).unwrap().cpu().unwrap(), cpu.sum_at(0).unwrap());
+    }
+
+    #[test]
+    fn test_remote_convert_validation() {
+        let backend = own_backend();
+        let src = backend.alloc_from_slice::<f32>(vec![1.0, 2.0].into()).unwrap();
+        let mut short = backend.alloc::<i32>(1).unwrap();
+        assert!(matches!(backend.convert(&src, &mut short), Err(TensorError::SizeMismatch(_))));
+        let mut same = backend.alloc_from_slice::<f32>(vec![0.0, 0.0].into()).unwrap();
+        backend.convert(&src, &mut same).unwrap();
+        assert_eq!(&*backend.dump(&same).unwrap(), &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_remote_reduce_rank1_and_offset_view() {
+        use crate::ops::reduction::{ReductionOp, TotalReductionOp};
+        let data = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let remote = make_remote_tensor(data.clone(), vec![6]).unwrap();
+        let cpu = Tensor::<f64>::from_buf(data.clone(), vec![6]).unwrap();
+        assert_eq!(remote.sum_at(0).unwrap().cpu().unwrap(), cpu.sum_at(0).unwrap());
+        // A full reduction of an offset view goes through the flat path, which honours the offset.
+        let remote = make_remote_tensor(data.clone(), vec![2, 3]).unwrap();
+        let cpu = Tensor::<f64>::from_buf(data, vec![2, 3]).unwrap();
+        let (rv, cv) = (remote.slice(0, 1).unwrap(), cpu.slice(0, 1).unwrap());
+        assert_eq!(rv.sum().unwrap().cpu().unwrap(), cv.sum().unwrap());
+    }
+
 
     #[test]
     fn test_remote_bool_roundtrip() {
